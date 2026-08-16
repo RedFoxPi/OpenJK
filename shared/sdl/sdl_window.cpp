@@ -331,6 +331,10 @@ static rserr_t GLimp_SetMode(glconfig_t *glConfig, const windowDesc_t *windowDes
 	{
 		flags |= SDL_WINDOW_OPENGL;
 	}
+	else if ( windowDesc->api == GRAPHICS_API_VULKAN )
+	{
+		flags |= SDL_WINDOW_VULKAN;
+	}
 
 	Com_Printf( "Initializing display\n");
 
@@ -773,10 +777,17 @@ window_t WIN_Init( const windowDesc_t *windowDesc, glconfig_t *glConfig )
 	// This depends on SDL_INIT_VIDEO, hence having it here
 	IN_Init( screen );
 
-	// window_t is only really useful for Windows if the renderer wants to create a D3D context.
+	// window_t is only really useful for Windows if the renderer wants to create a D3D context,
+	// or for a Vulkan renderer, which needs the raw SDL_Window* (below) on every platform to
+	// call SDL_Vulkan_CreateSurface()/SDL_Vulkan_GetInstanceExtensions().
 	window_t window = {};
 
 	window.api = windowDesc->api;
+
+	if ( windowDesc->api == GRAPHICS_API_VULKAN )
+	{
+		window.handle = screen;
+	}
 
 #if defined(_WIN32)
 	SDL_SysWMinfo info;

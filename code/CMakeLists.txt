@@ -28,6 +28,9 @@ endif(BuildSPGame)
 
 #    Add Modular Renderer project
 add_subdirectory("${SPDir}/rd-vanilla")
+if(BuildSPRdVulkan)
+	add_subdirectory("${SPDir}/rd-vulkan")
+endif(BuildSPRdVulkan)
 
 #    Add Engine Project
 if(BuildSPEngine OR BuildJK2SPEngine)

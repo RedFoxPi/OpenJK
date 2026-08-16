@@ -5,7 +5,12 @@ maps/features, and for later diffing one renderer implementation against
 another (e.g. rd-vanilla vs. a future Metal renderer).
 
 Runs entirely headless via SDL2's `offscreen` video driver + software GL
-(Mesa llvmpipe) - no display or Xvfb required.
+(Mesa llvmpipe) - no display or Xvfb required, for GL-based renderers
+(`rd-vanilla`). **`rd-vulkan` is the exception**: SDL2's `offscreen` driver
+does not support creating a Vulkan-capable window, so testing it headlessly
+needs Xvfb + the `x11` SDL driver + Mesa's `lavapipe` software Vulkan driver
+instead - see `code/rd-vulkan/README.md`'s "Testing headlessly" section for
+the exact invocation.
 
 ## Requirements
 
@@ -68,6 +73,30 @@ dark atmospheric lighting/fog, and both the SP and MP renderer code
 copies (`code/rd-vanilla` vs `codemp/rd-vanilla` are separate,
 independently-maintained copies of the same renderer).
 
-Pixel-diff comparison tooling (for comparing two renderers against each
-other, once a second renderer exists) is not built yet - this is capture
-only for now.
+## Comparing two renderers (`diff.py`)
+
+Run `capture.py` twice - once per renderer, into separate `--out`
+directories (set `cl_renderer` via `--extra_set` in `scenes.json`, or by
+using two builds with different default renderers) - then compare:
+
+```sh
+pip install pillow   # only needed for diff.py, not capture.py itself
+
+python3 diff.py --a screenshots-vanilla --b screenshots-vulkan --out diffs
+```
+
+For each scene present in both directories, this prints a per-pixel mean
+difference and a "% of pixels visibly changed" figure, classifies it as
+`MATCH` / `MINOR_DIFF` / `MAJOR_DIFF`, and writes an amplified difference
+image (`<scene>.diff.png`) so mismatches are visible at a glance rather than
+having to eyeball two screenshots side by side. Exits non-zero if anything
+isn't a `MATCH`, so it's usable as a regression gate once a renderer is far
+enough along that `MATCH` is actually the expected outcome for most scenes -
+right now, with `rd-vulkan`'s `.shader`-script gap (see
+`code/rd-vulkan/README.md`), expect `MAJOR_DIFF` on most non-trivial scenes
+and treat the diff image as a diagnostic, not a pass/fail signal.
+
+This is a simple mean-pixel-difference metric, not perceptual/SSIM - good
+enough to catch "obviously broken" (wrong colors, missing geometry, a blank
+screen) and to see at a glance where two renders diverge, not a claim of
+pixel-perfect parity.

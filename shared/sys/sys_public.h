@@ -162,6 +162,10 @@ typedef enum graphicsApi_e
 
 	// Only OpenGL needs special treatment..
 	GRAPHICS_API_OPENGL,
+
+	// Needs the SDL_WINDOW_VULKAN flag set at window-creation time so
+	// SDL_Vulkan_CreateSurface()/SDL_Vulkan_GetInstanceExtensions() work.
+	GRAPHICS_API_VULKAN,
 } graphicsApi_t;
 
 // Graphics API
