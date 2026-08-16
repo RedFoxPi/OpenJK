@@ -20,6 +20,7 @@
 #ifndef GSL_GSL_LITE_H_INCLUDED
 #define GSL_GSL_LITE_H_INCLUDED
 
+#include <cstdint>
 #include <exception>
 #include <iterator>
 #include <limits>
