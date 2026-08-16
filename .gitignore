@@ -147,6 +147,7 @@ Desktop.ini
 dist
 build
 build64
+build-*
 eggs
 parts
 bin
