@@ -136,7 +136,11 @@ void MSG_WriteBits( msg_t *msg, int value, int bits ) {
 		} else {
 			int	r;
 
-			r = 1 << (bits-1);
+			// bits is negative here (signed field width), so the magnitude
+			// -bits must be used, not bits itself - shifting by a negative
+			// amount is undefined behavior, and using bits unnegated never
+			// computed the intended bound anyway.
+			r = 1 << (-bits-1);
 
 			if ( value >  r - 1 || value < -r ) {
 				overflows++;
