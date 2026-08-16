@@ -218,7 +218,6 @@ qboolean G_ClearViewEntity( gentity_t *ent )
 
 	if ( ent->client->ps.viewEntity > 0 && ent->client->ps.viewEntity < ENTITYNUM_NONE )
 	{
-		if ( &g_entities[ent->client->ps.viewEntity] )
 		{
 			g_entities[ent->client->ps.viewEntity].svFlags &= ~SVF_BROADCAST;
 			if ( g_entities[ent->client->ps.viewEntity].NPC )
@@ -1321,7 +1320,7 @@ void ClientImpacts( gentity_t *ent, pmove_t *pm ) {
 	trace_t	trace;
 	gentity_t	*other;
 
-	memset( &trace, 0, sizeof( trace ) );
+	memset( (void *)&trace, 0, sizeof( trace ) );
 	for (i=0 ; i<pm->numtouch ; i++) {
 		for (j=0 ; j<i ; j++) {
 			if (pm->touchents[j] == pm->touchents[i] ) {
@@ -1453,7 +1452,7 @@ void	G_TouchTriggersLerped( gentity_t *ent ) {
 
 			touched[i] = qtrue;
 
-			memset( &trace, 0, sizeof(trace) );
+			memset( (void *)&trace, 0, sizeof(trace) );
 
 			if ( hit->e_TouchFunc != touchF_NULL ) {
 				GEntity_TouchFunc(hit, ent, &trace);
@@ -1526,7 +1525,7 @@ void	G_TouchTriggers( gentity_t *ent ) {
 			}
 		}
 
-		memset( &trace, 0, sizeof(trace) );
+		memset( (void *)&trace, 0, sizeof(trace) );
 
 		if ( hit->e_TouchFunc != touchF_NULL ) {
 			GEntity_TouchFunc(hit, ent, &trace);
@@ -1608,7 +1607,7 @@ void G_MoverTouchPushTriggers( gentity_t *ent, vec3_t oldOrg )
 				continue;
 			}
 
-			memset( &trace, 0, sizeof(trace) );
+			memset( (void *)&trace, 0, sizeof(trace) );
 
 			if ( hit->e_TouchFunc != touchF_NULL )
 			{

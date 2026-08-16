@@ -1015,11 +1015,11 @@ qboolean CROFFSystem::ClearLerp( SROFFEntity *roff_ent )
 	sharedEntity_t	*ent = NULL;
 	trajectory_t	*originTrajectory = NULL, *angleTrajectory = NULL;
 	float			*origin = NULL, *angle = NULL;
+	vec3_t		originTemp, angleTemp;
 
 	if (roff_ent->mIsClient)
 	{
 #ifndef DEDICATED
-		vec3_t		originTemp, angleTemp;
 		originTrajectory = CGVM_GetOriginTrajectory( roff_ent->mEntID );
 		angleTrajectory = CGVM_GetAngleTrajectory( roff_ent->mEntID );
 		CGVM_GetOrigin( roff_ent->mEntID, originTemp );

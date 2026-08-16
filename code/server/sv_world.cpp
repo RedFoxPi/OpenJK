@@ -859,7 +859,7 @@ Ghoul2 Insert End
 		maxs = vec3_origin;
 	}
 
-	memset ( &clip, 0, sizeof ( moveclip_t ) - sizeof(clip.trace.G2CollisionMap ));
+	memset ( (void *)&clip, 0, sizeof ( moveclip_t ) - sizeof(clip.trace.G2CollisionMap ));
 
 	// clip to world
 	//NOTE: this will stop not only on static architecture but also entity brushes such as

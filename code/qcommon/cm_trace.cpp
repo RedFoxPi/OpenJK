@@ -765,7 +765,7 @@ void CM_BoxTrace( trace_t *results, const vec3_t start, const vec3_t end,
 	c_traces++;				// for statistics, may be zeroed
 
 	// fill in a default trace
-	memset( &tw, 0, sizeof(tw) - sizeof(tw.trace.G2CollisionMap));
+	memset( (void *)&tw, 0, sizeof(tw) - sizeof(tw.trace.G2CollisionMap));
 	tw.trace.fraction = 1;	// assume it goes the entire distance until shown otherwise
 
 	if (!local->numNodes) {

@@ -46,7 +46,7 @@ void Use_Target_Give( gentity_t *ent, gentity_t *other, gentity_t *activator ) {
 
 	G_ActivateBehavior(ent,BSET_USE);
 
-	memset( &trace, 0, sizeof( trace ) );
+	memset( (void *)&trace, 0, sizeof( trace ) );
 	t = NULL;
 	while ( (t = G_Find (t, FOFS(targetname), ent->target)) != NULL ) {
 		if ( !t->item ) {
@@ -1140,7 +1140,7 @@ void target_change_parm_use(gentity_t *self, gentity_t *other, gentity_t *activa
 	{
 		for ( int parmNum = 0; parmNum < MAX_PARMS; parmNum++ )
 		{
-			if ( self->parms->parm[parmNum] && self->parms->parm[parmNum][0] )
+			if ( self->parms->parm[parmNum][0] )
 			{
 				Q3_SetParm( activator->s.number, parmNum, self->parms->parm[parmNum] );
 			}

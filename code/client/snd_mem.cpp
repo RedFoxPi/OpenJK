@@ -454,12 +454,12 @@ void R_CheckMP3s( const char *psDir )
 								{
 									pTAG = &TAG;
 									memset(&TAG,0,sizeof(TAG));
-									strncpy(pTAG->id,"TAG",3);
+									memcpy(pTAG->id,"TAG",3);
 								}
 
 								strncpy(pTAG->title,	Filename_WithoutPath(Filename_WithoutExt(sFilename)), sizeof(pTAG->title));
 								strncpy(pTAG->artist,	"Raven Software",						sizeof(pTAG->artist)	);
-								strncpy(pTAG->year,		"2002",									sizeof(pTAG->year)		);
+								memcpy(pTAG->year,		"2002",									sizeof(pTAG->year)		);
 								strncpy(pTAG->comment,	va("%s %g",sKEY_MAXVOL,fMaxVol),		sizeof(pTAG->comment)	);
 								strncpy(pTAG->album,	va("%s %d",sKEY_UNCOMP,iActualUnpackedSize),sizeof(pTAG->album)	);
 
@@ -593,7 +593,7 @@ static qboolean S_LoadSound_FileLoadAndNameAdjuster(char *psFilename, byte **pDa
 		{
 			fileHandle_t hFile;
 			//German
-			strncpy(psVoice,"chr_d",5);	// same number of letters as "chars"
+			memcpy(psVoice,"chr_d",5);	// same number of letters as "chars"
 			FS_FOpenFileRead(psFilename, &hFile, qfalse);		//cache the wav
 			if (!hFile)
 			{
@@ -607,7 +607,7 @@ static qboolean S_LoadSound_FileLoadAndNameAdjuster(char *psFilename, byte **pDa
 			strcpy(&psFilename[iNameStrlen-3],"wav");	//put it back to wav
 
 			//French
-			strncpy(psVoice,"chr_f",5);	// same number of letters as "chars"
+			memcpy(psVoice,"chr_f",5);	// same number of letters as "chars"
 			FS_FOpenFileRead(psFilename, &hFile, qfalse);		//cache the wav
 			if (!hFile)
 			{
@@ -621,7 +621,7 @@ static qboolean S_LoadSound_FileLoadAndNameAdjuster(char *psFilename, byte **pDa
 			strcpy(&psFilename[iNameStrlen-3],"wav");	//put it back to wav
 
 			//Spanish
-			strncpy(psVoice,"chr_e",5);	// same number of letters as "chars"
+			memcpy(psVoice,"chr_e",5);	// same number of letters as "chars"
 			FS_FOpenFileRead(psFilename, &hFile, qfalse);		//cache the wav
 			if (!hFile)
 			{
@@ -634,7 +634,7 @@ static qboolean S_LoadSound_FileLoadAndNameAdjuster(char *psFilename, byte **pDa
 			}
 			strcpy(&psFilename[iNameStrlen-3],"wav");	//put it back to wav
 
-			strncpy(psVoice,"chars",5);	//put it back to chars
+			memcpy(psVoice,"chars",5);	//put it back to chars
 		}
 
 		// account for foreign voices...
@@ -642,15 +642,15 @@ static qboolean S_LoadSound_FileLoadAndNameAdjuster(char *psFilename, byte **pDa
 		extern cvar_t* s_language;
 		if (s_language && Q_stricmp("DEUTSCH",s_language->string)==0)
 		{
-			strncpy(psVoice,"chr_d",5);	// same number of letters as "chars"
+			memcpy(psVoice,"chr_d",5);	// same number of letters as "chars"
 		}
 		else if (s_language && Q_stricmp("FRANCAIS",s_language->string)==0)
 		{
-			strncpy(psVoice,"chr_f",5);	// same number of letters as "chars"
+			memcpy(psVoice,"chr_f",5);	// same number of letters as "chars"
 		}
 		else if (s_language && Q_stricmp("ESPANOL",s_language->string)==0)
 		{
-			strncpy(psVoice,"chr_e",5);	// same number of letters as "chars"
+			memcpy(psVoice,"chr_e",5);	// same number of letters as "chars"
 		}
 		else
 		{
@@ -678,7 +678,7 @@ static qboolean S_LoadSound_FileLoadAndNameAdjuster(char *psFilename, byte **pDa
 				Com_Printf(S_COLOR_YELLOW "Foreign file missing: \"%s\"! (using English...)\n",psFilename);
 #endif
 
-				strncpy(psVoice,"chars",5);
+				memcpy(psVoice,"chars",5);
 
 				psFilename[iNameStrlen-3] = 'w';
 				psFilename[iNameStrlen-2] = 'a';

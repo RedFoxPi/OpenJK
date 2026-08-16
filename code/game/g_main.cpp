@@ -761,7 +761,7 @@ void InitGame(  const char *mapname, const char *spawntarget, int checkSum, cons
 	G_InitWorldSession();
 
 	// initialize all entities for this game
-	memset( g_entities, 0, MAX_GENTITIES * sizeof(g_entities[0]) );
+	memset( (void *)g_entities, 0, MAX_GENTITIES * sizeof(g_entities[0]) );
 	globals.gentities = g_entities;
 	ClearAllInUse();
 	// initialize all clients for this game

@@ -55,7 +55,7 @@ void G_ReflectMissile( gentity_t *ent, gentity_t *missile, vec3_t forward )
 	//save the original speed
 	speed = VectorNormalize( missile->s.pos.trDelta );
 
-	if ( &g_entities[missile->r.ownerNum] && missile->s.weapon != WP_SABER && missile->s.weapon != G2_MODEL_PART && !isowner )
+	if ( missile->s.weapon != WP_SABER && missile->s.weapon != G2_MODEL_PART && !isowner )
 	{//bounce back at them if you can
 		VectorSubtract( g_entities[missile->r.ownerNum].r.currentOrigin, missile->r.currentOrigin, bounce_dir );
 		VectorNormalize( bounce_dir );

@@ -259,14 +259,7 @@ static void WP_RemoveOldTraps( gentity_t *ent )
 		if ( removeMe != -1 )
 		{
 			//remove it... or blow it?
-			if ( &g_entities[foundLaserTraps[removeMe]] == NULL )
-			{
-				break;
-			}
-			else
-			{
-				G_FreeEntity( &g_entities[foundLaserTraps[removeMe]] );
-			}
+			G_FreeEntity( &g_entities[foundLaserTraps[removeMe]] );
 			foundLaserTraps[removeMe] = ENTITYNUM_NONE;
 			trapcount--;
 		}

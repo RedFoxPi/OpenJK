@@ -222,7 +222,7 @@ static void Svcmd_SaberBlade_f()
 		gi.Printf( "USAGE: saberblade <sabernum> <bladenum> [0 = off, 1 = on, no arg = toggle]\n" );
 		return;
 	}
-	if ( &g_entities[0] == NULL || g_entities[0].client == NULL )
+	if ( g_entities[0].client == NULL )
 	{
 		return;
 	}
@@ -326,7 +326,7 @@ SetForceCmd SetForceTable[NUM_FORCE_POWERS] = {
 
 static void Svcmd_ForceSetLevel_f( int forcePower )
 {
-	if ( !&g_entities[0] || !g_entities[0].client )
+	if ( !g_entities[0].client )
 	{
 		return;
 	}
@@ -363,7 +363,7 @@ extern qboolean PM_SaberInAttack( int move );
 extern qboolean WP_SaberCanTurnOffSomeBlades( saberInfo_t *saber );
 void Svcmd_SaberAttackCycle_f( void )
 {
-	if ( !&g_entities[0] || !g_entities[0].client )
+	if ( !g_entities[0].client )
 	{
 		return;
 	}

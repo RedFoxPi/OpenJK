@@ -999,7 +999,7 @@ static qboolean G_AddSexToPlayerString ( char *string, qboolean qDoBoth )
 		if ( g_sex->string[0] == 'f' ) {
 			start = strstr( string, "jaden_male/" );
 			if ( start != NULL ) {
-				strncpy( start, "jaden_fmle", 10 );
+				memcpy( start, "jaden_fmle", 10 );
 				return qtrue;
 			} else {
 				start = strrchr( string, '/' );		//get the last slash before the wav
@@ -7665,7 +7665,7 @@ int CQuake3GameInterface::RegisterScript( const char *strFileName, void **ppBuf,
 
 	// Prepare the name with the extension.
 	char		newname[MAX_FILENAME_LENGTH];
-	sprintf((char *) newname, "%s%s", sFilename, IBI_EXT );
+	Com_sprintf((char *) newname, sizeof(newname), "%s%s", sFilename, IBI_EXT );
 
 	qboolean qbIgnoreFileRead = qfalse;
 
