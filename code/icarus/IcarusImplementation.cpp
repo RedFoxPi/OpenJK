@@ -639,18 +639,27 @@ int CIcarus::LoadSequences()
 
 	//First pass, allocate all container sequences and give them their proper IDs
 	if ( AllocateSequences( numSequences, idTable ) == false )
+	{
+		delete[] idTable;
 		return false;
+	}
 
 	//Second pass, load all sequences
 	for ( int i = 0; i < numSequences; i++ )
 	{
 		//Get the proper sequence for this load
 		if ( ( sequence = GetSequence( idTable[i] ) ) == NULL )
+		{
+			delete[] idTable;
 			return false;
+		}
 
 		//Load the sequence
 		if ( ( sequence->Load(this) ) == false )
+		{
+			delete[] idTable;
 			return false;
+		}
 	}
 
 	//Free the idTable

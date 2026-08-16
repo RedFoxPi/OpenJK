@@ -646,6 +646,7 @@ bool CNavigator::Load( const char *filename, int checksum )
 
 		if ( node->Load( numNodes, file ) == false )
 		{
+			delete node;
 			FS_FCloseFile( file );
 			return false;
 		}
