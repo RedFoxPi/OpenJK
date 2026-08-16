@@ -24,6 +24,23 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "q_shared.h"
 #include "qcommon.h"
 
+// The loopback ring buffer below is a raw byte buffer with the packet-length
+// prefix written/read at an arbitrary (not necessarily 4-byte-aligned)
+// offset, so accessing it via a byteAlias_t cast-and-dereference is
+// undefined behavior. memcpy() into/out of a properly-aligned local is the
+// safe equivalent.
+static inline int ReadUnalignedInt( const void *p )
+{
+	int v;
+	memcpy( &v, p, sizeof( v ) );
+	return v;
+}
+
+static inline void WriteUnalignedInt( void *p, int v )
+{
+	memcpy( p, &v, sizeof( v ) );
+}
+
 /*
 
 packet header
@@ -455,8 +472,7 @@ qboolean	NET_GetLoopPacket (netsrc_t sock, netadr_t *net_from, msg_t *net_messag
 	}
 
 	//Get length of packet.
-	byteAlias_t *ba = (byteAlias_t *)&loop->loopData[i];
-	const int length = ba->i;
+	const int length = ReadUnalignedInt( &loop->loopData[i] );
 	i += 4;
 
 	//See if entire packet is at end of buffer or part is at the beginning.
@@ -509,8 +525,7 @@ void NET_SendLoopPacket (netsrc_t sock, int length, const void *data, netadr_t t
 	}
 
 	//Write length of packet.
-	byteAlias_t *ba = (byteAlias_t *)&loop->loopData[i];
-	ba->i = length;
+	WriteUnalignedInt( &loop->loopData[i], length );
 	i += 4;
 
 	//See if the whole packet will fit on the end of the buffer or if we
