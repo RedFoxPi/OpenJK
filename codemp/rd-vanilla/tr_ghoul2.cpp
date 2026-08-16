@@ -2465,7 +2465,7 @@ void RenderSurfaces(CRenderSurface &RS) //also ended up just ripping right from 
 //			&& RS.fogNum == 0
 			&& (RS.renderfx & RF_SHADOW_PLANE )
 			&& !(RS.renderfx & ( RF_NOSHADOW | RF_DEPTHHACK ) )
-			&& shader->sort == SS_OPAQUE )
+			&& shader->sort == (float)SS_OPAQUE )
 		{		// set the surface info to point at the where the transformed bone list is going to be for when the surface gets rendered out
 			CRenderableSurface *newSurf = new CRenderableSurface;
 			if (surface->numVerts >= SHADER_MAX_VERTEXES/2)
@@ -2485,7 +2485,7 @@ void RenderSurfaces(CRenderSurface &RS) //also ended up just ripping right from 
 		if ( r_shadows->integer == 3
 //			&& RS.fogNum == 0
 			&& (RS.renderfx & RF_SHADOW_PLANE )
-			&& shader->sort == SS_OPAQUE )
+			&& shader->sort == (float)SS_OPAQUE )
 		{		// set the surface info to point at the where the transformed bone list is going to be for when the surface gets rendered out
 			CRenderableSurface *newSurf = new CRenderableSurface;
 			newSurf->surfaceData = surface;

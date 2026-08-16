@@ -399,7 +399,7 @@ void R_AddMD3Surfaces( trRefEntity_t *ent ) {
 			&& r_shadows->integer == 2
 			&& fogNum == 0
 			&& !(ent->e.renderfx & ( RF_NOSHADOW | RF_DEPTHHACK ) )
-			&& shader->sort == SS_OPAQUE ) {
+			&& shader->sort == (float)SS_OPAQUE ) {
 			R_AddDrawSurf( (surfaceType_t *)surface, tr.shadowShader, 0, qfalse );
 		}
 
@@ -407,7 +407,7 @@ void R_AddMD3Surfaces( trRefEntity_t *ent ) {
 		if ( r_shadows->integer == 3
 			&& fogNum == 0
 			&& (ent->e.renderfx & RF_SHADOW_PLANE )
-			&& shader->sort == SS_OPAQUE ) {
+			&& shader->sort == (float)SS_OPAQUE ) {
 			R_AddDrawSurf( (surfaceType_t *)surface, tr.projectionShadowShader, 0, qfalse );
 		}
 

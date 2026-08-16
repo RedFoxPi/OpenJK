@@ -211,11 +211,11 @@ public:
 		float	point[2] = {xReal, yReal};
 		for (int i=0; i<2; i++)
 		{
-			if (point[i]<mMins[i] || mMins[i]==RANGE_NULL)
+			if (point[i]<mMins[i] || mMins[i]==(float)RANGE_NULL)
 			{
 				mMins[i] = point[i];
 			}
-			if (point[i]>mMaxs[i] || mMaxs[i]==RANGE_NULL)
+			if (point[i]>mMaxs[i] || mMaxs[i]==(float)RANGE_NULL)
 			{
 				mMaxs[i] = point[i];
 			}

@@ -757,7 +757,7 @@ void RB_RenderDrawSurfList( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 			if (oldShader != NULL) {
 				RB_EndSurface();
 
-				if (!didShadowPass && shader && shader->sort > SS_BANNER)
+				if (!didShadowPass && shader && shader->sort > (float)SS_BANNER)
 				{
 					RB_ShadowFinish();
 					didShadowPass = true;
