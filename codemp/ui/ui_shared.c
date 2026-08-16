@@ -9221,6 +9221,9 @@ qboolean MenuParse_itemDef( itemDef_t *item, int handle ) {
 	menuDef_t *menu = (menuDef_t*)item;
 	if (menu->itemCount < MAX_MENUITEMS) {
 		itemDef_t *newItem = menu->items[menu->itemCount] = (itemDef_t *) UI_Alloc(sizeof(itemDef_t));
+		if (!newItem) {
+			return qfalse;
+		}
 		Item_Init(newItem);
 		if (!Item_Parse(handle, newItem))
 		{
