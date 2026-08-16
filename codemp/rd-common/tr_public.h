@@ -313,6 +313,7 @@ typedef struct refimport_s {
 	e_status		(*CIN_RunCinematic)					( int handle );
 	int				(*CIN_PlayCinematic)				( const char *arg0, int xpos, int ypos, int width, int height, int bits );
 	void			(*CIN_UploadCinematic)				( int handle );
+	e_status		(*CIN_StopCinematic)				( int handle );
 	void			(*CL_WriteAVIVideoFrame)			( const byte *imageBuffer, int size );
 
 	// g2 data access
