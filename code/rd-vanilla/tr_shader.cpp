@@ -3871,7 +3871,7 @@ vid_restart, so any such cinematics must be explicitly stopped first, or
 their handles (and the zlib/file state behind them) leak.
 ==================
 */
-static void R_ShutdownVideoMapCinematics( void ) {
+void R_ShutdownVideoMapCinematics( void ) {
 	for ( int i = 0; i < tr.numShaders; i++ ) {
 		shader_t *sh = tr.shaders[i];
 		for ( int j = 0; j < sh->numUnfoggedPasses; j++ ) {
