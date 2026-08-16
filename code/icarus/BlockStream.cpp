@@ -36,6 +36,24 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #endif
 #include "blockstream.h"
 
+// The block stream is a raw byte buffer with values packed at arbitrary
+// (not necessarily 4-byte-aligned) offsets, so reading them via a cast
+// pointer dereference (*(int*)p) is undefined behavior. memcpy() into a
+// properly-aligned local is the standard safe equivalent.
+static inline int ReadUnalignedInt( const void *p )
+{
+	int v;
+	memcpy( &v, p, sizeof( v ) );
+	return v;
+}
+
+static inline float ReadUnalignedFloat( const void *p )
+{
+	float v;
+	memcpy( &v, p, sizeof( v ) );
+	return v;
+}
+
 /*
 ===================================================================================================
 
@@ -124,7 +142,7 @@ ReadMember
 int CBlockMember::ReadMember( char **stream, long *streamPos, CIcarus* icarus )
 {
 	IGameInterface* game = icarus->GetGame();
-	m_id = LittleLong(*(int *) (*stream + *streamPos));
+	m_id = LittleLong(ReadUnalignedInt(*stream + *streamPos));
 	*streamPos += sizeof( int );
 
 	if ( m_id == CIcarus::ID_RANDOM )
@@ -137,7 +155,7 @@ int CBlockMember::ReadMember( char **stream, long *streamPos, CIcarus* icarus )
 	}
 	else
 	{
-		m_size = LittleLong(*(int *) (*stream + *streamPos));
+		m_size = LittleLong(ReadUnalignedInt(*stream + *streamPos));
 		*streamPos += sizeof( int );
 		m_data = game->Malloc( m_size );
 		memcpy( m_data, (*stream + *streamPos), m_size );
@@ -526,10 +544,10 @@ int CBlockStream::ReadBlock( CBlock *get, CIcarus* icarus )
 	if (!BlockAvailable())
 		return false;
 
-	b_id		= LittleLong(*(int *) (m_stream + m_streamPos));
+	b_id		= LittleLong(ReadUnalignedInt(m_stream + m_streamPos));
 	m_streamPos += sizeof( b_id );
 
-	numMembers	= LittleLong(*(int *) (m_stream + m_streamPos));
+	numMembers	= LittleLong(ReadUnalignedInt(m_stream + m_streamPos));
 	m_streamPos += sizeof( numMembers );
 
 	flags		= *(unsigned char*) (m_stream + m_streamPos);
@@ -573,7 +591,7 @@ int CBlockStream::Open( char *buffer, long size )
 		id_header[i] = *(m_stream + m_streamPos++);
 	}
 
-	version = LittleFloat(*(float *) (m_stream + m_streamPos));
+	version = LittleFloat(ReadUnalignedFloat(m_stream + m_streamPos));
 	m_streamPos += sizeof( version );
 
 	//Check for valid header

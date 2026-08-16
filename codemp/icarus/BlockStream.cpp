@@ -30,6 +30,24 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include <string.h>
 #include "blockstream.h"
 
+// The block stream is a raw byte buffer with values packed at arbitrary
+// (not necessarily 4-byte-aligned) offsets, so reading them via a cast
+// pointer dereference (*(int*)p) is undefined behavior. memcpy() into a
+// properly-aligned local is the standard safe equivalent.
+static inline int ReadUnalignedInt( const void *p )
+{
+	int v;
+	memcpy( &v, p, sizeof( v ) );
+	return v;
+}
+
+static inline float ReadUnalignedFloat( const void *p )
+{
+	float v;
+	memcpy( &v, p, sizeof( v ) );
+	return v;
+}
+
 /*
 ===================================================================================================
 
@@ -116,7 +134,7 @@ ReadMember
 
 int CBlockMember::ReadMember( char **stream, int *streamPos )
 {
-	m_id = LittleLong(*(int *) (*stream + *((int *)streamPos)));
+	m_id = LittleLong(ReadUnalignedInt(*stream + *streamPos));
 	*streamPos += sizeof( int );
 
 	if ( m_id == ID_RANDOM )
@@ -129,7 +147,7 @@ int CBlockMember::ReadMember( char **stream, int *streamPos )
 	}
 	else
 	{
-		m_size = LittleLong(*(int *) (*stream + *streamPos));
+		m_size = LittleLong(ReadUnalignedInt(*stream + *streamPos));
 		*streamPos += sizeof( int );
 		m_data = ICARUS_Malloc( m_size );
 		memcpy( m_data, (*stream + *streamPos), m_size );
@@ -457,7 +475,7 @@ int	CBlockStream::GetInteger( void )
 {
 	int data;
 
-	data = *(int *) (m_stream + m_streamPos);
+	data = ReadUnalignedInt( m_stream + m_streamPos );
 	m_streamPos += sizeof( data );
 
 	return data;
@@ -473,7 +491,7 @@ long CBlockStream::GetLong( void )
 {
 	long data;
 
-	data = *(int *) (m_stream + m_streamPos);
+	data = ReadUnalignedInt( m_stream + m_streamPos );
 	m_streamPos += sizeof( data );
 
 	return data;
@@ -489,7 +507,7 @@ float CBlockStream::GetFloat( void )
 {
 	float data;
 
-	data = *(float *) (m_stream + m_streamPos);
+	data = ReadUnalignedFloat( m_stream + m_streamPos );
 	m_streamPos += sizeof( data );
 
 	return data;
