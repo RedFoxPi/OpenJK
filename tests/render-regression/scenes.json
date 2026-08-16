@@ -1,0 +1,55 @@
+{
+  "//": "Starter scene set for the render-regression harness. Each scene loads a distinct combination of engine/renderer features so that broad code paths get exercised (and can be run under ASan/UBSan for bug-finding, or diffed pixel-for-pixel between two renderer implementations later). 'binary' selects which engine executable+renderer to use: 'sp' = openjk_sp.x86_64 + rdsp-vanilla, 'mp' = openjk.x86_64 + rd-vanilla. Requires the user's own legally-owned game assets; this manifest contains no copyrighted content, only map identifiers.",
+
+  "scenes": [
+    {
+      "id": "sp_menu",
+      "binary": "sp",
+      "map": null,
+      "wait_frames": 60,
+      "notes": "SP main menu. No map load. Exercises 2D/UI rendering, font rendering, menu shaders - independent of any BSP/world content."
+    },
+    {
+      "id": "sp_academy1_spawn",
+      "binary": "sp",
+      "map": "academy1",
+      "wait_frames": 300,
+      "notes": "Indoor/outdoor academy courtyard (opening tutorial level). Static architectural geometry, a skeletal (Ghoul2) NPC model, sky portal, basic lighting."
+    },
+    {
+      "id": "sp_hoth2_spawn",
+      "binary": "sp",
+      "map": "hoth2",
+      "wait_frames": 300,
+      "notes": "Snow/ice exterior level. Different lighting/fog profile and outdoor terrain geometry from academy1."
+    },
+    {
+      "id": "sp_yavin1_spawn",
+      "binary": "sp",
+      "map": "yavin1",
+      "wait_frames": 300,
+      "notes": "Jungle/temple exterior. Vegetation (alpha-tested foliage), large outdoor sky, likely water."
+    },
+    {
+      "id": "sp_vjun1_spawn",
+      "binary": "sp",
+      "map": "vjun1",
+      "wait_frames": 300,
+      "notes": "Dark atmospheric Imperial facility. Exercises dynamic/colored lighting, fog, and any rain/atmospheric particle effects distinct from the daylight outdoor levels."
+    },
+    {
+      "id": "mp_ctf1_spawn",
+      "binary": "mp",
+      "map": "ctf1",
+      "wait_frames": 300,
+      "notes": "MP renderer coverage (codemp/rd-vanilla is a separate code copy from code/rd-vanilla/SP - needs its own exercising). CTF map, open outdoor + structure geometry."
+    },
+    {
+      "id": "mp_duel1_spawn",
+      "binary": "mp",
+      "map": "duel1",
+      "wait_frames": 300,
+      "notes": "MP renderer, second/different map for broader MP-side geometry and shader coverage."
+    }
+  ]
+}
