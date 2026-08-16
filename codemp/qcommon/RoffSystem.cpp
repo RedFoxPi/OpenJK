@@ -1015,7 +1015,9 @@ qboolean CROFFSystem::ClearLerp( SROFFEntity *roff_ent )
 	sharedEntity_t	*ent = NULL;
 	trajectory_t	*originTrajectory = NULL, *angleTrajectory = NULL;
 	float			*origin = NULL, *angle = NULL;
+#ifndef DEDICATED
 	vec3_t		originTemp, angleTemp;
+#endif
 
 	if (roff_ent->mIsClient)
 	{
