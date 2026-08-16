@@ -25,6 +25,8 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "q_shared.h"
 #include "qcommon.h"
 
+#include <unordered_set>
+
 #ifdef DEBUG_ZONE_ALLOCS
 #include "sstring.h"
 int giZoneSnaphotNum=0;
@@ -116,6 +118,15 @@ typedef struct zone_s
 cvar_t	*com_validateZone;
 
 zone_t	TheZone = {};
+
+// Z_IsFromZone() (see below) is used - always with TAG_G_ALLOC - to safely test
+// whether an arbitrary pointer was actually returned by Z_Malloc(), e.g. the
+// game code testing an entity string field before Free()ing it, since that
+// field may instead hold a static string literal that was never zone-allocated.
+// Such a pointer must not be treated as if a zoneHeader_t precedes it - doing
+// so used to read out-of-bounds for non-zone pointers - so live TAG_G_ALLOC
+// pointers are tracked here instead and looked up rather than blindly read.
+static std::unordered_set<const void*> gG_AllocPointers;
 
 
 
@@ -414,6 +425,12 @@ void *Z_Malloc(int iSize, memtag_t eTag, qboolean bZeroit, int /*unusedAlign*/)
 	Z_Validate();	// check for corruption
 
 	void *pvReturnMem = &pMemory[1];
+
+	if (eTag == TAG_G_ALLOC)
+	{
+		gG_AllocPointers.insert(pvReturnMem);
+	}
+
 	return pvReturnMem;
 }
 
@@ -491,6 +508,11 @@ static int Zone_FreeBlock(zoneHeader_t *pMemory)
 			pMemory->pNext->pPrev = pMemory->pPrev;
 		}
 
+		if (pMemory->eTag == TAG_G_ALLOC)
+		{
+			gG_AllocPointers.erase(&pMemory[1]);
+		}
+
 		//debugging double frees
 		pMemory->iMagic = INT_ID('F','R','E','E');
 		free (pMemory);
@@ -514,6 +536,16 @@ static int Zone_FreeBlock(zoneHeader_t *pMemory)
 // returns block size if so
 qboolean Z_IsFromZone(const void *pvAddress, memtag_t eTag)
 {
+	// pvAddress may be an arbitrary, non-zone-allocated pointer (e.g. a static
+	// string literal), so it must not be treated as though a zoneHeader_t
+	// precedes it without first confirming that via the tracked-pointer set -
+	// only TAG_G_ALLOC pointers are tracked, since that's the only tag ever
+	// passed here (see gG_AllocPointers above).
+	if (eTag != TAG_G_ALLOC || gG_AllocPointers.find(pvAddress) == gG_AllocPointers.end())
+	{
+		return qfalse;
+	}
+
 	const zoneHeader_t *pMemory = ((const zoneHeader_t *)pvAddress) - 1;
 #if 1	//debugging double free
 	if (pMemory->iMagic == INT_ID('F','R','E','E'))
