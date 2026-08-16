@@ -809,9 +809,18 @@ static qboolean CG_RunLerpFrame( clientInfo_t *ci, lerpFrame_t *lf, int newAnima
 			f -= anim->numFrames;
 			if ( anim->loopFrames != -1 ) //Before 0 meant no loop
 			{
-				if(anim->numFrames - anim->loopFrames == 0)
+				if ( anim->numFrames - anim->loopFrames == 0 )
 				{
-					f %= anim->numFrames;
+					// numFrames == loopFrames here, so numFrames could be 0 - avoid a
+					// divide-by-zero on malformed/empty animation data.
+					if ( anim->numFrames != 0 )
+					{
+						f %= anim->numFrames;
+					}
+					else
+					{
+						f = 0;
+					}
 				}
 				else
 				{
