@@ -677,7 +677,7 @@ Touch all known used data to make sure it is paged in
 void Com_TouchMemory( void ) {
 //	int		start, end;
 	int		i, j;
-	int		sum;
+	unsigned int	sum;	// unsigned: this just forces pages in, the value itself is discarded
 
 //	start = Sys_Milliseconds();
 	Z_Validate();
