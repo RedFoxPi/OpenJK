@@ -24,7 +24,6 @@ endif(NOT InOpenJK)
 set(MPCGameIncludeDirectories
 	"${MPDir}"
 	"${SharedDir}"
-	"${GSLIncludeDirectory}"
 	)
 if(WIN32)
 	set(MPCGameLibraries "odbc32" "odbccp32") # what are these even?

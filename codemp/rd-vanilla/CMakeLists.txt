@@ -29,7 +29,6 @@ set(MPVanillaRendererIncludeDirectories
 	${SharedDir}
 	${MPDir}
 	"${MPDir}/rd-vanilla"
-	"${GSLIncludeDirectory}"
 	)
 
 set(MPVanillaRendererFiles

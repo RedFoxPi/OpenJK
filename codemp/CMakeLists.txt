@@ -52,7 +52,6 @@ if(BuildMPEngine OR BuildMPDed)
 	set(MPBotlibIncludeDirectories
 		${SharedDir}
 		${MPDir}
-		"${GSLIncludeDirectory}"
 		)
 	set(MPBotlibBotlibFiles
 		"${MPDir}/botlib/aasfile.h"
@@ -175,7 +174,7 @@ if(BuildMPEngine OR BuildMPDed)
 	endif(WIN32)
 
 	# Include directories
-	set(MPEngineAndDedIncludeDirectories ${MPDir} ${SharedDir} ${GSLIncludeDirectory} ${CMAKE_BINARY_DIR}/shared)
+	set(MPEngineAndDedIncludeDirectories ${MPDir} ${SharedDir} ${CMAKE_BINARY_DIR}/shared)
 
 	# Transparently use our bundled minizip.
 	list(APPEND MPEngineAndDedIncludeDirectories ${MINIZIP_INCLUDE_DIRS})

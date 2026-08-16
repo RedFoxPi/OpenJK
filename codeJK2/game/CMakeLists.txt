@@ -27,7 +27,6 @@ set(JK2SPGameIncludeDirectories
 	"${JK2SPDir}"
 	"${JK2SPDir}/game"
 	"${SharedDir}"
-	"${GSLIncludeDirectory}"
 	"${CMAKE_BINARY_DIR}/shared"
 	)
 if(WIN32)

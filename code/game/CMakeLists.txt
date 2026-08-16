@@ -26,7 +26,6 @@ set(SPGameIncludeDirectories
 	${SharedDir}
 	${SPDir}
 	"${SPDir}/game"
-	"${GSLIncludeDirectory}"
 	"${CMAKE_BINARY_DIR}/shared"
 	)
 
