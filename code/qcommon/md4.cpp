@@ -42,8 +42,6 @@ typedef struct mdfour_s
 It assumes that an int is at least 32 bits long
 */
 
-static  mdfour_ctx *m;
-
 #define F(X,Y,Z) (((X)&(Y)) | ((~(X))&(Z)))
 #define G(X,Y,Z) (((X)&(Y)) | ((X)&(Z)) | ((Y)&(Z)))
 #define H(X,Y,Z) ((X)^(Y)^(Z))
@@ -54,7 +52,7 @@ static  mdfour_ctx *m;
 #define ROUND3(a,b,c,d,k,s) a = lshift(a + H(b,c,d) + X[k] + 0x6ED9EBA1,s)
 
 /* this applies md4 to 64 byte chunks */
-static void mdfour64( uint32_t *M )
+static void mdfour64( mdfour_ctx *m, uint32_t *M )
 {
 	int j;
 	uint32_t AA, BB, CC, DD;
@@ -129,7 +127,7 @@ void mdfour_begin( mdfour_ctx *md )
 }
 
 
-static void mdfour_tail( byte *in, int n )
+static void mdfour_tail( mdfour_ctx *m, byte *in, int n )
 {
 	byte buf[128];
 	uint32_t M[16];
@@ -147,15 +145,15 @@ static void mdfour_tail( byte *in, int n )
 	{
 		copy4( buf + 56, b );
 		copy64( M, buf );
-		mdfour64( M );
+		mdfour64( m, M );
 	}
 	else
 	{
 		copy4( buf + 120, b );
 		copy64( M, buf );
-		mdfour64( M );
+		mdfour64( m, M );
 		copy64( M, buf + 64 );
-		mdfour64( M );
+		mdfour64( m, M );
 	}
 }
 
@@ -163,31 +161,27 @@ static void mdfour_update( mdfour_ctx *md, byte *in, int n )
 {
 	uint32_t M[16];
 
-	m = md;
-
-	if ( n == 0 ) mdfour_tail( in, n );
+	if ( n == 0 ) mdfour_tail( md, in, n );
 
 	while ( n >= 64 )
 	{
 		copy64( M, in );
-		mdfour64( M );
+		mdfour64( md, M );
 		in += 64;
 		n -= 64;
-		m->totalN += 64;
+		md->totalN += 64;
 	}
 
-	mdfour_tail( in, n );
+	mdfour_tail( md, in, n );
 }
 
 
 static void mdfour_result( mdfour_ctx *md, byte *out )
 {
-	m = md;
-
-	copy4( out, m->A );
-	copy4( out + 4, m->B );
-	copy4( out + 8, m->C );
-	copy4( out + 12, m->D );
+	copy4( out, md->A );
+	copy4( out + 4, md->B );
+	copy4( out + 8, md->C );
+	copy4( out + 12, md->D );
 }
 
 static void mdfour( byte *out, byte *in, int n )
