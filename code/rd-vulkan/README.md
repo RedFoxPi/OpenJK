@@ -239,6 +239,42 @@ frames:
   here left it null with nothing to recreate it, crashing the next texture
   registration. Fixed by making `VK_Shutdown` a no-op unless `destroyWindow`
   is true (i.e. an actual full shutdown, not a soft restart).
+- **Curved surfaces (`MST_PATCH`) are now tessellated** (`VK_TessellatePatchQuad`)
+  instead of being skipped entirely. academy1 (this file's other verification
+  scenes) turns out to have **zero** `MST_PATCH` surfaces - confirmed by
+  parsing its `LUMP_SURFACES` directly - so it was never actually exercising
+  this gap; `hoth2`/`yavin1`/`vjun1` (the render-regression harness's other
+  scenes) have 101/58/146 respectively, all curved terrain/snowdrifts/pipes
+  that previously just weren't there. This is a fixed-subdivision
+  simplification of rd-vanilla's real, adaptive `R_SubdividePatchToGrid`
+  (`tr_curve.cpp`), which only subdivides as much as a patch's actual
+  curvature needs (checked against the `r_subdivisions` cvar's error
+  tolerance) - every patch here always tessellates to the same fixed
+  8x8-quad resolution per 3x3 control-point sub-patch, regardless of size or
+  flatness. That's not a shortcut on the *math*, though: quadratic Bezier
+  de Casteljau subdivision (rd-vanilla's recursive midpoint-bisection
+  approach) and the closed-form biquadratic Bernstein basis evaluation this
+  uses instead both trace the exact same curve family - sampled at fixed
+  rather than adaptive density, not a different or approximate shape. Same
+  "simplify the algorithm, keep the math faithful" tradeoff as the flat
+  (non-subdivided) skybox box elsewhere in this file.
+  **Verified**: no crash on `hoth2` or `vjun1` across several `wait_frames`
+  values (`yavin1` still hits the same pre-existing, unrelated ICARUS
+  `Assertion 0 failed` crash on a direct `devmap` documented earlier in this
+  file - not caused by this change, reproduced identically with patches
+  reverted); `vjun1`'s frustum-culled/visible batch split with patches
+  enabled (11576/12556, ~92%) closely matches the same map with patches
+  skipped (11462/12436, ~92%) across `wait_frames` 30/90/200, so the new
+  per-sub-patch AABBs aren't corrupting culling. Both test maps' default
+  camera angle happens to be a poor vantage point for actually *seeing*
+  terrain (confirmed pre-existing and unrelated to this change too, by
+  reproducing the identical framing with patches reverted) - a visible
+  rounded silhouette on `hoth2`'s one on-screen curved shape is the closest
+  thing to a direct visual check achieved here, short of a proper "fly a
+  camera to a clear vantage point" capability this headless harness doesn't
+  have yet. `academy1`/`sp_menu` are unaffected (identical batch/vertex/index
+  counts and screenshot to before, as expected for a map with no patches to
+  begin with).
 
 ### Ghoul2 rendering (tr_model.cpp)
 
@@ -458,8 +494,10 @@ touch this code)
   was actually verified. Concretely: a `.bsp`'s `LUMP_SHADERS`/
   `LUMP_DRAWVERTS`/`LUMP_DRAWINDEXES`/`LUMP_SURFACES`/`LUMP_LIGHTMAPS` lumps
   (shared, GL-agnostic structs from `qcommon/qfiles.h`) are parsed; only
-  `MST_PLANAR`/`MST_TRIANGLE_SOUP` surfaces are kept (patches/curves and
-  flares are skipped, not tessellated or drawn); `SURF_NODRAW`/`SURF_SKY`
+  `MST_PLANAR`/`MST_TRIANGLE_SOUP` surfaces are kept, and `MST_PATCH`
+  (curved surfaces) are tessellated at a fixed subdivision level - see "3D
+  world geometry" above; `MST_FLARE` is still skipped, not drawn;
+  `SURF_NODRAW`/`SURF_SKY`
   surfaces are skipped; each surface's diffuse texture is resolved through
   the same first-stage-only `.shader` lookup the 2D path uses, multiplied by
   its baked lightmap (or a white 1x1 fallback for surfaces with none); a
@@ -508,8 +546,11 @@ touch this code)
   but every surface potentially in view is still submitted regardless of
   whether the level's BVH/PVS data would say it's actually occluded by
   other geometry, and both triangle winding directions still draw.
-- Curved surfaces/patches (`MST_PATCH`) and flares (`MST_FLARE`) - skipped
-  entirely at load time, not just unlit.
+- Flares (`MST_FLARE`) - skipped entirely at load time, not just unlit.
+  Curved surfaces (`MST_PATCH`) *are* tessellated now (see "3D world
+  geometry" above), but only at a fixed subdivision level, not rd-vanilla's
+  real adaptive one - large or nearly-flat patches get more triangles than
+  they need.
 - Proper sky rendering: what's implemented (see "3D world geometry" above)
   is a flat, non-subdivided skybox using the sky shader's *name* as its
   basename - no `.shader` `skyparms` parsing (so a level whose sky script

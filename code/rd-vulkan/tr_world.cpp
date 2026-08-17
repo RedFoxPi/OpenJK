@@ -19,12 +19,12 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
 // Static world geometry - the first slice of 3D rendering in this renderer.
-// Loads a .bsp's opaque, non-patch surfaces (diffuse texture * baked
-// lightmap, see VK_LoadLightmaps) and draws them unculled, with a real
-// camera. See README.md for exactly what that does and does not cover: no
-// dynamic lights, no entities, no Ghoul2, no BSP visibility culling, no
-// patches/curves, first-.shader-stage texturing only (same scope as the 2D
-// UI path, see tr_shader.cpp).
+// Loads a .bsp's opaque surfaces, including tessellated curved patches (see
+// VK_TessellatePatchQuad) - diffuse texture * baked lightmap (see
+// VK_LoadLightmaps) - and draws them frustum-culled, with a real camera. See
+// README.md for exactly what that does and does not cover: no dynamic
+// lights, no BSP visibility culling, first-.shader-stage texturing only
+// (same scope as the 2D UI path, see tr_shader.cpp).
 //
 // The BSP lump structs (dheader_t/dshader_t/drawVert_t/dsurface_t) are
 // shared, GL-agnostic definitions from qcommon/qfiles.h - unlike Ghoul2
@@ -324,6 +324,95 @@ static void VK_LoadSky( const char *baseName )
 	ri.Printf( PRINT_ALL, "rd-vulkan: loaded sky '%s'\n", baseName );
 }
 
+// Fixed subdivision level for MST_PATCH tessellation (see VK_TessellatePatchQuad
+// below) - a deliberate first-pass simplification of rd-vanilla's real
+// R_SubdividePatchToGrid (tr_curve.cpp), which adaptively subdivides only as
+// much as a curve's actual curvature needs (checked against the r_subdivisions
+// cvar's error tolerance, in world units). This always subdivides every patch
+// to the same fixed 8x8-quad resolution regardless of size or flatness -
+// visually fine (a flat "curve" just tessellates into coplanar quads, wasted
+// but not wrong) at the cost of some avoidable triangle overdraw on large or
+// nearly-flat patches. Same "simplify the algorithm, keep the math faithful"
+// tradeoff as the flat (non-subdivided) skybox box elsewhere in this file.
+static const int PATCH_SUBDIVISIONS = 8;
+
+// Evaluates a single biquadratic Bezier "sub-patch" (3x3 control points) at a
+// fixed (PATCH_SUBDIVISIONS+1)^2 grid of parameter values and appends the
+// resulting vertices/triangles to cpuVerts/cpuIndexes, updating mins/maxs as
+// it goes. The math itself - not just the position, but interpolating a
+// vertex's UV and lightmap UV through the exact same weights - is the
+// standard biquadratic Bezier surface formula (tensor product of two
+// quadratic Bernstein bases), the same curve family rd-vanilla's recursive
+// midpoint-bisection (LerpDrawVert-based) subdivision in tr_curve.cpp
+// produces - quadratic Bezier subdivision is exact, not approximate, so a
+// closed-form basis-function evaluation at a fixed parameter grid traces
+// precisely the same surface, just sampled at fixed rather than adaptive
+// density. ctrl is indexed [row][col], matching R_SubdividePatchToGrid's own
+// ctrl[j][i] = points[j*width+i] convention (row = height axis, col = width
+// axis) - see this function's only caller for how a BSP patch's flat
+// patchWidth*patchHeight control array maps into a 3x3 ctrl for each
+// sub-patch.
+static void VK_TessellatePatchQuad( const WorldVertex ctrl[3][3], int level,
+	std::vector<WorldVertex> &cpuVerts, std::vector<uint32_t> &cpuIndexes,
+	float mins[3], float maxs[3] )
+{
+	uint32_t vertBase = (uint32_t)cpuVerts.size();
+	int stride = level + 1;
+
+	for ( int row = 0; row <= level; row++ )
+	{
+		float v = (float)row / (float)level;
+		float bv[3] = { ( 1 - v ) * ( 1 - v ), 2 * v * ( 1 - v ), v * v };
+		for ( int col = 0; col <= level; col++ )
+		{
+			float u = (float)col / (float)level;
+			float bu[3] = { ( 1 - u ) * ( 1 - u ), 2 * u * ( 1 - u ), u * u };
+
+			WorldVertex out = {};
+			for ( int i = 0; i < 3; i++ )
+			{
+				for ( int j = 0; j < 3; j++ )
+				{
+					float w = bv[i] * bu[j];
+					const WorldVertex &p = ctrl[i][j];
+					out.pos[0] += w * p.pos[0];
+					out.pos[1] += w * p.pos[1];
+					out.pos[2] += w * p.pos[2];
+					out.uv[0] += w * p.uv[0];
+					out.uv[1] += w * p.uv[1];
+					out.lightmapUV[0] += w * p.lightmapUV[0];
+					out.lightmapUV[1] += w * p.lightmapUV[1];
+				}
+			}
+
+			for ( int k = 0; k < 3; k++ )
+			{
+				if ( out.pos[k] < mins[k] ) mins[k] = out.pos[k];
+				if ( out.pos[k] > maxs[k] ) maxs[k] = out.pos[k];
+			}
+			cpuVerts.push_back( out );
+		}
+	}
+
+	// Two triangles per quad cell of the tessellated grid. Winding is not
+	// verified against rd-vanilla's own convention - harmless since world
+	// geometry draws with VK_CULL_MODE_NONE (see VK_CreateWorldPipeline's
+	// "no culling" comment in tr_init.cpp), so both winding directions
+	// render regardless.
+	for ( int row = 0; row < level; row++ )
+	{
+		for ( int col = 0; col < level; col++ )
+		{
+			uint32_t i0 = vertBase + row * stride + col;
+			uint32_t i1 = vertBase + row * stride + col + 1;
+			uint32_t i2 = vertBase + ( row + 1 ) * stride + col;
+			uint32_t i3 = vertBase + ( row + 1 ) * stride + col + 1;
+			cpuIndexes.push_back( i0 ); cpuIndexes.push_back( i2 ); cpuIndexes.push_back( i1 );
+			cpuIndexes.push_back( i1 ); cpuIndexes.push_back( i2 ); cpuIndexes.push_back( i3 );
+		}
+	}
+}
+
 void RE_LoadWorldMap( const char *name )
 {
 	VK_ShutdownWorld();
@@ -398,14 +487,33 @@ void RE_LoadWorldMap( const char *name )
 	for ( int i = 0; i < numSurfaces; i++ )
 	{
 		const dsurface_t &surf = surfaces[i];
-		// Patches (curved surfaces) need tessellation and flares need their
-		// own draw path - neither is implemented yet, skip rather than draw
-		// garbage geometry from their raw control-point data.
-		if ( surf.surfaceType != MST_PLANAR && surf.surfaceType != MST_TRIANGLE_SOUP )
+		// Flares (MST_FLARE) need their own draw path, not implemented yet -
+		// skip rather than draw garbage geometry from their raw data. Patches
+		// (MST_PATCH, curved surfaces) ARE handled below, tessellated via
+		// VK_TessellatePatchQuad - see that function's comment.
+		bool isPatch = surf.surfaceType == MST_PATCH;
+		if ( !isPatch && surf.surfaceType != MST_PLANAR && surf.surfaceType != MST_TRIANGLE_SOUP )
 		{
 			continue;
 		}
-		if ( surf.shaderNum < 0 || surf.shaderNum >= numShaders || surf.numIndexes <= 0 )
+		if ( surf.shaderNum < 0 || surf.shaderNum >= numShaders )
+		{
+			continue;
+		}
+		if ( isPatch )
+		{
+			// A patch's numVerts should be exactly patchWidth*patchHeight (its
+			// flat control-point array) - guard against malformed/truncated
+			// data rather than reading past the surface's own vertex range.
+			// Must be at least a single 3x3 sub-patch (a lone control point
+			// or a 1-wide/1-tall strip can't form one).
+			if ( surf.patchWidth < 3 || surf.patchHeight < 3 ||
+				surf.numVerts < surf.patchWidth * surf.patchHeight )
+			{
+				continue;
+			}
+		}
+		else if ( surf.numIndexes <= 0 )
 		{
 			continue;
 		}
@@ -455,32 +563,67 @@ void RE_LoadWorldMap( const char *name )
 		}
 
 		uint32_t firstIndex = (uint32_t)cpuIndexes.size();
-		for ( int j = 0; j < surf.numIndexes; j++ )
-		{
-			// BSP drawIndexes are surface-local (0-based within the
-			// surface's own [firstVert, firstVert+numVerts) range) - offset
-			// by firstVert to get indices into the single combined vertex
-			// buffer this renderer uploads for the whole world.
-			cpuIndexes.push_back( (uint32_t)( surf.firstVert + indexes[surf.firstIndex + j] ) );
-		}
-
-		// AABB from the surface's own vertex range, for view-frustum culling
-		// in RE_RenderScene - cheap to compute once here vs. re-deriving it
-		// (or worse, testing every vertex) every frame.
+		// AABB from the generated/surface vertex range, for view-frustum
+		// culling in RE_RenderScene - cheap to compute once here vs.
+		// re-deriving it (or worse, testing every vertex) every frame.
 		float mins[3] = { 1e30f, 1e30f, 1e30f };
 		float maxs[3] = { -1e30f, -1e30f, -1e30f };
-		for ( int v = 0; v < surf.numVerts; v++ )
+
+		if ( isPatch )
 		{
-			const float *p = cpuVerts[surf.firstVert + v].pos;
-			for ( int k = 0; k < 3; k++ )
+			// Decompose the flat patchWidth*patchHeight control array into
+			// its (patchWidth-1)/2 x (patchHeight-1)/2 overlapping 3x3
+			// sub-patches (adjacent sub-patches share an edge row/column of
+			// control points, the standard Quake3 "biquadratic patch mesh"
+			// convention) and tessellate each independently - see
+			// VK_TessellatePatchQuad. cpuVerts is captured into a local
+			// ctrl[3][3] by value before any push_back, so the reference
+			// stays valid even though VK_TessellatePatchQuad appends to the
+			// same vector it's reading control points out of.
+			int numPatchesX = ( surf.patchWidth - 1 ) / 2;
+			int numPatchesY = ( surf.patchHeight - 1 ) / 2;
+			for ( int py = 0; py < numPatchesY; py++ )
 			{
-				if ( p[k] < mins[k] ) mins[k] = p[k];
-				if ( p[k] > maxs[k] ) maxs[k] = p[k];
+				for ( int px = 0; px < numPatchesX; px++ )
+				{
+					WorldVertex ctrl[3][3];
+					for ( int ci = 0; ci < 3; ci++ )
+					{
+						for ( int cj = 0; cj < 3; cj++ )
+						{
+							int gx = px * 2 + cj;
+							int gy = py * 2 + ci;
+							ctrl[ci][cj] = cpuVerts[surf.firstVert + gy * surf.patchWidth + gx];
+						}
+					}
+					VK_TessellatePatchQuad( ctrl, PATCH_SUBDIVISIONS, cpuVerts, cpuIndexes, mins, maxs );
+				}
+			}
+		}
+		else
+		{
+			for ( int j = 0; j < surf.numIndexes; j++ )
+			{
+				// BSP drawIndexes are surface-local (0-based within the
+				// surface's own [firstVert, firstVert+numVerts) range) -
+				// offset by firstVert to get indices into the single
+				// combined vertex buffer this renderer uploads for the
+				// whole world.
+				cpuIndexes.push_back( (uint32_t)( surf.firstVert + indexes[surf.firstIndex + j] ) );
+			}
+			for ( int v = 0; v < surf.numVerts; v++ )
+			{
+				const float *p = cpuVerts[surf.firstVert + v].pos;
+				for ( int k = 0; k < 3; k++ )
+				{
+					if ( p[k] < mins[k] ) mins[k] = p[k];
+					if ( p[k] > maxs[k] ) maxs[k] = p[k];
+				}
 			}
 		}
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
-		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf.numIndexes,
+		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] } } );
 	}
 
@@ -499,8 +642,8 @@ void RE_LoadWorldMap( const char *name )
 
 	s_worldLoaded = true;
 
-	ri.Printf( PRINT_ALL, "rd-vulkan: loaded %s: %d draw batches, %d verts, %d indexes, %d lightmaps (skipped patches/flares)\n",
-		name, (int)s_worldSurfaces.size(), numVerts, (int)cpuIndexes.size(), (int)s_lightmapImages.size() );
+	ri.Printf( PRINT_ALL, "rd-vulkan: loaded %s: %d draw batches, %d verts, %d indexes, %d lightmaps (skipped flares)\n",
+		name, (int)s_worldSurfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size(), (int)s_lightmapImages.size() );
 }
 
 // Byte-for-byte copy of rd-vanilla's tr_main.cpp myGlMultMatrix (not
