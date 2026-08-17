@@ -560,7 +560,11 @@ every model instance is posed to a single, correctly-computed static frame
 real per-vertex weighted blending, verified against actual game data - but
 **not yet live**: `G2API_SetBoneAnim`/`GetBoneAnim`/`GetAnimRange` etc are
 still stubs, so nothing yet drives *which* frame plays or advances it over
-time. That's the natural next step, not done here.
+time. That's the natural next step, not done here. **Frame 0 specifically
+is not a meaningful body pose** - see the caveat bullet below (checked
+directly: it's a 2-frame *facial-expression* clip, `FACE_ALERT`, not
+anything resembling a rest/idle stance) - don't read anything into a
+frame-0 screenshot's arm position or facing beyond "the skinning math ran."
 
 The math (bone-hierarchy composition, frame decompression, the skinning
 formula itself) is copied verbatim from rd-vanilla's real, working
@@ -652,6 +656,30 @@ plausible while being wrong.
   translation. `academy1`/`hoth2` screenshots otherwise match the prior
   (bind-pose-only) session's framing and composition, as expected since
   nothing about camera/world/sky/fog changed here.
+- **Important caveat, found by direct question rather than assumed away**:
+  "frame 0" is not a meaningful rest/idle *body* pose and the academy1
+  screenshot's specific arm position/facing should **not** be read as
+  something the real cutscene ever actually shows. Checked directly, not
+  guessed: the Kyle model in that screenshot uses
+  `models/players/_humanoid/_humanoid.gla` (confirmed via its own load
+  log), and that skeleton's `animation.cfg` (`enum, targetFrame,
+  frameCount, ...`) lists frame 0 as belonging to `FACE_ALERT` - a 2-frame
+  **facial-expression-only** clip (there's a whole separate `FACE_*` block
+  of tiny clips before the real `BOTH_*`/body clips start). The real game
+  drives face, torso, and legs as up to three independently-selected,
+  independently-blended animations at once (ICARUS `SET_ANIM_HOLDTIME_BOTH/
+  UPPER/LOWER`, `TID_ANIM_*` in `code/game`); this renderer's frame-0
+  shortcut instead reads *every* bone's compressed data at the same single
+  global frame index, so the body bones shown are whatever incidental data
+  happens to sit in that slot - not a deliberate rest pose, and not
+  anything a real playthrough would display. The `vjun1` articulated-arm
+  result above is still a legitimate confirmation of the skinning *math*
+  (it correctly reproduces whatever pose the data at a given frame encodes)
+  - just not evidence that frame 0 specifically looks like real gameplay.
+  This is the concrete, visible face of the "not live yet" limitation
+  already called out above, not a new bug - and a good illustration of why
+  live animation state (picking the frame the game actually asked for) is
+  the natural next step.
 
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
@@ -900,3 +928,26 @@ xvfb-run -a --server-args="-screen 0 800x600x24" ./openjk_sp.x86_64 \
     +set cl_renderer rd-vulkan +set r_customwidth 640 +set r_customheight 480 \
     +set in_nograb 1 +wait 120 +screenshot_png test +quit
 ```
+
+**`+wait N` counts rendered client frames, not elapsed game time** - a real,
+recurring source of noise when comparing two renderers or two runs, called
+out several times elsewhere in this file (academy1's and hoth2's cutscene-
+camera investigations above). Two renderers with different per-frame cost
+(this one is markedly slower than `rd-vanilla` under lavapipe vs. llvmpipe)
+reach different points along a real-time-paced ICARUS script by the time
+each has rendered its Nth frame, making any comparison at a fixed
+`wait_frames` an apples-to-oranges snapshot unless the scene happens to be
+static. **Fix: `+set com_fixedtime <ms>`** (`qcommon/common.cpp`'s
+`Com_ModifyMsec`) forces *every* frame - regardless of how long it actually
+took to render - to advance the simulated clock by exactly that many
+milliseconds, making `wait_frames * com_fixedtime` a precise, renderer-
+speed-independent amount of game time. Verified on hoth2: with
+`com_fixedtime 16` set, `rd-vanilla` and this renderer given the *same*
+`wait 750` (≈12s of simulated time) land at matching points in the intro
+cutscene - vanilla's screenshot shows the NPC's raised datapad in frame
+against the ship, and this renderer's shows the same datapad-shaped object
+at nearly the same screen position and framing, where without
+`com_fixedtime` the two would show entirely different, incomparable moments
+of the same script (as they did throughout the earlier hoth2 investigation
+above, before this was discovered). It's `CVAR_CHEAT`-flagged but freely
+settable here since `devmap` auto-enables cheats in SP.
