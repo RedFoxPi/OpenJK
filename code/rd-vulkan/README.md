@@ -123,6 +123,20 @@ frames:
   seams at the box edges up close - a deliberate first-pass simplification,
   not a bug. Visually confirmed on academy1: the ceiling grate gaps now
   show hazy blue sky instead of solid black/clear-color.
+- **Bug found and fixed: the sky was rendering vertically flipped.** The
+  per-vertex UV formula was `uv = ((s+1)*0.5, (t+1)*0.5)`, which *looks*
+  like a faithful copy of rd-vanilla's real `MakeSkyVec` (`tr_sky.cpp`) -
+  and the `s`/position math is - but `MakeSkyVec` has one more line after
+  that: `t = 1.0 - t;`, a real, separate V-flip on top of the remap, not
+  just a naming coincidence. Dropping it flipped every face vertically:
+  the ground-level tree-line band each face's texture has near its bottom
+  edge rendered near the *top* of the visible sky instead. Caught by
+  comparing an academy1 screenshot against a vanilla reference (the
+  flipped tree-line was visible as foliage appearing at the top of a
+  window opening with blown-out brightness filling the rest, rather than
+  trees near the sill with sky above) - the exact same reference screenshot
+  used for the Ghoul2 skin-handle bug below, checked more closely once that
+  fix landed. Fixed by adding the missing `1.0f -` back onto `v.uv[1]`.
 - A pixel diff against an `rd-vanilla` reference (same map, same camera, no
   special cvars now that lighting is real) is still a **`MAJOR_DIFF`, ~40%
   mean pixel difference**, and that's expected, not a regression to chase
@@ -328,6 +342,26 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
   academy1 NPCs' resolved-surface counts jumped similarly post-fix (e.g.
   `kyle` 5 -> 19, `jedi` -> 17, `protocol` 32 -> two distinct skin variants
   at 32 and 26).
+- **Caveat, not a bug**: academy1's spawn point is a scripted, *moving*
+  cutscene camera (a close-up character portrait shot that then pulls back
+  - confirmed by capturing the same scene at `wait_frames` 100/200/300
+  (near-first-person, camera essentially at the NPC's side) vs. 600/1000
+  (pulled back to a side/profile view of the same NPC) - the framing keeps
+  changing well past where static world geometry has long since settled).
+  Since `+wait N` waits for N *rendered client frames*, not N fixed
+  server ticks, and the underlying cutscene timeline advances in real
+  (wall-clock) time, two renderers with different per-frame cost reach
+  different points along that timeline by the time each has rendered its
+  Nth frame. That means a screenshot comparison at a fixed `wait_frames`
+  value is only meaningful for content that doesn't move - it's exactly
+  why the *static* world/sky/culling comparisons elsewhere in this file
+  hold up, but it also means a single-frame side-by-side against a vanilla
+  reference can show a legitimately different camera angle/NPC distance
+  through no fault of the renderer, and shouldn't be read as a position bug
+  on its own. (`tests/render-regression`'s `wait_frames: 300` for this
+  scene predates Ghoul2 rendering entirely - it was chosen when nothing
+  but static geometry was visible, so it was never tuned to land on any
+  particular cutscene beat.)
 
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)

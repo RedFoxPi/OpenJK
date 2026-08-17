@@ -293,8 +293,15 @@ static void VK_LoadSky( const char *baseName )
 				int k = st_to_vec[axis][j];
 				v.pos[j] = ( k < 0 ) ? -b[-k - 1] : b[k - 1];
 			}
+			// Bug found and fixed (see README.md): this used to stop at
+			// (s+1)*0.5/(t+1)*0.5, dropping rd-vanilla's real MakeSkyVec's
+			// (tr_sky.cpp) final `t = 1.0 - t` step - a real, separate V-flip
+			// on top of the (t+1)*0.5 remap, not just a naming coincidence.
+			// Without it the sky rendered upside down (tree-line texture
+			// detail appearing near the top of each face instead of the
+			// bottom).
 			v.uv[0] = ( s + 1.0f ) * 0.5f;
-			v.uv[1] = ( t + 1.0f ) * 0.5f;
+			v.uv[1] = 1.0f - ( t + 1.0f ) * 0.5f;
 			v.lightmapUV[0] = 0.0f;
 			v.lightmapUV[1] = 0.0f;
 			cpuVerts.push_back( v );
