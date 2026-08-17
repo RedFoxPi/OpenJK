@@ -392,20 +392,22 @@ frames:
 
 ### Ghoul2 rendering (tr_model.cpp)
 
-Character/weapon model (`.glm`) rendering, in the models' **static bind
-pose only** - no skeletal animation, no bone math at all. The scope-reducing
-fact making that small: `mdxmVertex_t::vertCoords` (`rd-common/mdx_format.h`)
-is already the model's bind-pose object-space position - bone weight data
-only matters for computing how a vertex should move *away* from bind pose
-during animation - so the `.gla` skeleton/animation file is never even
-opened. GLM parsing is a fresh implementation (see "Ghoul2 is not reused
-from rd-vanilla" below for why), but the offset/pointer arithmetic is
-copied field-for-field from rd-vanilla's real `R_LoadMDXM`
-(`rd-vanilla/tr_ghoul2.cpp`) rather than rederived from the struct comments
-alone. Loaded models reuse `tr_world.cpp`'s vertex format, pipeline, and
-descriptor-set-building helper wholesale - a Ghoul2 surface is, for drawing
-purposes, just another indexed triangle batch paired with `vk.whiteImage`
-as its "lightmap" (Ghoul2 meshes have no baked lightmap of their own).
+Character/weapon model (`.glm`) rendering. Real skeletal animation now
+exists (see "Skeletal animation" below) - meshes are skinned per bone,
+not held in a fixed bind pose - but only up to a real, specific limit:
+every model instance always plays **frame 0 of its `.gla`'s animation
+data**, not whatever animation the game actually asked for. `G2API_SetBoneAnim`
+and friends are still stubs (see "What's not implemented yet"), so there is
+not yet any live, time-driven, game-selected animation - just a single,
+correctly-posed *static* frame instead of the old single *bind-pose* frame.
+GLM parsing is a fresh implementation (see "Ghoul2 is not reused from
+rd-vanilla" below for why), but the offset/pointer arithmetic is copied
+field-for-field from rd-vanilla's real `R_LoadMDXM` (`rd-vanilla/tr_ghoul2.cpp`)
+rather than rederived from the struct comments alone. Loaded models reuse
+`tr_world.cpp`'s vertex format, pipeline, and descriptor-set-building helper
+wholesale - a Ghoul2 surface is, for drawing purposes, just another indexed
+triangle batch paired with `vk.whiteImage` as its "lightmap" (Ghoul2 meshes
+have no baked lightmap of their own).
 
 Run against `academy1`, headlessly, same as the world-geometry checks above:
 
@@ -549,6 +551,108 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
   investigation into `cg_camera.cpp`'s broader subject/distance logic (or
   running with sound enabled) to pin down further.
 
+### Skeletal animation (tr_model.cpp)
+
+Real per-bone mesh skinning - the biggest remaining gap this file used to
+document ("no skeletal animation, no bone math at all"). Scope, precisely:
+every model instance is posed to a single, correctly-computed static frame
+(frame 0 of its `.gla`) instead of the old fixed bind pose - real bone math,
+real per-vertex weighted blending, verified against actual game data - but
+**not yet live**: `G2API_SetBoneAnim`/`GetBoneAnim`/`GetAnimRange` etc are
+still stubs, so nothing yet drives *which* frame plays or advances it over
+time. That's the natural next step, not done here.
+
+The math (bone-hierarchy composition, frame decompression, the skinning
+formula itself) is copied verbatim from rd-vanilla's real, working
+implementation - `Multiply_3x4Matrix`/`G2_GetBonePoolIndex`/`UnCompressBone`/
+`G2_RagGetAnimMatrix`/`R_AddGHOULSurfaces` (`rd-vanilla/tr_ghoul2.cpp`) -
+not rederived from the file format comments, for the same reason this
+renderer's other binary-format/matrix-math ports always copy real arithmetic
+rather than reinvent it (see the patch-tessellation and sky-corner-formula
+entries above): a skeletal animation pipeline has a lot of small places to
+get a sign, a row/column, or an indirection backwards and have it *look*
+plausible while being wrong.
+
+- `VK_LoadGhoul2Skeleton` (`.gla` loading) now keeps the whole file resident
+  instead of reading out just bone names/`BasePoseMat` and freeing it - real
+  animation needs on-demand access to `mdxaHeader_t::ofsFrames`/
+  `ofsCompBonePool` at arbitrary later times, not just at load time.
+- `VK_ComputeGhoul2Pose` computes every bone's object-space matrix for one
+  frame: `MC_UnCompressQuat` (`qcommon/matcomp.cpp` - already linked into
+  this renderer, unused until now) decompresses each bone's frame-local
+  delta from the compressed bone pool, and a recursive walk composes each
+  bone with its already-composed parent (`child = parent ∘ delta`, matching
+  rd-vanilla's exact `Multiply_3x4Matrix` argument order).
+- **A real surprise, checked against rd-vanilla's actual code rather than
+  assumed**: this composition deliberately never touches `BasePoseMat`/
+  `BasePoseMatInv` anywhere. That looks wrong at first for something
+  producing an *object-space* pose - but rd-vanilla's real mesh-skinning
+  code (`R_AddGHOULSurfaces`) applies its bone-cache result directly to
+  `mdxmVertex_t::vertCoords` with no bind-pose-inverse step at all;
+  `BasePoseMat`/`BasePoseMatInv` are only used elsewhere, for bolt queries
+  against a fixed reference pose and an optional cvar-gated "unsquash"
+  renormalization pass this renderer doesn't implement. Confirmed empirically
+  too, not just by reading: temporary debug logging of frame 0's composed
+  matrices showed rotation parts very close to identity (trace ≈ 3.0) but
+  *non-zero* translations that don't match `BasePoseMat`'s own translations -
+  consistent with frame 0 being an ordinary animation frame (the first frame
+  of whatever clip happens to be first in the file, not a T-pose/rest
+  reference), which is exactly what the "no BasePoseMatInv" reading predicts
+  and a "frame 0 = bind pose" reading would not have explained.
+- `VK_SkinGhoul2Model` applies that pose to the mesh: linear blend skinning,
+  up to 4 weighted bones per vertex (`G2_GetVertWeights`/`GetVertBoneIndex`/
+  `GetVertBoneWeight`, `rd-common/mdx_format.h`'s existing packed-weight
+  helpers, unused until now), formula copied verbatim from
+  `R_AddGHOULSurfaces`. One indirection worth calling out because it's easy
+  to get wrong silently: `G2_GetVertBoneIndex` returns an index into that
+  *surface's own* `ofsBoneReferences` table, not a global skeleton bone
+  index directly (confirmed against rd-vanilla's real
+  `piBoneReferences[G2_GetVertBoneIndex(v,k)]` usage) - remapped to a real
+  global bone index once at load time (`VK_LoadGhoul2Model`), not redone on
+  every skin.
+- The vertex buffer itself changed from device-local/upload-once (fine for
+  a fixed bind pose) to host-visible/coherent and persistently mapped, since
+  `VK_SkinGhoul2Model` now rewrites its contents from the CPU whenever a
+  model instance's pose changes - CPU skinning, not GPU vertex-shader
+  skinning, the smaller/simpler of the two architectures and consistent
+  with this renderer's existing "CPU-generate geometry, upload a flat
+  buffer" pattern elsewhere (patch tessellation, the skybox box). A real
+  performance cost worth flagging honestly: every visible animated entity
+  gets fully re-skinned and re-uploaded, currently once per model-cache
+  entry per draw (frame 0 never changes, so `lastSkinnedFrame` caching
+  already avoids repeat work *this* pass) - once real per-entity animation
+  state exists, different entities sharing one cached model
+  (`s_ghoul2ModelsByKey`, keyed by file+skin, not by entity) will need
+  independent poses and therefore independent buffers, a real architecture
+  change flagged in `tr_model.cpp`'s comments for that follow-up to address,
+  not solved here.
+- **Bug found and fixed, unrelated to animation itself**: `VK_DrawGhoul2Entities`
+  was still pushing only `mvp` (64 bytes, `VK_SHADER_STAGE_VERTEX_BIT` alone)
+  through `vk.worldPipelineLayout`, which the fog work in a previous session
+  had already widened to a 96-byte `mvp`+`camPos`+`fogColor` range requiring
+  both vertex and fragment stages. Per the Vulkan spec, a `vkCmdPushConstants`
+  call must match the *union* of stage flags for every push-constant range
+  overlapping the bytes it touches - this was pushing a stage-flag subset of
+  what the layout at that byte range actually requires, a real spec
+  violation (silently tolerated by lavapipe in practice, since it never
+  crashed or visibly misrendered, which is exactly why it went unnoticed
+  until reading this code closely for an unrelated reason). Fixed by pushing
+  the full struct with both stages, matching `RE_RenderScene`'s own world/sky
+  pushes exactly; `fogColor.a` stays 0 (fog disabled) since Ghoul2 models
+  aren't fogged this pass.
+- **Verified**: no crash across `academy1`/`vjun1`/`hoth2` (a clean rebuild,
+  zero warnings, all three). Visually: `academy1`'s Kyle-model close-up shows
+  a fully intact, correctly proportioned head/neck/torso/belt at frame 0 -
+  not exploded, stretched, or missing geometry, the failure mode a wrong
+  weight/index/matrix-order bug would produce. More convincingly,
+  `vjun1`'s character (a different model, different `.gla`) shows a visibly
+  *articulated* pose - one arm raised and extended away from the body, not
+  just a rigid whole-model translation - real evidence that per-bone
+  rotation is propagating correctly through the hierarchy, not just
+  translation. `academy1`/`hoth2` screenshots otherwise match the prior
+  (bind-pose-only) session's framing and composition, as expected since
+  nothing about camera/world/sky/fog changed here.
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -629,27 +733,32 @@ touch this code)
   above for what was verified. A flat (non-subdivided, non-warped) 6-face
   box using the sky shader's own name as its basename, always camera-
   centered; drawn depth-test/write-disabled before world geometry.
-- Ghoul2 (character/weapon model) rendering (`tr_model.cpp`), in models'
-  static bind pose - see "Ghoul2 rendering" above for what was verified and
-  its scope: no skeletal animation, LOD selection, per-surface on/off
-  overrides, or gore, but real `.glm` mesh parsing, `.skin` texture
-  resolution (single-file case only), bind-pose bone bolts (see below), and
-  per-frame entity dispatch through the same pipeline/vertex-format world
-  geometry uses.
+- Ghoul2 (character/weapon model) rendering (`tr_model.cpp`) - real `.glm`
+  mesh parsing, `.skin` texture resolution (single-file case only),
+  bind-pose bone bolts, per-frame entity dispatch through the same
+  pipeline/vertex-format world geometry uses, and (see "Skeletal animation"
+  above) real per-bone mesh skinning to a single correctly-computed static
+  frame - not yet *live*, time-driven, game-selected animation (see "What's
+  not implemented yet" below), but real bone math and weighted blending,
+  not the old fixed bind pose. Still missing: LOD selection, per-surface
+  on/off overrides, gore.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
-- Ghoul2 skeletal animation and everything downstream of it: bone math, LOD
-  selection, per-surface on/off overrides (`SetSurfaceOnOff`), gore, tags,
-  ragdoll, model-to-model attachment (`AttachG2Model`/`AttachEnt`) and
-  surface bolts (a bolt naming a *surface* rather than a bone - only bone
-  bolts are implemented, see "Ghoul2 rendering" above for the real, bind-
-  pose-only `AddBolt`/`GetBoltMatrix`). Models render in a fixed bind pose
-  only - see "Ghoul2 rendering" above for exactly what *is* real (mesh
-  parsing, `.skin` textures, bone bolts, entity dispatch) and "Ghoul2 is
-  not reused from rd-vanilla" below for why the animation system in
-  particular is a separate, larger task. Every other `G2API_*` entry point
-  beyond model loading/skin registration/bone bolts is still a safe stub.
+- **Live** Ghoul2 skeletal animation: `G2API_SetBoneAnim`/`GetBoneAnim`/
+  `GetAnimRange`/`SetAnimIndex`/etc are still stubs, so nothing yet tells a
+  model instance which animation to play or advances it over time - see
+  "Skeletal animation" above for what *is* real now (per-bone mesh skinning,
+  correctly posed to a single static frame - frame 0 - instead of the old
+  fixed bind pose). Also still missing: LOD selection, per-surface on/off
+  overrides (`SetSurfaceOnOff`), gore, tags, ragdoll, model-to-model
+  attachment (`AttachG2Model`/`AttachEnt`), animation *blending* (a single
+  pose only, no crossfade between two), and surface bolts (a bolt naming a
+  *surface* rather than a bone - only bone bolts are implemented, see
+  "Ghoul2 rendering" above for `AddBolt`/`GetBoltMatrix`, itself still
+  bind-pose-only regardless of what the mesh is doing). See "Ghoul2 is not
+  reused from rd-vanilla" below for why the animation system was a separate,
+  larger task than the rest of this renderer.
 - Dynamic/scripted fog changes (`RE_SetRangedFog`/`R_SetTempGlobalFogColor`
   are stubs, used by e.g. weather-effect entities in `g_fx.cpp` for
   mid-level fog changes) and per-brush *local* fog volumes (a `LUMP_FOGS`

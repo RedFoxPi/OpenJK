@@ -293,6 +293,12 @@ int VK_RegisterSkin( const char *name );
 // (leaving *out untouched) on any invalid index.
 int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName );
 bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t *out );
+// Computes every bone's object-space pose matrix for one .gla animation
+// frame (see VK_ComputeGhoul2Pose's own comment in tr_model.cpp for the
+// real, verified-against-rd-vanilla math and its deliberate scope cuts).
+// skeletonIndex is VK_LoadGhoul2Skeleton's return value, not a model cache
+// index. Clears and leaves outBones empty on any invalid input.
+void VK_ComputeGhoul2Pose( int skeletonIndex, int frame, std::vector<mdxaBone_t> &outBones );
 
 // tr_shader.cpp
 //

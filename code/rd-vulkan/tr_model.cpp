@@ -45,6 +45,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 #include "tr_local.h"
 #include "../rd-common/mdx_format.h"
+#include "../qcommon/matcomp.h"
 #include <cstring>
 #include <vector>
 #include <unordered_map>
@@ -57,18 +58,50 @@ struct GhoulSurfaceDraw
 	uint32_t indexCount;
 };
 
+// One vertex's CPU-side skinning inputs, parallel (same index) to the
+// uploaded vertex buffer's contents - VK_SkinGhoul2Model re-derives that
+// buffer's positions from these every time a model's pose changes, instead
+// of the fixed-at-load-time WorldVertex the bind-pose-only version of this
+// file baked once and never touched again. boneIndex entries are already
+// remapped from the surface-local indices G2_GetVertBoneIndex returns to
+// global skeleton bone indices (via that surface's own ofsBoneReferences
+// table) at load time, once, rather than needing that indirection redone
+// on every skin - see VK_LoadGhoul2Model.
+struct GhoulSkinVertex
+{
+	float bindPos[3];
+	float uv[2];
+	int numWeights;
+	int boneIndex[iMAX_G2_BONEWEIGHTS_PER_VERT];
+	float boneWeight[iMAX_G2_BONEWEIGHTS_PER_VERT];
+};
+
 struct VulkanGhoul2Model
 {
 	std::vector<GhoulSurfaceDraw> surfaces;
 	VkBuffer vertexBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
+	// Host-visible/coherent and persistently mapped (unlike tr_world.cpp's
+	// device-local geometry, which never changes post-upload) - see
+	// VK_SkinGhoul2Model's comment for why this buffer's contents are
+	// rewritten from the CPU every time a model instance's pose changes,
+	// not just once at load time.
+	void *vertexBufferMapped = nullptr;
 	VkBuffer indexBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
 	// Index into s_skeletons (0 = none/failed to load) - see VulkanSkeleton
-	// below. Only used for bolt lookups (G2API_AddBolt/GetBoltMatrix), never
-	// for mesh rendering - see this file's header comment on why mesh
-	// vertices don't need the skeleton at all.
+	// below. Used both for bolt lookups (G2API_AddBolt/GetBoltMatrix) and,
+	// now, real per-frame mesh skinning (VK_SkinGhoul2Model) - see this
+	// file's header comment for why that used to not be true.
 	int skeletonIndex = 0;
+	// Parallel to the vertex buffer's contents - see GhoulSkinVertex.
+	std::vector<GhoulSkinVertex> skinSource;
+	// Cache of the last frame this model instance's vertex buffer was
+	// skinned to, so an already-up-to-date model isn't needlessly re-skinned
+	// and re-uploaded within the same draw when nothing has changed (e.g.
+	// several sub-models sharing one cache entry - see s_ghoul2ModelsByKey's
+	// comment). -1 = never skinned yet.
+	int lastSkinnedFrame = -1;
 };
 
 // A bind-pose-only skeleton: just bone names and their bind-pose object-
@@ -88,10 +121,23 @@ struct VulkanBone
 {
 	std::string name;
 	mdxaBone_t basePoseMat;
+	int parent; // -1 = root - needed for VK_ComputeGhoul2Pose's hierarchy walk
 };
 struct VulkanSkeleton
 {
 	std::vector<VulkanBone> bones;
+	int numFrames = 0;
+	// The whole .gla file, kept resident (unlike the original bind-pose-only
+	// version of this struct, which read out bone names/BasePoseMat and
+	// freed the file immediately) - animation needs on-demand access to
+	// mdxaHeader_t::ofsFrames/ofsCompBonePool for an arbitrary frame at an
+	// arbitrary later time (see VK_ComputeGhoul2Pose), not just the fixed
+	// bind-pose data read once at load time. Always re-derive the header
+	// pointer from fileData.data() rather than caching it separately - a
+	// moved (not copied) std::vector keeps its heap buffer, so this stays
+	// valid across s_skeletons reallocating, but a cached raw pointer
+	// computed before that move would not be worth the risk for no benefit.
+	std::vector<byte> fileData;
 };
 // Index 0 reserved/invalid, same convention as every other cache in this
 // file. Keyed by the resolved ".gla" path (mdxmHeader_t::animName + ".gla"),
@@ -141,10 +187,18 @@ int VK_LoadGhoul2Skeleton( const char *animName )
 		VulkanBone vb;
 		vb.name = bone->name;
 		vb.basePoseMat = bone->BasePoseMat;
+		vb.parent = bone->parent;
 		skel.bones.push_back( std::move( vb ) );
 	}
 
-	int numBones = (int)skel.bones.size(); // hdr/base alias buffer, freed next - can't read hdr->numBones after
+	int numBones = (int)skel.bones.size();
+	skel.numFrames = hdr->numFrames;
+	// Copy the whole file (not just bones) into our own buffer before
+	// freeing FS's copy - VK_ComputeGhoul2Pose needs ofsFrames/
+	// ofsCompBonePool later, at arbitrary times this function has already
+	// returned from, so the FS-owned buffer (freed below, same as every
+	// other loader in this file) can't be the one it reads from.
+	skel.fileData.assign( base, base + len );
 	ri.FS_FreeFile( buffer );
 
 	if ( s_skeletons.empty() )
@@ -335,6 +389,7 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	std::vector<WorldVertex> cpuVerts;
 	std::vector<uint32_t> cpuIndexes;
 	std::vector<GhoulSurfaceDraw> drawSurfaces;
+	std::vector<GhoulSkinVertex> skinSource;
 
 	for ( int i = 0; i < hdr->numSurfaces; i++ )
 	{
@@ -362,6 +417,13 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 				// the vertex array, not interleaved into mdxmVertex_t itself
 				// (mdx_format.h's comment: "seperated ... for cache reasons").
 				const mdxmVertexTexCoord_t *texCoords = (const mdxmVertexTexCoord_t *)&verts[surf->numVerts];
+				// Surface-local weight bone indices (G2_GetVertBoneIndex)
+				// are indexes into THIS array, not the skeleton directly -
+				// confirmed against rd-vanilla's real R_AddGHOULSurfaces
+				// (tr_ghoul2.cpp: `piBoneReferences[G2_GetVertBoneIndex(v,k)]`).
+				// Remapped to global skeleton bone indices once here, at
+				// load time, so VK_SkinGhoul2Model never needs this table.
+				const int *boneReferences = (const int *)( (const byte *)surf + surf->ofsBoneReferences );
 
 				uint32_t vertBase = (uint32_t)cpuVerts.size();
 				for ( int v = 0; v < surf->numVerts; v++ )
@@ -375,6 +437,23 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 					wv.lightmapUV[0] = 0.0f;
 					wv.lightmapUV[1] = 0.0f;
 					cpuVerts.push_back( wv );
+
+					GhoulSkinVertex sv = {};
+					sv.bindPos[0] = verts[v].vertCoords[0];
+					sv.bindPos[1] = verts[v].vertCoords[1];
+					sv.bindPos[2] = verts[v].vertCoords[2];
+					sv.uv[0] = texCoords[v].texCoords[0];
+					sv.uv[1] = texCoords[v].texCoords[1];
+					sv.numWeights = G2_GetVertWeights( &verts[v] );
+					float totalWeight = 0.0f;
+					for ( int k = 0; k < sv.numWeights && k < iMAX_G2_BONEWEIGHTS_PER_VERT; k++ )
+					{
+						int localBoneIndex = G2_GetVertBoneIndex( &verts[v], k );
+						sv.boneIndex[k] = ( localBoneIndex >= 0 && localBoneIndex < surf->numBoneReferences )
+							? boneReferences[localBoneIndex] : 0;
+						sv.boneWeight[k] = G2_GetVertBoneWeight( &verts[v], k, totalWeight, sv.numWeights );
+					}
+					skinSource.push_back( sv );
 				}
 
 				const mdxmTriangle_t *tris = (const mdxmTriangle_t *)( (const byte *)surf + surf->ofsTriangles );
@@ -415,8 +494,24 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	VulkanGhoul2Model model;
 	model.surfaces = std::move( drawSurfaces );
 	model.skeletonIndex = skeletonIndex;
-	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
-		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &model.vertexBuffer, &model.vertexBufferMemory );
+	model.skinSource = std::move( skinSource );
+
+	// Host-visible/coherent and persistently mapped, not device-local like
+	// tr_world.cpp's static geometry - VK_SkinGhoul2Model rewrites this
+	// buffer's contents directly from the CPU every time this model
+	// instance's pose changes (see its own comment), so there's no benefit
+	// to device-local memory's faster GPU-side read here, only the cost of
+	// a staging-buffer round trip on every re-skin. Initial contents are
+	// the raw bind pose (cpuVerts, built above) - correct until the first
+	// real VK_SkinGhoul2Model call for whatever frame this instance is
+	// actually posed to.
+	VkDeviceSize vbSize = cpuVerts.size() * sizeof( WorldVertex );
+	VK_CreateBuffer( vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&model.vertexBuffer, &model.vertexBufferMemory );
+	vkMapMemory( vk.device, model.vertexBufferMemory, 0, vbSize, 0, &model.vertexBufferMapped );
+	memcpy( model.vertexBufferMapped, cpuVerts.data(), (size_t)vbSize );
+
 	VK_UploadDeviceLocalBuffer( cpuIndexes.data(), cpuIndexes.size() * sizeof( uint32_t ),
 		VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &model.indexBuffer, &model.indexBufferMemory );
 
@@ -474,6 +569,160 @@ bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t
 	}
 	*out = bones[boneIndex].basePoseMat;
 	return true;
+}
+
+// out = a applied first, then b (i.e. out transforms a point by a, then by
+// b) - arithmetic copied verbatim from rd-vanilla's real
+// Multiply_3x4Matrix (tr_ghoul2.cpp), not rederived: this is exactly the
+// operation real skeletal hierarchy composition needs (child = parent ∘
+// child-local-delta) and getting a 3x4 affine multiply's row/column
+// convention subtly backwards is easy to do and hard to notice by eye.
+static void VK_Multiply3x4Matrix( mdxaBone_t *out, const mdxaBone_t *b, const mdxaBone_t *a )
+{
+	out->matrix[0][0] = ( b->matrix[0][0] * a->matrix[0][0] ) + ( b->matrix[0][1] * a->matrix[1][0] ) + ( b->matrix[0][2] * a->matrix[2][0] );
+	out->matrix[0][1] = ( b->matrix[0][0] * a->matrix[0][1] ) + ( b->matrix[0][1] * a->matrix[1][1] ) + ( b->matrix[0][2] * a->matrix[2][1] );
+	out->matrix[0][2] = ( b->matrix[0][0] * a->matrix[0][2] ) + ( b->matrix[0][1] * a->matrix[1][2] ) + ( b->matrix[0][2] * a->matrix[2][2] );
+	out->matrix[0][3] = ( b->matrix[0][0] * a->matrix[0][3] ) + ( b->matrix[0][1] * a->matrix[1][3] ) + ( b->matrix[0][2] * a->matrix[2][3] ) + b->matrix[0][3];
+	out->matrix[1][0] = ( b->matrix[1][0] * a->matrix[0][0] ) + ( b->matrix[1][1] * a->matrix[1][0] ) + ( b->matrix[1][2] * a->matrix[2][0] );
+	out->matrix[1][1] = ( b->matrix[1][0] * a->matrix[0][1] ) + ( b->matrix[1][1] * a->matrix[1][1] ) + ( b->matrix[1][2] * a->matrix[2][1] );
+	out->matrix[1][2] = ( b->matrix[1][0] * a->matrix[0][2] ) + ( b->matrix[1][1] * a->matrix[1][2] ) + ( b->matrix[1][2] * a->matrix[2][2] );
+	out->matrix[1][3] = ( b->matrix[1][0] * a->matrix[0][3] ) + ( b->matrix[1][1] * a->matrix[1][3] ) + ( b->matrix[1][2] * a->matrix[2][3] ) + b->matrix[1][3];
+	out->matrix[2][0] = ( b->matrix[2][0] * a->matrix[0][0] ) + ( b->matrix[2][1] * a->matrix[1][0] ) + ( b->matrix[2][2] * a->matrix[2][0] );
+	out->matrix[2][1] = ( b->matrix[2][0] * a->matrix[0][1] ) + ( b->matrix[2][1] * a->matrix[1][1] ) + ( b->matrix[2][2] * a->matrix[2][1] );
+	out->matrix[2][2] = ( b->matrix[2][0] * a->matrix[0][2] ) + ( b->matrix[2][1] * a->matrix[1][2] ) + ( b->matrix[2][2] * a->matrix[2][2] );
+	out->matrix[2][3] = ( b->matrix[2][0] * a->matrix[0][3] ) + ( b->matrix[2][1] * a->matrix[1][3] ) + ( b->matrix[2][2] * a->matrix[2][3] ) + b->matrix[2][3];
+}
+
+// Per-(frame,bone) index into the compressed bone pool - a little-endian
+// packed 3-byte int (mdxaIndex_t), formula copied verbatim from
+// rd-vanilla's real G2_GetBonePoolIndex (tr_ghoul2.cpp).
+static int VK_GetGhoul2BonePoolIndex( const mdxaHeader_t *header, int frame, int bone )
+{
+	int offset = ( frame * header->numBones * 3 ) + ( bone * 3 );
+	const mdxaIndex_t *index = (const mdxaIndex_t *)( (const byte *)header + header->ofsFrames + offset );
+	return ( index->iIndex[2] << 16 ) + ( index->iIndex[1] << 8 ) + index->iIndex[0];
+}
+
+// Computes every bone's object-space pose matrix for one animation frame of
+// one skeleton - the input to both mesh skinning (VK_SkinGhoul2Model, added
+// in a follow-up commit) and (eventually) a real, animated
+// G2API_GetBoltMatrix. No blending between two frames/animations, no
+// per-bone angle overrides, no ragdoll, no smoothing - see README.md for
+// the deliberate scope cut versus rd-vanilla's real, much larger
+// CBoneCache/G2_TransformBone (tr_ghoul2.cpp).
+//
+// Deliberately NOT using mdxaSkel_t::BasePoseMat/BasePoseMatInv anywhere in
+// this path, even though that looks suspicious at first glance for
+// something computing an object-space pose - confirmed against
+// rd-vanilla's real mesh-skinning code (R_AddGHOULSurfaces, tr_ghoul2.cpp):
+// it applies CBoneCache::EvalRender()'s result - exactly this function's
+// per-bone hierarchy composition, with no BasePoseMatInv step - directly to
+// mdxmVertex_t::vertCoords. BasePoseMat/BasePoseMatInv are only used
+// elsewhere for bolt queries against a fixed reference pose and an
+// optional, cvar-gated "unsquash" renormalization pass - not the ordinary
+// animated-mesh-skinning path this function feeds.
+static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdxaHeader_t *header, int frame,
+	int boneIndex, std::vector<mdxaBone_t> &outBones, std::vector<bool> &computed )
+{
+	if ( computed[boneIndex] )
+	{
+		return;
+	}
+
+	mdxaBone_t delta;
+	const mdxaCompQuatBone_t *pool = (const mdxaCompQuatBone_t *)( (const byte *)header + header->ofsCompBonePool );
+	int poolIndex = VK_GetGhoul2BonePoolIndex( header, frame, boneIndex );
+	MC_UnCompressQuat( delta.matrix, pool[poolIndex].Comp );
+
+	int parent = skel.bones[boneIndex].parent;
+	if ( parent < 0 )
+	{
+		outBones[boneIndex] = delta;
+	}
+	else
+	{
+		VK_ComputeGhoul2BoneRecursive( skel, header, frame, parent, outBones, computed );
+		VK_Multiply3x4Matrix( &outBones[boneIndex], &outBones[parent], &delta );
+	}
+	computed[boneIndex] = true;
+}
+
+void VK_ComputeGhoul2Pose( int skeletonIndex, int frame, std::vector<mdxaBone_t> &outBones )
+{
+	outBones.clear();
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return;
+	}
+	const VulkanSkeleton &skel = s_skeletons[skeletonIndex];
+	if ( skel.numFrames <= 0 )
+	{
+		return;
+	}
+	if ( frame < 0 || frame >= skel.numFrames )
+	{
+		frame = 0;
+	}
+
+	const mdxaHeader_t *header = (const mdxaHeader_t *)skel.fileData.data();
+	int numBones = (int)skel.bones.size();
+	outBones.resize( numBones );
+	std::vector<bool> computed( numBones, false );
+	for ( int i = 0; i < numBones; i++ )
+	{
+		VK_ComputeGhoul2BoneRecursive( skel, header, frame, i, outBones, computed );
+	}
+}
+
+// Recomputes one model instance's vertex buffer for a given pose - linear
+// blend skinning, weighted sum of (bone.matrix applied to bindPos) over
+// each vertex's up-to-4 weighted bones. Formula (including applying the
+// pose matrix directly to bindPos with no extra bind-pose-inverse step, and
+// the 1/2/generic-N weight cases) copied verbatim from rd-vanilla's real
+// R_AddGHOULSurfaces (tr_ghoul2.cpp) - see VK_ComputeGhoul2Pose's comment
+// for why no BasePoseMatInv belongs here. A model with no valid skeleton
+// (pose.empty()) falls back to unskinned bind pose - the original
+// behavior, still correct for e.g. single-bone weapon models attached via
+// a bolt rather than posed themselves.
+static void VK_SkinGhoul2Model( VulkanGhoul2Model &model, const std::vector<mdxaBone_t> &pose )
+{
+	WorldVertex *out = (WorldVertex *)model.vertexBufferMapped;
+	for ( size_t v = 0; v < model.skinSource.size(); v++ )
+	{
+		const GhoulSkinVertex &sv = model.skinSource[v];
+		float pos[3] = { 0.0f, 0.0f, 0.0f };
+
+		if ( !pose.empty() )
+		{
+			for ( int k = 0; k < sv.numWeights; k++ )
+			{
+				int boneIndex = sv.boneIndex[k];
+				if ( boneIndex < 0 || (size_t)boneIndex >= pose.size() )
+				{
+					continue;
+				}
+				const mdxaBone_t &m = pose[boneIndex];
+				float w = sv.boneWeight[k];
+				pos[0] += w * ( m.matrix[0][0] * sv.bindPos[0] + m.matrix[0][1] * sv.bindPos[1] + m.matrix[0][2] * sv.bindPos[2] + m.matrix[0][3] );
+				pos[1] += w * ( m.matrix[1][0] * sv.bindPos[0] + m.matrix[1][1] * sv.bindPos[1] + m.matrix[1][2] * sv.bindPos[2] + m.matrix[1][3] );
+				pos[2] += w * ( m.matrix[2][0] * sv.bindPos[0] + m.matrix[2][1] * sv.bindPos[1] + m.matrix[2][2] * sv.bindPos[2] + m.matrix[2][3] );
+			}
+		}
+		else
+		{
+			pos[0] = sv.bindPos[0];
+			pos[1] = sv.bindPos[1];
+			pos[2] = sv.bindPos[2];
+		}
+
+		out[v].pos[0] = pos[0];
+		out[v].pos[1] = pos[1];
+		out[v].pos[2] = pos[2];
+		out[v].uv[0] = sv.uv[0];
+		out[v].uv[1] = sv.uv[1];
+		out[v].lightmapUV[0] = 0.0f;
+		out[v].lightmapUV[1] = 0.0f;
+	}
 }
 
 void VK_ShutdownGhoul2Models( void )
@@ -574,13 +823,41 @@ void VK_DrawGhoul2Entities( const float *mvp )
 			{
 				continue;
 			}
-			const VulkanGhoul2Model &model = s_ghoul2Models[modelIndex];
+			VulkanGhoul2Model &model = s_ghoul2Models[modelIndex];
 			if ( model.surfaces.empty() )
 			{
 				continue;
 			}
 
-			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof( entityMvp ), entityMvp );
+			// TEMPORARY: always frame 0 - real per-entity animation state
+			// (G2API_SetBoneAnim tracking + time-based frame selection) is
+			// a follow-up step, not implemented yet (see README.md). Every
+			// entity sharing this cached model (model.skinSource, keyed by
+			// file+skin, not by entity - see s_ghoul2ModelsByKey's comment)
+			// necessarily shares one vertex buffer and therefore one pose
+			// for now; once entities can be at genuinely different frames
+			// this per-model buffer/cache will need to become per-entity
+			// instead, see the same follow-up note.
+			int targetFrame = 0;
+			if ( model.lastSkinnedFrame != targetFrame )
+			{
+				std::vector<mdxaBone_t> pose;
+				VK_ComputeGhoul2Pose( model.skeletonIndex, targetFrame, pose );
+				VK_SkinGhoul2Model( model, pose );
+				model.lastSkinnedFrame = targetFrame;
+			}
+
+			// Full push constant struct (mvp + camPos + fogColor), both
+			// stages - matching vk.worldPipelineLayout's actual range (see
+			// tr_init.cpp) exactly, not just the mvp-sized/vertex-only push
+			// this used before the fog work touched that layout. Ghoul2
+			// models aren't fogged (see README.md), so fogColor.a stays 0
+			// (disabling the mix in world.frag) same as the sky's own push
+			// in tr_world.cpp.
+			vkWorldPushConstants_t entityPush = {};
+			memcpy( entityPush.mvp, entityMvp, sizeof( entityMvp ) );
+			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+				0, sizeof( entityPush ), &entityPush );
 
 			VkDeviceSize vertexOffset = 0;
 			vkCmdBindVertexBuffers( cmd, 0, 1, &model.vertexBuffer, &vertexOffset );
