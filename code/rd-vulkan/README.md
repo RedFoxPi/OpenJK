@@ -93,21 +93,40 @@ frames:
   is right but something else is missing"); (2) visually, the rendered
   screenshot shows coherent architecture with correct-looking perspective,
   not noise or a degenerate blob.
-- A pixel diff against an `rd-vanilla` reference (same map, same camera,
-  `r_fullbright 1` to remove lighting from the comparison) is a
-  **`MAJOR_DIFF`, ~23% mean pixel difference** (down from an initial 39% -
-  see the dust/fog quad bug below), and the remainder is expected, not a
-  regression to chase down: academy1's spawn point is a scripted
-  character-portrait shot (confirmed by comparing against a `capture.py`
-  reference captured independently, much earlier, with default settings -
-  same framing both times, so this is genuinely the level's intro camera,
-  not an artifact of any flag used here) where the player's own Ghoul2 model
-  fills a large fraction of the frame - and Ghoul2 rendering is entirely
-  unimplemented (see "Ghoul2 is not reused from rd-vanilla" below). Sky
-  isn't implemented either (see below). Given that, a large diff on *this
-  specific scene* is exactly what "no models, no sky, no lighting yet"
-  predicts - it's not evidence the world-geometry path itself is wrong (see
-  the hand-verified matrix math above for that).
+- World geometry is now **lit by the map's baked lightmap** (see
+  `VK_LoadLightmaps` in `tr_world.cpp`), not flat/fullbright: `LUMP_LIGHTMAPS`
+  is a flat array of fixed-size (128x128) RGB images with no explicit count
+  or index (divide the lump length by one image's byte size), each uploaded
+  as a plain texture; each surface's second UV set (`drawVert_t.lightmap[0]`,
+  already parsed, just previously unused) samples its assigned lightmap
+  (`dsurface_t.lightmapNum[0]`, or a 1x1 white fallback for surfaces with
+  none - vertex-lit/fullbright cases), multiplied with the diffuse texture
+  in `world.frag`. This is what makes a *non*-`r_fullbright` comparison
+  against `rd-vanilla` meaningful for the first time - visually, the
+  academy1 screenshot now shows real light shafts and shadowing (a grated
+  ceiling casting light bars across the floor) instead of flat, uniformly-lit
+  surfaces, and reads as a recognizable game screenshot rather than a
+  lighting-flattened render.
+- A pixel diff against an `rd-vanilla` reference (same map, same camera, no
+  special cvars now that lighting is real) is still a **`MAJOR_DIFF`, ~40%
+  mean pixel difference**, and that's expected, not a regression to chase
+  down: academy1's spawn point is a scripted character-portrait shot
+  (confirmed by comparing against a `capture.py` reference captured
+  independently, much earlier, with default settings - same framing both
+  times, so this is genuinely the level's intro camera, not an artifact of
+  any flag used here) where the player's own Ghoul2 model fills a large
+  fraction of the frame - and Ghoul2 rendering is entirely unimplemented
+  (see "Ghoul2 is not reused from rd-vanilla" below). Sky isn't implemented
+  either (see below). Given that, a large diff on *this specific scene* is
+  exactly what "no models, no sky yet" predicts - it's not evidence the
+  world-geometry or lighting path itself is wrong (see the hand-verified
+  matrix math above, and the visual lightmap check just above, for that).
+  Before lightmaps landed, the same comparison needed `r_fullbright 1` on
+  the vanilla side to be meaningful at all, and scored progressively 39%
+  (initial) then 23% (after the `SURF_NODRAW`/dust-quad fixes below) mean
+  diff - those numbers aren't directly comparable to the current ~40%,
+  since fullbright-vs-fullbright and lit-vs-lit are different comparisons,
+  not a regression between them.
 - **Bug found and fixed**: `SURF_NODRAW`-flagged surfaces (editor-only
   geometry - caulk, clip, trigger volumes; 3 of academy1's 16 shaders) and
   `SURF_SKY`-flagged surfaces weren't excluded at all, so each painted a
@@ -230,19 +249,22 @@ touch this code)
 - Static world/BSP geometry (`tr_world.cpp`: `RE_LoadWorldMap`,
   `RE_RenderScene`, `RE_ClearScene`) - see "3D world geometry" above for what
   was actually verified. Concretely: a `.bsp`'s `LUMP_SHADERS`/
-  `LUMP_DRAWVERTS`/`LUMP_DRAWINDEXES`/`LUMP_SURFACES` lumps (shared,
-  GL-agnostic structs from `qcommon/qfiles.h`) are parsed; only
+  `LUMP_DRAWVERTS`/`LUMP_DRAWINDEXES`/`LUMP_SURFACES`/`LUMP_LIGHTMAPS` lumps
+  (shared, GL-agnostic structs from `qcommon/qfiles.h`) are parsed; only
   `MST_PLANAR`/`MST_TRIANGLE_SOUP` surfaces are kept (patches/curves and
-  flares are skipped, not tessellated or drawn); each surface's diffuse
-  texture is resolved through the same first-stage-only `.shader` lookup the
-  2D path uses; geometry is unlit (no lightmap/vertex-color term at all -
-  not even the `.shader`-driven blend-mode selection the 2D path has, every
-  surface uses one opaque pipeline), unculled (no BSP visibility culling,
-  no view-frustum culling, no back-face culling - see the "no culling"
-  comment on `VK_CreateWorldPipeline` in `tr_init.cpp` for why not even
-  back-face culling is safe to turn on yet), and drawn with a real
-  per-frame camera built from `refdef_t` (see `VK_BuildViewMatrix`/
-  `VK_BuildProjectionMatrix` in `tr_world.cpp`).
+  flares are skipped, not tessellated or drawn); `SURF_NODRAW`/`SURF_SKY`
+  surfaces are skipped; each surface's diffuse texture is resolved through
+  the same first-stage-only `.shader` lookup the 2D path uses, multiplied by
+  its baked lightmap (or a white 1x1 fallback for surfaces with none); a
+  surface whose diffuse texture fails to resolve is skipped rather than
+  drawn wrong (see the `dark_dust` bug below); geometry is unculled (no BSP
+  visibility culling, no view-frustum culling, no back-face culling - see
+  the "no culling" comment on `VK_CreateWorldPipeline` in `tr_init.cpp` for
+  why not even back-face culling is safe to turn on yet) and every surface
+  uses one opaque pipeline (not even the `.shader`-driven blend-mode
+  selection the 2D path has); drawn with a real per-frame camera built from
+  `refdef_t` (see `VK_BuildViewMatrix`/`VK_BuildProjectionMatrix` in
+  `tr_world.cpp`).
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -252,9 +274,11 @@ touch this code)
   models will animate, attach, or render. (Registration now reports success
   - see the "3D world geometry" bugs-found list above - so game logic
   proceeds normally; it's specifically the rendering that's still a no-op.)
-- Lighting of any kind for world geometry - no lightmaps, no vertex
-  lighting, no dynamic lights (`AddLightToScene` is a stub). Every static
-  surface draws at flat, unlit texture brightness.
+- Dynamic lighting for world geometry (`AddLightToScene` is a stub) and
+  vertex lighting/colors - only the map's precomputed, baked lightmap
+  applies (see "3D world geometry" above). No shadows other than what's
+  already baked into that lightmap; nothing moves, casts, or receives a
+  dynamic shadow.
 - BSP visibility culling, view-frustum culling, and back-face culling for
   world geometry - every loaded static surface is submitted every frame,
   see "3D world geometry" above.

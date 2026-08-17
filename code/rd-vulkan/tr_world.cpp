@@ -19,11 +19,12 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
 // Static world geometry - the first slice of 3D rendering in this renderer.
-// Loads a .bsp's opaque, non-patch surfaces (positions + diffuse UVs only)
-// and draws them unlit, unculled, with a real camera. See README.md for
-// exactly what that does and does not cover: no lighting, no entities, no
-// Ghoul2, no BSP visibility culling, no patches/curves, first-.shader-stage
-// texturing only (same scope as the 2D UI path, see tr_shader.cpp).
+// Loads a .bsp's opaque, non-patch surfaces (diffuse texture * baked
+// lightmap, see VK_LoadLightmaps) and draws them unculled, with a real
+// camera. See README.md for exactly what that does and does not cover: no
+// dynamic lights, no entities, no Ghoul2, no BSP visibility culling, no
+// patches/curves, first-.shader-stage texturing only (same scope as the 2D
+// UI path, see tr_shader.cpp).
 //
 // The BSP lump structs (dheader_t/dshader_t/drawVert_t/dsurface_t) are
 // shared, GL-agnostic definitions from qcommon/qfiles.h - unlike Ghoul2
@@ -46,7 +47,12 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 struct WorldSurfaceBatch
 {
-	image_t *image;
+	// Combines a surface's diffuse image and its lightmap image (see
+	// VK_BuildWorldDescriptorSet) - one set per batch, not per texture,
+	// since Vulkan descriptor sets are fixed-shape (both bindings must be
+	// filled at once) and a diffuse image can pair with different lightmaps
+	// on different surfaces.
+	VkDescriptorSet descriptorSet;
 	uint32_t firstIndex;
 	uint32_t indexCount;
 };
@@ -58,12 +64,41 @@ static VkBuffer s_worldIndexBuffer = VK_NULL_HANDLE;
 static VkDeviceMemory s_worldIndexBufferMemory = VK_NULL_HANDLE;
 static bool s_worldLoaded = false;
 
+// Lightmaps (see VK_LoadLightmaps) - owned separately from the regular
+// named-image cache in tr_image.cpp since they're anonymous (indexed by
+// position in the BSP's LUMP_LIGHTMAPS, not by name) and per-map, not
+// per-name-cached across map loads.
+static std::vector<image_t *> s_lightmapImages;
+// Bound for any surface with no lightmap of its own (dsurface_t.lightmapNum
+// < 0 - vertex-lit or fullbright surfaces) so the shader's diffuse*lightmap
+// multiply is a no-op rather than requiring a separate unlit code path.
+static image_t *s_whiteLightmap = nullptr;
+
+static void VK_DestroyWorldImage( image_t *img )
+{
+	if ( !img ) return;
+	if ( img->view ) vkDestroyImageView( vk.device, img->view, nullptr );
+	if ( img->image ) vkDestroyImage( vk.device, img->image, nullptr );
+	if ( img->memory ) vkFreeMemory( vk.device, img->memory, nullptr );
+	delete img;
+}
+
 void VK_ShutdownWorld( void )
 {
 	if ( s_worldVertexBuffer ) { vkDestroyBuffer( vk.device, s_worldVertexBuffer, nullptr ); s_worldVertexBuffer = VK_NULL_HANDLE; }
 	if ( s_worldVertexBufferMemory ) { vkFreeMemory( vk.device, s_worldVertexBufferMemory, nullptr ); s_worldVertexBufferMemory = VK_NULL_HANDLE; }
 	if ( s_worldIndexBuffer ) { vkDestroyBuffer( vk.device, s_worldIndexBuffer, nullptr ); s_worldIndexBuffer = VK_NULL_HANDLE; }
 	if ( s_worldIndexBufferMemory ) { vkFreeMemory( vk.device, s_worldIndexBufferMemory, nullptr ); s_worldIndexBufferMemory = VK_NULL_HANDLE; }
+	for ( image_t *img : s_lightmapImages ) VK_DestroyWorldImage( img );
+	s_lightmapImages.clear();
+	VK_DestroyWorldImage( s_whiteLightmap );
+	s_whiteLightmap = nullptr;
+	// Descriptor sets allocated per-batch below come from this pool, not
+	// individually tracked - reclaim them all at once rather than freeing
+	// one by one (vk.worldDescriptorPool wasn't created with
+	// VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT, so individual
+	// vkFreeDescriptorSets calls aren't valid on it anyway).
+	if ( vk.worldDescriptorPool ) vkResetDescriptorPool( vk.device, vk.worldDescriptorPool, 0 );
 	s_worldSurfaces.clear();
 	s_worldLoaded = false;
 }
@@ -92,6 +127,80 @@ static void VK_UploadDeviceLocalBuffer( const void *data, VkDeviceSize size, VkB
 
 	vkDestroyBuffer( vk.device, staging, nullptr );
 	vkFreeMemory( vk.device, stagingMemory, nullptr );
+}
+
+// Lightmaps are stored as a flat array of fixed-size (LIGHTMAP_WIDTH x
+// LIGHTMAP_HEIGHT) RGB888 images, one after another - no header, no count
+// field, just divide the lump length by one image's byte size. Expanded to
+// RGBA here since VK_UploadImage (tr_image.cpp) - reused as-is, this is a
+// plain texture upload once expanded - expects 4 bytes/pixel like every
+// other image this renderer handles.
+static void VK_LoadLightmaps( const byte *lumpData, int lumpLen )
+{
+	const int imageSize = LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 3;
+	int count = imageSize > 0 ? lumpLen / imageSize : 0;
+
+	std::vector<byte> rgba( (size_t)LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT * 4 );
+	for ( int i = 0; i < count; i++ )
+	{
+		const byte *rgb = lumpData + (size_t)i * imageSize;
+		for ( int p = 0; p < LIGHTMAP_WIDTH * LIGHTMAP_HEIGHT; p++ )
+		{
+			rgba[(size_t)p * 4 + 0] = rgb[(size_t)p * 3 + 0];
+			rgba[(size_t)p * 4 + 1] = rgb[(size_t)p * 3 + 1];
+			rgba[(size_t)p * 4 + 2] = rgb[(size_t)p * 3 + 2];
+			rgba[(size_t)p * 4 + 3] = 255;
+		}
+
+		image_t *img = new image_t();
+		VK_UploadImage( img, rgba.data(), LIGHTMAP_WIDTH, LIGHTMAP_HEIGHT );
+		s_lightmapImages.push_back( img );
+	}
+
+	byte white[4] = { 255, 255, 255, 255 };
+	s_whiteLightmap = new image_t();
+	VK_UploadImage( s_whiteLightmap, white, 1, 1 );
+}
+
+// One combined (diffuse, lightmap) descriptor set per surface batch - see
+// WorldSurfaceBatch's comment for why this can't be cached per-texture the
+// way the UI path's single-binding descriptor sets are (image_t::
+// descriptorSet, unused here): the same diffuse image can legitimately pair
+// with different lightmaps on different surfaces.
+static VkDescriptorSet VK_BuildWorldDescriptorSet( image_t *diffuse, image_t *lightmap )
+{
+	VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+	alloc.descriptorPool = vk.worldDescriptorPool;
+	alloc.descriptorSetCount = 1;
+	alloc.pSetLayouts = &vk.worldDescriptorSetLayout;
+
+	VkDescriptorSet set = VK_NULL_HANDLE;
+	VK_Check( vkAllocateDescriptorSets( vk.device, &alloc, &set ), "vkAllocateDescriptorSets (world)" );
+
+	VkDescriptorImageInfo imageInfos[2] = {};
+	imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	imageInfos[0].imageView = diffuse->view;
+	imageInfos[0].sampler = vk.worldSampler;
+	imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	imageInfos[1].imageView = lightmap->view;
+	imageInfos[1].sampler = vk.worldSampler;
+
+	VkWriteDescriptorSet writes[2] = {};
+	writes[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	writes[0].dstSet = set;
+	writes[0].dstBinding = 0;
+	writes[0].descriptorCount = 1;
+	writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[0].pImageInfo = &imageInfos[0];
+	writes[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+	writes[1].dstSet = set;
+	writes[1].dstBinding = 1;
+	writes[1].descriptorCount = 1;
+	writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	writes[1].pImageInfo = &imageInfos[1];
+
+	vkUpdateDescriptorSets( vk.device, 2, writes, 0, nullptr );
+	return set;
 }
 
 void RE_LoadWorldMap( const char *name )
@@ -130,6 +239,8 @@ void RE_LoadWorldMap( const char *name )
 	const dsurface_t *surfaces = (const dsurface_t *)lumpData( LUMP_SURFACES );
 	int numSurfaces = lumpCount( LUMP_SURFACES, sizeof( dsurface_t ) );
 
+	VK_LoadLightmaps( lumpData( LUMP_LIGHTMAPS ), header->lumps[LUMP_LIGHTMAPS].filelen );
+
 	std::vector<WorldVertex> cpuVerts( (size_t)numVerts );
 	for ( int i = 0; i < numVerts; i++ )
 	{
@@ -138,6 +249,10 @@ void RE_LoadWorldMap( const char *name )
 		cpuVerts[i].pos[2] = verts[i].xyz[2];
 		cpuVerts[i].uv[0] = verts[i].st[0];
 		cpuVerts[i].uv[1] = verts[i].st[1];
+		// Lightmap UV set 0 - the other 3 (deluxe maps / secondary styles)
+		// aren't used by this renderer, see WorldVertex's comment.
+		cpuVerts[i].lightmapUV[0] = verts[i].lightmap[0][0];
+		cpuVerts[i].lightmapUV[1] = verts[i].lightmap[0][1];
 	}
 
 	std::vector<uint32_t> cpuIndexes;
@@ -195,6 +310,13 @@ void RE_LoadWorldMap( const char *name )
 			continue;
 		}
 
+		image_t *lightmap = s_whiteLightmap;
+		int lightmapNum = surf.lightmapNum[0];
+		if ( lightmapNum >= 0 && (size_t)lightmapNum < s_lightmapImages.size() )
+		{
+			lightmap = s_lightmapImages[lightmapNum];
+		}
+
 		uint32_t firstIndex = (uint32_t)cpuIndexes.size();
 		for ( int j = 0; j < surf.numIndexes; j++ )
 		{
@@ -205,7 +327,8 @@ void RE_LoadWorldMap( const char *name )
 			cpuIndexes.push_back( (uint32_t)( surf.firstVert + indexes[surf.firstIndex + j] ) );
 		}
 
-		s_worldSurfaces.push_back( { img, firstIndex, (uint32_t)surf.numIndexes } );
+		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( img, lightmap );
+		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf.numIndexes } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -223,8 +346,8 @@ void RE_LoadWorldMap( const char *name )
 
 	s_worldLoaded = true;
 
-	ri.Printf( PRINT_ALL, "rd-vulkan: loaded %s: %d draw batches, %d verts, %d indexes (skipped patches/flares)\n",
-		name, (int)s_worldSurfaces.size(), numVerts, (int)cpuIndexes.size() );
+	ri.Printf( PRINT_ALL, "rd-vulkan: loaded %s: %d draw batches, %d verts, %d indexes, %d lightmaps (skipped patches/flares)\n",
+		name, (int)s_worldSurfaces.size(), numVerts, (int)cpuIndexes.size(), (int)s_lightmapImages.size() );
 }
 
 // No per-frame entity/poly/light list to clear yet (RE_AddRefEntityToScene
@@ -367,7 +490,7 @@ void RE_RenderScene( const refdef_t *fd )
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
 		vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.worldPipelineLayout,
-			0, 1, &batch.image->descriptorSet, 0, nullptr );
+			0, 1, &batch.descriptorSet, 0, nullptr );
 		vkCmdDrawIndexed( cmd, batch.indexCount, 1, batch.firstIndex, 0, 0 );
 	}
 

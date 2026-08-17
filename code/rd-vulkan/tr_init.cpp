@@ -758,18 +758,50 @@ static void VK_CreateUiPipeline( void )
 
 static void VK_CreateWorldPipeline( void )
 {
+	// World draws need two bound textures per surface (diffuse + lightmap -
+	// see tr_world.cpp's VK_LoadLightmaps), unlike the UI path's one, so
+	// this gets its own descriptor set layout/pool rather than reusing
+	// vk.uiDescriptorSetLayout. One set is built per surface batch at map
+	// load (VK_BuildWorldDescriptorSet in tr_world.cpp), not per texture.
+	VkDescriptorSetLayoutBinding bindings[2] = {};
+	bindings[0].binding = 0;
+	bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	bindings[0].descriptorCount = 1;
+	bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+	bindings[1].binding = 1;
+	bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+	bindings[1].descriptorCount = 1;
+	bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+	VkDescriptorSetLayoutCreateInfo dslInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+	dslInfo.bindingCount = 2;
+	dslInfo.pBindings = bindings;
+	VK_Check( vkCreateDescriptorSetLayout( vk.device, &dslInfo, nullptr, &vk.worldDescriptorSetLayout ), "vkCreateDescriptorSetLayout (world)" );
+
+	VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_VK_IMAGES * 2 };
+	VkDescriptorPoolCreateInfo dpInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+	dpInfo.poolSizeCount = 1;
+	dpInfo.pPoolSizes = &poolSize;
+	dpInfo.maxSets = MAX_VK_IMAGES;
+	VK_Check( vkCreateDescriptorPool( vk.device, &dpInfo, nullptr, &vk.worldDescriptorPool ), "vkCreateDescriptorPool (world)" );
+
+	VkSamplerCreateInfo worldSamplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+	worldSamplerInfo.magFilter = VK_FILTER_LINEAR;
+	worldSamplerInfo.minFilter = VK_FILTER_LINEAR;
+	worldSamplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	worldSamplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	worldSamplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+	worldSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
+	VK_Check( vkCreateSampler( vk.device, &worldSamplerInfo, nullptr, &vk.worldSampler ), "vkCreateSampler (world)" );
+
 	VkPushConstantRange pushRange = {};
 	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 	pushRange.offset = 0;
 	pushRange.size = sizeof( vkWorldPushConstants_t );
 
-	// Reuses the UI pipeline's descriptor set layout (one combined-image-
-	// sampler binding) - every image_t already gets a descriptor set from
-	// that layout regardless of whether it's used for 2D or 3D drawing, so
-	// no new per-texture setup is needed here.
 	VkPipelineLayoutCreateInfo plInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
 	plInfo.setLayoutCount = 1;
-	plInfo.pSetLayouts = &vk.uiDescriptorSetLayout;
+	plInfo.pSetLayouts = &vk.worldDescriptorSetLayout;
 	plInfo.pushConstantRangeCount = 1;
 	plInfo.pPushConstantRanges = &pushRange;
 	VK_Check( vkCreatePipelineLayout( vk.device, &plInfo, nullptr, &vk.worldPipelineLayout ), "vkCreatePipelineLayout (world)" );
@@ -788,15 +820,16 @@ static void VK_CreateWorldPipeline( void )
 	stages[1].pName = "main";
 
 	VkVertexInputBindingDescription binding = { 0, sizeof( WorldVertex ), VK_VERTEX_INPUT_RATE_VERTEX };
-	VkVertexInputAttributeDescription attrs[2] = {
+	VkVertexInputAttributeDescription attrs[3] = {
 		{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof( WorldVertex, pos ) },
 		{ 1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof( WorldVertex, uv ) },
+		{ 2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof( WorldVertex, lightmapUV ) },
 	};
 
 	VkPipelineVertexInputStateCreateInfo vertexInput = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
 	vertexInput.vertexBindingDescriptionCount = 1;
 	vertexInput.pVertexBindingDescriptions = &binding;
-	vertexInput.vertexAttributeDescriptionCount = 2;
+	vertexInput.vertexAttributeDescriptionCount = 3;
 	vertexInput.pVertexAttributeDescriptions = attrs;
 
 	VkPipelineInputAssemblyStateCreateInfo inputAssembly = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
@@ -955,6 +988,9 @@ void VK_Shutdown( qboolean destroyWindow )
 
 	if ( vk.worldPipeline ) vkDestroyPipeline( vk.device, vk.worldPipeline, nullptr );
 	if ( vk.worldPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.worldPipelineLayout, nullptr );
+	if ( vk.worldSampler ) vkDestroySampler( vk.device, vk.worldSampler, nullptr );
+	if ( vk.worldDescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.worldDescriptorPool, nullptr );
+	if ( vk.worldDescriptorSetLayout ) vkDestroyDescriptorSetLayout( vk.device, vk.worldDescriptorSetLayout, nullptr );
 
 	if ( vk.depthImageView ) vkDestroyImageView( vk.device, vk.depthImageView, nullptr );
 	if ( vk.depthImage ) vkDestroyImage( vk.device, vk.depthImage, nullptr );

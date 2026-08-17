@@ -101,13 +101,16 @@ struct vkPushConstants_t
 	float color[4];
 };
 
-// Static world geometry only (see tr_world.cpp): position + diffuse UV, no
-// normal/lightmap UV/vertex color yet - this first pass renders opaque,
-// unlit, single-texture-per-surface geometry only.
+// Static world geometry only (see tr_world.cpp): position, diffuse UV, and
+// lightmap UV. Still opaque, single-diffuse-texture-per-surface geometry -
+// no vertex color/normal, no dynamic lights - but lit by the map's baked
+// lightmap, which is what actually makes it comparable to rd-vanilla's
+// default (non-fullbright) output. See VK_LoadLightmaps in tr_world.cpp.
 struct WorldVertex
 {
 	float pos[3];
 	float uv[2];
+	float lightmapUV[2];
 };
 
 // Layout must match world.vert's `layout(push_constant) uniform PushConstants
@@ -165,10 +168,16 @@ typedef struct
 	VkDeviceMemory depthImageMemory = VK_NULL_HANDLE;
 	VkImageView depthImageView = VK_NULL_HANDLE;
 
-	// 3D world geometry draw path (tr_world.cpp) - opaque, unlit, unculled
-	// static BSP surfaces only, see README.md for exactly what that means.
+	// 3D world geometry draw path (tr_world.cpp) - opaque, lightmapped,
+	// unculled static BSP surfaces only, see README.md for exactly what
+	// that means. Its own descriptor set layout/pool (distinct from the UI
+	// path's) because each draw needs two bound textures (diffuse +
+	// lightmap), not the UI path's one.
+	VkDescriptorSetLayout worldDescriptorSetLayout = VK_NULL_HANDLE;
+	VkDescriptorPool worldDescriptorPool = VK_NULL_HANDLE;
 	VkPipelineLayout worldPipelineLayout = VK_NULL_HANDLE;
 	VkPipeline worldPipeline = VK_NULL_HANDLE;
+	VkSampler worldSampler = VK_NULL_HANDLE;
 
 	// Shared across tr_cmds.cpp's and tr_world.cpp's draw calls (both bind
 	// pipelines into the same per-frame command buffer) so a pipeline bound
