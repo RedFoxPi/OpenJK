@@ -137,6 +137,46 @@ frames:
   trees near the sill with sky above) - the exact same reference screenshot
   used for the Ghoul2 skin-handle bug below, checked more closely once that
   fix landed. Fixed by adding the missing `1.0f -` back onto `v.uv[1]`.
+- **Bug found and fixed: a sky shader with no textured farbox rendered as a
+  pure black void instead of a sky.** Flagged by comparing a `hoth2`
+  screenshot against vanilla: ours showed a stark white terrain wedge
+  against solid black, unlike anything in the vanilla reference (a soft,
+  foggy snowscape). Root-caused, not just patched over: `VK_LoadSky`
+  assumes every sky shader has 6 real `_rt`/`_lf`/`_bk`/`_ft`/`_up`/`_dn`
+  face images to load and gives up entirely (no sky drawn at all, leaving
+  the Vulkan clear colour - black) the moment one is missing. hoth2's sky
+  shader (`textures/skies/hoth`, confirmed by parsing `LUMP_SHADERS`
+  directly) turned out to be `skyParms - 512 -` (`shaders/skies.shader`) -
+  a literal dash for the farbox parameter, valid Quake3 syntax for a
+  fog/portal-only sky with **no textured cubemap at all**. Confirmed no
+  `hoth*_rt`/etc face files exist anywhere in any `assets*.pk3`, so this
+  was never a naming-mismatch bug (the kind the missing `skyparms` parsing
+  noted below would explain) - the faces genuinely don't exist. Since this
+  renderer doesn't parse `skyParms` at all, it can't recover the shader's
+  real fog colour, but falling back to *no sky whatsoever* was clearly
+  worse than an approximation: fixed by falling back to a flat neutral
+  grey box (`VK_CreateSolidImage`) whenever any face fails to resolve,
+  rather than aborting sky rendering entirely. One more bug caught in the
+  process: the first attempt at this used an on-screen grey of (140,150,
+  160), which rendered as solid white - sky faces are drawn through the
+  same `world.frag` as everything else, paired with the full-white
+  `s_whiteLightmap`, so the `*2.0` "overbright bits" approximation
+  (see above) doubles the colour before it hits the screen; halving the
+  raw texture value (70,75,80) fixed it. **Verified**: re-ran `hoth2`
+  with per-batch debug logging (shader name + AABB for every surface that
+  passed frustum culling) before touching the sky code at all, confirming
+  every drawn batch was `textures/hoth/snow_01` with small, sane,
+  correctly-positioned extents - real terrain, not a stray/degenerate
+  polygon, ruling out a geometry bug before concluding this was a sky
+  issue. After the fix, the same camera position now shows the grey
+  fallback sky and, distinguishable against it for the first time, a
+  genuinely shadowed terrain mound that previously blended invisibly into
+  the black void. Re-tested `academy1` (working textured sky) and `vjun1`
+  (same missing-farbox situation, different map) to confirm no regression:
+  academy1 still loads its real 6-face sky with no fallback-colour log
+  suffix and an unchanged screenshot; vjun1 falls back cleanly with no
+  crash. The camera's low/close framing on `hoth2` itself - separate from
+  this bug - is discussed in "Curved surfaces" above.
 - A pixel diff against an `rd-vanilla` reference (same map, same camera, no
   special cvars now that lighting is real) is still a **`MAJOR_DIFF`, ~40%
   mean pixel difference**, and that's expected, not a regression to chase
@@ -265,16 +305,25 @@ frames:
   reverted); `vjun1`'s frustum-culled/visible batch split with patches
   enabled (11576/12556, ~92%) closely matches the same map with patches
   skipped (11462/12436, ~92%) across `wait_frames` 30/90/200, so the new
-  per-sub-patch AABBs aren't corrupting culling. Both test maps' default
-  camera angle happens to be a poor vantage point for actually *seeing*
-  terrain (confirmed pre-existing and unrelated to this change too, by
-  reproducing the identical framing with patches reverted) - a visible
-  rounded silhouette on `hoth2`'s one on-screen curved shape is the closest
-  thing to a direct visual check achieved here, short of a proper "fly a
-  camera to a clear vantage point" capability this headless harness doesn't
-  have yet. `academy1`/`sp_menu` are unaffected (identical batch/vertex/index
-  counts and screenshot to before, as expected for a map with no patches to
-  begin with).
+  per-sub-patch AABBs aren't corrupting culling. `academy1`/`sp_menu` are
+  unaffected (identical batch/vertex/index counts and screenshot to before,
+  as expected for a map with no patches to begin with).
+  `hoth2`'s default `devmap` camera sits low and close to the ground rather
+  than at an elevated establishing shot like vanilla's, which combined with
+  the sky bug below to look badly broken at first - **this was checked
+  properly** (see below), not just eyeballed and dismissed: temporary
+  per-batch debug logging (shader name + world-space AABB for every surface
+  that actually passed frustum culling that frame) confirmed every drawn
+  batch was `textures/hoth/snow_01` with small, sane, correctly-positioned
+  extents - real terrain, not a stray or degenerate polygon. The camera
+  framing itself (why it's low/close instead of an elevated cutscene shot)
+  remains unexplained and is most likely a separate, pre-existing
+  cutscene/camera-script limitation, not a rendering bug - `vieworg` and
+  `viewaxis` come from shared client/cgame code the renderer doesn't
+  control, and academy1's cutscene camera only works correctly here because
+  of the Ghoul2 bolt-matrix work done specifically for it (see "Ghoul2
+  rendering" below); hoth2 likely drives its camera differently and that
+  path isn't verified to work yet.
 
 ### Ghoul2 rendering (tr_model.cpp)
 

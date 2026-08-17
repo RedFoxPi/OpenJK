@@ -255,6 +255,7 @@ static void VK_LoadSky( const char *baseName )
 	};
 
 	image_t *faces[6];
+	bool allFacesFound = true;
 	for ( int i = 0; i < 6; i++ )
 	{
 		char faceName[MAX_QPATH];
@@ -262,8 +263,43 @@ static void VK_LoadSky( const char *baseName )
 		faces[i] = VK_FindImage( faceName );
 		if ( !faces[i] )
 		{
-			ri.Printf( PRINT_WARNING, "rd-vulkan: sky face '%s' not found, skipping sky\n", faceName );
-			return;
+			ri.Printf( PRINT_WARNING, "rd-vulkan: sky face '%s' not found\n", faceName );
+			allFacesFound = false;
+			break;
+		}
+	}
+
+	if ( !allFacesFound )
+	{
+		// Not every sky shader has 6 real face images to find in the first
+		// place - `skyParms - <cloudheight> -` (a literal dash for the
+		// farbox parameter) is valid Quake3 shader syntax for a fog/portal-
+		// only sky with no textured cubemap at all (e.g. hoth2's
+		// 'textures/skies/hoth', confirmed by reading skies.shader - no
+		// hoth*_rt/_lf/etc face files exist in any assets*.pk3). This
+		// renderer doesn't parse .shader skyParms (see README.md), so it
+		// can't recover that shader's real fog colour or tell a genuinely
+		// missing/misnamed face apart from an intentionally textureless sky
+		// - but in both cases, falling all the way back to "no sky at all"
+		// (leaving the Vulkan clear colour, pure black) reads far worse than
+		// this actually looks in vanilla: those levels still show a lit,
+		// foggy backdrop, not a black void. A flat neutral overcast-gray box
+		// is a much closer approximation than black, even though it isn't
+		// the shader's real colour.
+		// Sky faces are drawn through the same world.frag as everything else,
+		// paired with s_whiteLightmap (full white) - see the *2.0 "overbright
+		// bits" approximation there. That doubles this image's colour before
+		// it hits the screen, so halve the intended on-screen grey (~140,150,
+		// 160) here or it clips to solid white, same mistake as the first
+		// attempt at this fallback.
+		static image_t *s_skyFallbackFace = nullptr;
+		if ( !s_skyFallbackFace )
+		{
+			s_skyFallbackFace = VK_CreateSolidImage( "*skyFallback", 70, 75, 80, 255 );
+		}
+		for ( int i = 0; i < 6; i++ )
+		{
+			faces[i] = s_skyFallbackFace;
 		}
 	}
 
@@ -321,7 +357,8 @@ static void VK_LoadSky( const char *baseName )
 		VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &s_skyIndexBuffer, &s_skyIndexBufferMemory );
 
 	s_skyLoaded = true;
-	ri.Printf( PRINT_ALL, "rd-vulkan: loaded sky '%s'\n", baseName );
+	ri.Printf( PRINT_ALL, "rd-vulkan: loaded sky '%s'%s\n", baseName,
+		allFacesFound ? "" : " (using flat fallback colour, real faces not found)" );
 }
 
 // Fixed subdivision level for MST_PATCH tessellation (see VK_TessellatePatchQuad
