@@ -1310,12 +1310,25 @@ int G2API_InitGhoul2Model( CGhoul2Info_v &ghoul2, const char *fileName, int mode
 	// loading entirely before RE_RenderScene ever gets a chance to draw the
 	// world - same spirit as RE_RegisterModel below. A slot whose model
 	// fails to load (mModel stays 0, see VK_LoadGhoul2Model) is silently
-	// skipped at draw time instead. customSkin (a VK_RegisterSkin handle,
-	// see RE_RegisterSkin above) IS honored - it's what makes any humanoid
-	// player/NPC model resolve textures at all, see VulkanSkin's comment in
-	// tr_model.cpp. Custom shaders/LOD bias/modelFlags still aren't
-	// implemented (see README.md).
-	(void)modelIndex; (void)customShader; (void)modelFlags; (void)lodBias;
+	// skipped at draw time instead.
+	//
+	// customSkin here is NOT a VK_RegisterSkin/RE_RegisterSkin handle,
+	// despite the parameter name suggesting it lines up with RE_RegisterSkin's
+	// return value - real callers (g_client.cpp's G_SetG2PlayerModel) pass
+	// G_SkinIndex(skinName) instead, a small networked *configstring* index
+	// (position in CS_CHARSKINS, shared/renumbered across the whole game
+	// session) in a completely different, unrelated numbering scheme.
+	// Treating it as a VK_RegisterSkin handle (this renderer's first attempt)
+	// silently applied a random *other* model's skin whenever the two
+	// numbering schemes happened to collide - e.g. academy1's rosh_penin
+	// picking up the protocol droid's textures on some surfaces. The real
+	// renderer skin handle only shows up later, as G2API_SetSkin's
+	// *renderSkin* (third) parameter - see that function below, which
+	// `G_SetG2PlayerModel` always calls immediately after this one. So:
+	// load with no skin (0) here, exactly like a model with no G2API_SetSkin
+	// call ever made; custom shaders/LOD bias/modelFlags still aren't
+	// implemented either (see README.md).
+	(void)modelIndex; (void)customSkin; (void)customShader; (void)modelFlags; (void)lodBias;
 
 	int slot = -1;
 	for ( int i = 0; i < ghoul2.size(); i++ )
@@ -1335,8 +1348,7 @@ int G2API_InitGhoul2Model( CGhoul2Info_v &ghoul2, const char *fileName, int mode
 
 	Q_strncpyz( ghoul2[slot].mFileName, fileName, sizeof( ghoul2[slot].mFileName ) );
 	ghoul2[slot].mModelindex = slot;
-	ghoul2[slot].mCustomSkin = customSkin;
-	ghoul2[slot].mModel = (qhandle_t)VK_LoadGhoul2Model( fileName, (int)customSkin );
+	ghoul2[slot].mModel = (qhandle_t)VK_LoadGhoul2Model( fileName, 0 );
 	return slot;
 }
 qboolean G2API_IsPaused( CGhoul2Info *ghlInfo, const char *boneName ) { (void)ghlInfo; (void)boneName; return qfalse; }
@@ -1372,7 +1384,24 @@ qboolean G2API_SetNewOrigin( CGhoul2Info *ghlInfo, const int boltIndex ) { (void
 void G2API_SetRagDoll( CGhoul2Info_v &ghoul2, CRagDollParams *parms ) { (void)ghoul2; (void)parms; }
 qboolean G2API_SetRootSurface( CGhoul2Info_v &ghlInfo, const int modelIndex, const char *surfaceName ) { (void)ghlInfo; (void)modelIndex; (void)surfaceName; return qfalse; }
 qboolean G2API_SetShader( CGhoul2Info *ghlInfo, qhandle_t customShader ) { (void)ghlInfo; (void)customShader; return qfalse; }
-qboolean G2API_SetSkin( CGhoul2Info *ghlInfo, qhandle_t customSkin, qhandle_t renderSkin ) { (void)ghlInfo; (void)customSkin; (void)renderSkin; return qfalse; }
+// customSkin is the same networked configstring index G2API_InitGhoul2Model's
+// same-named parameter is (see that function's comment) - NOT usable as a
+// VK_RegisterSkin handle. renderSkin is the real one: g_client.cpp's
+// G_SetG2PlayerModel gets it from `gi.RE_RegisterSkin(skinName)` directly
+// (assigned to a local it calls `skin`) and passes *that* here, immediately
+// after G2API_InitGhoul2Model - this is where a humanoid model actually
+// picks up its real per-surface textures, not at Init time.
+qboolean G2API_SetSkin( CGhoul2Info *ghlInfo, qhandle_t customSkin, qhandle_t renderSkin )
+{
+	(void)customSkin;
+	if ( !ghlInfo || !ghlInfo->mFileName[0] )
+	{
+		return qfalse;
+	}
+	ghlInfo->mCustomSkin = renderSkin;
+	ghlInfo->mModel = (qhandle_t)VK_LoadGhoul2Model( ghlInfo->mFileName, (int)renderSkin );
+	return qtrue;
+}
 qboolean G2API_SetSurfaceOnOff( CGhoul2Info *ghlInfo, const char *surfaceName, const int flags ) { (void)ghlInfo; (void)surfaceName; (void)flags; return qfalse; }
 void G2API_SetTime( int currentTime, int clock ) { (void)currentTime; (void)clock; }
 qboolean G2API_StopBoneAnim( CGhoul2Info *ghlInfo, const char *boneName ) { (void)ghlInfo; (void)boneName; return qfalse; }

@@ -261,30 +261,20 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
   `origin`/`axis` to build a model matrix (same column-major construction
   as rd-vanilla's `R_RotateForEntity`, composed with the frame's `mvp` via
   the same `VK_MultiplyMatrix` convention the camera/sky matrices use).
-  **Verified via a rate-limited load-bearing log line**, the same standard
-  frustum culling was held to: on academy1, 9 of 18 `RT_MODEL`+Ghoul2 scene
-  entities per frame actually draw (the other 9 have no drawable surfaces -
-  see the skin bullet), and those 9 are real, named NPCs with plausible
-  geometry (`kyle`: 5 surfaces/970 verts; `jedi_hf`: 10 surfaces/1883
-  verts; `jeditrainer`: 19 surfaces/2101 verts; the `protocol` droid: 32
-  surfaces/3150 verts) - not zero, not garbage.
 - **Skin (`.skin` file) support was required and added**, not originally
   planned: humanoid player/NPC `.glm` files ship every surface's embedded
   shader name **empty** - their actual per-surface textures come entirely
   from an external `.skin` file (`surfacename,shaderpath` per line) applied
   at runtime, confirmed against `models/players/kyle/model_default.skin`'s
   real contents. Without parsing it, every humanoid model resolved zero
-  images and skipped every surface (confirmed: 0 drawable surfaces for
-  every player/NPC model tried, while weapon/droid models - which embed
-  real shader names directly - loaded fine). `VK_RegisterSkin`
-  (`tr_model.cpp`) parses the common single-file case (comma-separated
-  lines, `tag_` lines skipped); the three-part `head|torso|lower` macro
-  skin syntax is **not** implemented. `RE_RegisterSkin` now calls it for
-  real (previously a stub returning a fake handle `1`), and
-  `G2API_InitGhoul2Model`'s `customSkin` parameter is honored (previously
-  ignored) - the model cache key is `(fileName, skinHandle)`, not just
-  `fileName`, since the same `.glm` loaded with two different skins needs
-  two different sets of baked per-surface textures/descriptor sets.
+  images and skipped every surface. `VK_RegisterSkin` (`tr_model.cpp`)
+  parses the common single-file case (comma-separated lines, `tag_` lines
+  skipped); the three-part `head|torso|lower` macro skin syntax is **not**
+  implemented. `RE_RegisterSkin` now calls it for real (previously a stub
+  returning a fake handle `1`). The model cache key is
+  `(fileName, skinHandle)`, not just `fileName`, since the same `.glm`
+  loaded with two different skins needs two different sets of baked
+  per-surface textures/descriptor sets.
 - **Bug found and fixed**: a single entity's Ghoul2 vector can (and
   routinely does) hold several sub-models at once - body + weapon + saber
   blade, each loaded via its own `G2API_InitGhoul2Model` call on the *same*
@@ -297,18 +287,47 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
   (`mModelindex == -1`, `CGhoul2Info`'s default) or append; the returned
   slot index is what game code indexes back into. `VK_DrawGhoul2Entities`
   iterates every valid slot per entity, not just index `0`.
-- Not verified: a screenshot with a Ghoul2 model actually inside the frame.
-  The camera position `academy1`'s intro spawns at doesn't happen to have
-  any of the 9 successfully-loaded NPCs in view (confirmed by trying
-  `cg_thirdperson 1` and a `noclip`-based camera move, neither of which
-  changed what's visible - likely academy1-specific scripting/camera
-  behavior, not a rendering bug), so this checkpoint relies on the log-based
-  evidence above (real entities, real geometry, real per-frame draw calls,
-  no crash) rather than a positive screenshot. A `sp_academy1_spawn`
-  screenshot from this exact camera is unchanged (bit-for-bit, outside the
-  console-text log region) from before Ghoul2 rendering existed - i.e. this
-  is additive, not a regression to previously-verified world/sky/culling
-  rendering.
+- **Bug found and fixed - the one that actually made characters invisible**:
+  the very first working build of this feature loaded correctly (real
+  entities, real per-model geometry, real per-frame draw calls, no crash)
+  but rendered **no visible character** anywhere - caught by comparing
+  against a vanilla reference screenshot of academy1's opening, which shows
+  an NPC standing centered and close enough to fill much of the frame; this
+  renderer's screenshot from the identical camera showed empty pillars and
+  floor, nothing else. The cause: `G2API_InitGhoul2Model`'s `customSkin`
+  parameter is **not** a `VK_RegisterSkin`/`RE_RegisterSkin` handle, despite
+  the name suggesting it lines up with `RE_RegisterSkin`'s return value -
+  real callers (`g_client.cpp`'s `G_SetG2PlayerModel`) pass
+  `G_SkinIndex(skinName)` instead, a small networked *configstring* index
+  (position in `CS_CHARSKINS`, renumbered across the whole game session),
+  a completely different, unrelated numbering scheme from this renderer's
+  own skin cache. Treating it as a `VK_RegisterSkin` handle (this feature's
+  first attempt) silently applied a random *other* model's skin whenever
+  the two numbering schemes happened to collide - concretely, academy1's
+  `rosh_penin` NPC picked up several of the `protocol` droid's textures,
+  and most of its surfaces failed to resolve *any* image and were skipped
+  (confirmed by a temporary per-surface trace: `rosh_penin`'s `.glm` has 14
+  real drawable body surfaces, all with matching entries in its own
+  `.skin` file by name, but only 4 surfaces actually resolved - one to a
+  `models/players/protocol/...` texture path that has no business being on
+  a `rosh_penin` instance at all). The real renderer skin handle only shows
+  up later, as `G2API_SetSkin`'s *`renderSkin`* (third) parameter -
+  `G_SetG2PlayerModel` gets it from `gi.RE_RegisterSkin(skinName)` directly
+  and always calls `G2API_SetSkin` immediately after
+  `G2API_InitGhoul2Model`. Fixed by having `G2API_InitGhoul2Model` ignore
+  its `customSkin` parameter entirely (load with no skin, same as a model
+  with no `G2API_SetSkin` call ever made) and implementing `G2API_SetSkin`
+  for real - it re-resolves `ghlInfo->mModel` via
+  `VK_LoadGhoul2Model(ghlInfo->mFileName, renderSkin)` using its own
+  `renderSkin` parameter, the one actually in this renderer's handle space.
+  After the fix, `rosh_penin` resolves 14/14 real body surfaces (not 4),
+  and the academy1 screenshot from that same camera **now shows the NPC**,
+  matching the vanilla reference's framing, pose, and dark-robe/belt-buckle
+  look closely - the first checkpoint in this session verified with an
+  actual positive screenshot rather than log evidence alone. Other
+  academy1 NPCs' resolved-surface counts jumped similarly post-fix (e.g.
+  `kyle` 5 -> 19, `jedi` -> 17, `protocol` 32 -> two distinct skin variants
+  at 32 and 26).
 
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
