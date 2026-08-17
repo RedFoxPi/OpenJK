@@ -55,6 +55,12 @@ struct WorldSurfaceBatch
 	VkDescriptorSet descriptorSet;
 	uint32_t firstIndex;
 	uint32_t indexCount;
+	// World-space AABB, used for view-frustum culling in RE_RenderScene
+	// (see VK_AABBOutsideFrustum). Unused/left zeroed for sky faces - the
+	// sky is always camera-centered and drawn unconditionally, see
+	// RE_RenderScene.
+	float mins[3];
+	float maxs[3];
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -292,7 +298,7 @@ static void VK_LoadSky( const char *baseName )
 		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 2 ); cpuIndexes.push_back( vertBase + 3 );
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( faces[axis], s_whiteLightmap );
-		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u } );
+		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 } } );
 	}
 
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
@@ -444,8 +450,24 @@ void RE_LoadWorldMap( const char *name )
 			cpuIndexes.push_back( (uint32_t)( surf.firstVert + indexes[surf.firstIndex + j] ) );
 		}
 
+		// AABB from the surface's own vertex range, for view-frustum culling
+		// in RE_RenderScene - cheap to compute once here vs. re-deriving it
+		// (or worse, testing every vertex) every frame.
+		float mins[3] = { 1e30f, 1e30f, 1e30f };
+		float maxs[3] = { -1e30f, -1e30f, -1e30f };
+		for ( int v = 0; v < surf.numVerts; v++ )
+		{
+			const float *p = cpuVerts[surf.firstVert + v].pos;
+			for ( int k = 0; k < 3; k++ )
+			{
+				if ( p[k] < mins[k] ) mins[k] = p[k];
+				if ( p[k] > maxs[k] ) maxs[k] = p[k];
+			}
+		}
+
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( img, lightmap );
-		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf.numIndexes } );
+		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf.numIndexes,
+			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] } } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -567,6 +589,56 @@ static void VK_BuildProjectionMatrix( const refdef_t *fd, float *out )
 	out[11] = -1;
 }
 
+// Standard Gribb-Hartmann plane extraction from a combined view-projection
+// matrix, adjusted for Vulkan's [0,1] depth-clip range instead of GL's
+// [-1,1] (only the near plane's formula differs between the two - see the
+// comment inline below). Each plane is (a,b,c,d) such that a point is
+// "inside" when a*x + b*y + c*z + d >= 0. mvp is column-major (data[col*4+
+// row], the same convention VK_BuildProjectionMatrix/VK_MultiplyMatrix use
+// throughout this file), so "row i" of the matrix is { mvp[i], mvp[4+i],
+// mvp[8+i], mvp[12+i] }, not four consecutive elements.
+static void VK_ExtractFrustumPlanes( const float *mvp, float planes[6][4] )
+{
+	float row0[4] = { mvp[0], mvp[4], mvp[8], mvp[12] };
+	float row1[4] = { mvp[1], mvp[5], mvp[9], mvp[13] };
+	float row2[4] = { mvp[2], mvp[6], mvp[10], mvp[14] };
+	float row3[4] = { mvp[3], mvp[7], mvp[11], mvp[15] };
+
+	for ( int i = 0; i < 4; i++ ) planes[0][i] = row3[i] + row0[i]; // left
+	for ( int i = 0; i < 4; i++ ) planes[1][i] = row3[i] - row0[i]; // right
+	for ( int i = 0; i < 4; i++ ) planes[2][i] = row3[i] + row1[i]; // bottom
+	for ( int i = 0; i < 4; i++ ) planes[3][i] = row3[i] - row1[i]; // top
+	// Near: Vulkan's clip-space z ranges [0,1] (not GL's [-1,1]), and z_clip
+	// >= 0 is exactly row2.v >= 0 - no row3 term needed, unlike GL's near
+	// plane (row3+row2) or Vulkan's own far plane (row3-row2) below.
+	for ( int i = 0; i < 4; i++ ) planes[4][i] = row2[i];           // near
+	for ( int i = 0; i < 4; i++ ) planes[5][i] = row3[i] - row2[i]; // far
+}
+
+// True if the AABB is entirely on the outside of at least one frustum plane
+// (a real intersection/inside case returns false, including partial overlap
+// - this is a conservative "definitely not visible" test, not an exact
+// visibility test, which is exactly what culling needs: false negatives
+// here would incorrectly hide visible geometry, false positives just mean
+// an off-screen box gets submitted anyway, harmless).
+static bool VK_AABBOutsideFrustum( const float mins[3], const float maxs[3], const float planes[6][4] )
+{
+	for ( int i = 0; i < 6; i++ )
+	{
+		const float *p = planes[i];
+		// The AABB corner most positive along this plane's normal - if even
+		// that corner is outside, every other corner is too.
+		float x = ( p[0] >= 0 ) ? maxs[0] : mins[0];
+		float y = ( p[1] >= 0 ) ? maxs[1] : mins[1];
+		float z = ( p[2] >= 0 ) ? maxs[2] : mins[2];
+		if ( p[0] * x + p[1] * y + p[2] * z + p[3] < 0 )
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 void RE_RenderScene( const refdef_t *fd )
 {
 	if ( !vk.frameActive || !s_worldLoaded || ( fd->rdflags & RDF_NOWORLDMODEL ) )
@@ -638,11 +710,29 @@ void RE_RenderScene( const refdef_t *fd )
 	vkCmdBindVertexBuffers( cmd, 0, 1, &s_worldVertexBuffer, &vertexOffset );
 	vkCmdBindIndexBuffer( cmd, s_worldIndexBuffer, 0, VK_INDEX_TYPE_UINT32 );
 
+	float frustumPlanes[6][4];
+	VK_ExtractFrustumPlanes( mvp, frustumPlanes );
+
+	static int s_debugCullLogsRemaining = 3;
+	int culledCount = 0;
+
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
+		if ( VK_AABBOutsideFrustum( batch.mins, batch.maxs, frustumPlanes ) )
+		{
+			culledCount++;
+			continue;
+		}
 		vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.worldPipelineLayout,
 			0, 1, &batch.descriptorSet, 0, nullptr );
 		vkCmdDrawIndexed( cmd, batch.indexCount, 1, batch.firstIndex, 0, 0 );
+	}
+
+	if ( s_debugCullLogsRemaining > 0 )
+	{
+		s_debugCullLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: frustum culling: %d/%d world batches culled\n",
+			culledCount, (int)s_worldSurfaces.size() );
 	}
 
 	// Restore the full-screen viewport/scissor for any 2D drawing

@@ -143,6 +143,24 @@ frames:
   aren't directly comparable to the current ~40%, since fullbright-vs-
   fullbright and lit-vs-lit are different comparisons, not a regression
   between them.
+- World surfaces are now **view-frustum culled** (`VK_ExtractFrustumPlanes`/
+  `VK_AABBOutsideFrustum` in `tr_world.cpp`): each surface's AABB (computed
+  once at load time from its own vertex range) is tested against the 6
+  frustum planes extracted from that frame's view-projection matrix, and a
+  surface entirely outside is skipped. **Verified two ways**, the same
+  standard the camera math itself was held to: (1) on academy1, the same
+  camera that gets a `MAJOR_DIFF` against vanilla above culled 265-284 of
+  365 world batches (73-78%) depending on the frame, so the mechanism is
+  doing real work, not a no-op; (2) a screenshot from that exact camera with
+  culling enabled is **bit-for-bit identical**, outside a small console-text
+  strip from this feature's own load-time log line, to the same screenshot
+  captured before culling existed - i.e. removing ~75% of the draw calls
+  changed nothing about what's actually visible, which is exactly what
+  correct culling should do (an incorrect cull that drops something that's
+  actually in view would very likely have shown up as a pixel difference,
+  not passed silently). Frustum culling is unrelated to triangle winding
+  order, so it doesn't run into the "no culling" backface concern below -
+  it operates on bounding boxes, not face direction.
 - **Bug found and fixed**: `SURF_NODRAW`-flagged surfaces (editor-only
   geometry - caulk, clip, trigger volumes; 3 of academy1's 16 shaders) and
   `SURF_SKY`-flagged surfaces weren't excluded at all, so each painted a
@@ -273,14 +291,15 @@ touch this code)
   the same first-stage-only `.shader` lookup the 2D path uses, multiplied by
   its baked lightmap (or a white 1x1 fallback for surfaces with none); a
   surface whose diffuse texture fails to resolve is skipped rather than
-  drawn wrong (see the `dark_dust` bug below); geometry is unculled (no BSP
-  visibility culling, no view-frustum culling, no back-face culling - see
-  the "no culling" comment on `VK_CreateWorldPipeline` in `tr_init.cpp` for
-  why not even back-face culling is safe to turn on yet) and every surface
-  uses one opaque pipeline (not even the `.shader`-driven blend-mode
-  selection the 2D path has); drawn with a real per-frame camera built from
-  `refdef_t` (see `VK_BuildViewMatrix`/`VK_BuildProjectionMatrix` in
-  `tr_world.cpp`).
+  drawn wrong (see the `dark_dust` bug below); surfaces entirely outside the
+  view frustum are culled (per-surface AABB vs. the frame's frustum planes,
+  see "3D world geometry" above) but there's still no BSP visibility
+  culling or back-face culling (see the "no culling" comment on
+  `VK_CreateWorldPipeline` in `tr_init.cpp` for why not even back-face
+  culling is safe to turn on yet) and every surface uses one opaque
+  pipeline (not even the `.shader`-driven blend-mode selection the 2D path
+  has); drawn with a real per-frame camera built from `refdef_t` (see
+  `VK_BuildViewMatrix`/`VK_BuildProjectionMatrix` in `tr_world.cpp`).
 - Skybox rendering (`tr_world.cpp`: `VK_LoadSky`) - see "3D world geometry"
   above for what was verified. A flat (non-subdivided, non-warped) 6-face
   box using the sky shader's own name as its basename, always camera-
@@ -299,9 +318,11 @@ touch this code)
   applies (see "3D world geometry" above). No shadows other than what's
   already baked into that lightmap; nothing moves, casts, or receives a
   dynamic shadow.
-- BSP visibility culling, view-frustum culling, and back-face culling for
-  world geometry - every loaded static surface is submitted every frame,
-  see "3D world geometry" above.
+- BSP visibility (PVS) culling and back-face culling for world geometry -
+  view-frustum culling *is* implemented (see "3D world geometry" above),
+  but every surface potentially in view is still submitted regardless of
+  whether the level's BVH/PVS data would say it's actually occluded by
+  other geometry, and both triangle winding directions still draw.
 - Curved surfaces/patches (`MST_PATCH`) and flares (`MST_FLARE`) - skipped
   entirely at load time, not just unlit.
 - Proper sky rendering: what's implemented (see "3D world geometry" above)
