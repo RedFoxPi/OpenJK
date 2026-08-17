@@ -95,7 +95,8 @@ frames:
   not noise or a degenerate blob.
 - A pixel diff against an `rd-vanilla` reference (same map, same camera,
   `r_fullbright 1` to remove lighting from the comparison) is a
-  **`MAJOR_DIFF`, ~39% mean pixel difference**, and that's expected, not a
+  **`MAJOR_DIFF`, ~23% mean pixel difference** (down from an initial 39% -
+  see the dust/fog quad bug below), and the remainder is expected, not a
   regression to chase down: academy1's spawn point is a scripted
   character-portrait shot (confirmed by comparing against a `capture.py`
   reference captured independently, much earlier, with default settings -
@@ -103,11 +104,30 @@ frames:
   not an artifact of any flag used here) where the player's own Ghoul2 model
   fills a large fraction of the frame - and Ghoul2 rendering is entirely
   unimplemented (see "Ghoul2 is not reused from rd-vanilla" below). Sky
-  isn't implemented either (see below), so sky-facing surfaces show as
-  whatever their `.shader` lookup falls back to. Given that, a large diff on
-  *this specific scene* is exactly what "no models, no sky, no lighting yet"
+  isn't implemented either (see below). Given that, a large diff on *this
+  specific scene* is exactly what "no models, no sky, no lighting yet"
   predicts - it's not evidence the world-geometry path itself is wrong (see
   the hand-verified matrix math above for that).
+- **Bug found and fixed**: `SURF_NODRAW`-flagged surfaces (editor-only
+  geometry - caulk, clip, trigger volumes; 3 of academy1's 16 shaders) and
+  `SURF_SKY`-flagged surfaces weren't excluded at all, so each painted a
+  stray, wrongly-textured polygon (these flags are on `dshader_t` itself,
+  already parsed - the real fix was just checking them, no new parsing).
+  More impactful: a shader with no plain image of its own - typically an
+  effects-only shader built entirely from its stages' `map` references,
+  which this renderer's first-stage-only `.shader` support (see "3D world
+  geometry" above) doesn't parse for world geometry - was falling back to
+  an **opaque white quad** (`vk.whiteImage`), the same mistake as the
+  `videologo` white-square bug in the 2D path, just newly possible here
+  because world geometry has no blend pipeline to fall back to instead.
+  Concretely: academy1's `textures/common/dark_dust` (a `surfaceparm trans
+  nonopaque` fog/dust volume with no base image, only an editor preview
+  texture) was covering large parts of the screen in solid white. Since
+  drawing it translucent isn't possible yet, the fix is to skip the surface
+  entirely instead - "invisible" is honest about "not implemented yet",
+  "solid white wall" is actively wrong. This alone dropped the vanilla diff
+  from 39% to 23% and made the screenshot recognizably academy1's actual
+  architecture (columns, floor, stairway) rather than mostly a white void.
 - **Bug found and fixed**: the view/projection matrix combination was
   computed as `VK_MultiplyMatrix(projection, view, mvp)` - the "obvious"
   argument order - but `VK_MultiplyMatrix` (a byte-for-byte copy of
@@ -240,9 +260,10 @@ touch this code)
   see "3D world geometry" above.
 - Curved surfaces/patches (`MST_PATCH`) and flares (`MST_FLARE`) - skipped
   entirely at load time, not just unlit.
-- Sky (`RDF_DRAWSKYBOX`/skyportal) - not specially handled at all; a sky
-  surface is textured (or falls back to white) exactly like any other
-  surface, with no portal/box rendering.
+- Sky (`RDF_DRAWSKYBOX`/skyportal) - no portal/box rendering at all;
+  `SURF_SKY`-flagged surfaces are skipped rather than drawn (see "3D world
+  geometry" above), so sky-facing areas currently just show the clear color
+  instead of anything resembling a sky.
 - Dynamic scene content: entities (`AddRefEntityToScene`), runtime polys
   (`AddPolyToScene`) - both still stubs, so nothing except the static world
   itself ever appears in a 3D scene yet.

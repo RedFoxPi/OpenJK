@@ -158,13 +158,41 @@ void RE_LoadWorldMap( const char *name )
 			continue;
 		}
 
+		// SURF_NODRAW (game/surfaceflags.h - transitively available here via
+		// q_shared.h, no extra include needed) marks editor-only geometry
+		// (caulk, clip, trigger volumes, ...) that the real engine never
+		// generates a drawsurface for at all. Without this check every one
+		// of academy1's caulk/clip/nodraw shaders (3 of its 16) fails
+		// VK_FindImage and paints a stray white polygon - not a
+		// missing-texture bug, a missing "should this surface draw at all"
+		// check. SURF_SKY: a textured polygon is actively misleading for
+		// sky - it's supposed to be a portal/skybox, not a surface with its
+		// own diffuse map, so skip it here too rather than draw the sky
+		// shader's (usually unrelated or missing) base image as a wall.
+		if ( shaders[surf.shaderNum].surfaceFlags & ( SURF_NODRAW | SURF_SKY ) )
+		{
+			continue;
+		}
+
 		image_t *img = VK_FindImage( shaders[surf.shaderNum].shader );
 		if ( !img )
 		{
-			// Missing/unresolvable texture - draw white rather than drop the
-			// surface entirely, consistent with RE_StretchPic's handling of
-			// an out-of-range image handle.
-			img = vk.whiteImage;
+			// Unlike RE_StretchPic's out-of-range-handle case (which really
+			// does mean "caller asked for white"), a failed lookup here
+			// means the shader has no plain image of its own - typically a
+			// stages-only effect shader (fog/dust volumes, decals) whose
+			// name doesn't resolve to a file because it's meant to be built
+			// from its stages' own `map` references, which this renderer
+			// doesn't parse for world geometry (see README.md). Those are
+			// usually explicitly translucent (surfaceparm trans/nonopaque -
+			// e.g. academy1's textures/common/dark_dust) and this renderer
+			// has no blend pipeline for world geometry yet (see
+			// VK_CreateWorldPipeline), so drawing them as an *opaque white*
+			// quad is actively wrong, not just imprecise - it was covering
+			// large parts of the screen. Skip the surface instead, same
+			// "invisible beats wrong" call as the RE_RegisterShaderNoMip
+			// videologo fix in tr_image.cpp.
+			continue;
 		}
 
 		uint32_t firstIndex = (uint32_t)cpuIndexes.size();
