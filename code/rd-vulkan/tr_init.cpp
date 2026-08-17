@@ -694,6 +694,10 @@ void R_Init( void )
 	vk.images.push_back( vk.whiteImage );
 	vk.imagesByName[vk.whiteImage->name] = 0;
 
+	vk.transparentImage = VK_CreateSolidImage( "*transparent", 0, 0, 0, 0 );
+	vk.images.push_back( vk.transparentImage );
+	vk.imagesByName[vk.transparentImage->name] = (qhandle_t)( vk.images.size() - 1 );
+
 	ri.Printf( PRINT_ALL, "rd-vulkan: initialized on %s (%dx%d)\n",
 		vk.physicalDeviceProps.deviceName, vk.glConfig.vidWidth, vk.glConfig.vidHeight );
 }

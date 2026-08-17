@@ -15,21 +15,37 @@ to just compiled.
 ## Verified state
 
 Run against the real game's `sp_menu` scene, headlessly, under Xvfb + Mesa's
-`lavapipe` software Vulkan driver (see "Testing headlessly" below):
+`lavapipe` software Vulkan driver (see "Testing headlessly" below), and
+scored with `tests/render-regression/diff.py` against a same-scene
+`rd-vanilla` reference screenshot:
 
 - Instance/device/swapchain/render pass/pipeline creation succeeds, no
   validation errors, no crashes.
 - The actual main menu renders correctly: title, background art, buttons,
-  glow/highlight compositing all match `rd-vanilla`'s output closely (layout,
-  text, and most graphics are visually identical between the two renderers on
-  this scene). Compared side-by-side and with `tests/render-regression/diff.py`.
-- Remaining visual differences from `rd-vanilla` on this scene are limited to
-  effects that depend on `.shader` script parsing, which isn't implemented
-  yet (see below) - e.g. an animated radar graphic renders as a flat white
-  disc instead of its intended dark starfield pattern, and one glow effect
-  renders a different color because its real blend mode isn't replicated.
-  These are expected/documented gaps, not unexplained bugs.
+  radar/starfield graphic, and glow/highlight compositing all match
+  `rd-vanilla`'s output closely. Currently **`MINOR_DIFF`, 3.8% mean pixel
+  difference** (down from an initial 15.9%/`MAJOR_DIFF` - see "History" in
+  this section).
 - `screenshot_png` reads back real, correct pixel data (used for the above).
+
+Remaining known gaps on this scene, all tied to `.shader` script parsing not
+being implemented (see below): one glow effect (`gfx/menus/menu_buttonback`)
+needs additive blending (`GL_ONE GL_ONE`) instead of the standard alpha blend
+every draw currently uses, and a starfield "twinkle" dot overlay on the radar
+graphic isn't drawn. Neither is a mystery - both are visible, specific,
+`.shader`-defined effects this renderer doesn't parse yet, not unexplained
+rendering bugs.
+
+**History**: the first working screenshot scored 15.9% mean diff
+(`MAJOR_DIFF`) despite the menu being visually recognizable, because a
+solid **opaque white square** covered the radar/starfield decoration -
+`RegisterShaderNoMip("gfx/menus/videologo")` (a `videoMap`-only shader with
+no direct image fallback) failed to resolve and fell back to handle 0
+("white"), which is the correct behavior for a caller that *intentionally*
+passes 0, but wrong for a failed lookup. Splitting those two cases -
+`RE_RegisterShaderNoMip` now returns a dedicated transparent placeholder on
+failure instead of reusing handle 0 - dropped the diff to 3.8% in one fix,
+without touching `.shader` parsing at all.
 
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)

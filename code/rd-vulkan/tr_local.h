@@ -123,12 +123,19 @@ typedef struct
 	VkCommandBuffer activeCommandBuffer = VK_NULL_HANDLE;
 	bool frameActive = false;
 
-	float clearColor[4] = { 1.0f, 0.0f, 1.0f, 1.0f }; // DIAG: magenta, temporary
+	float clearColor[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 	float drawColor[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
 
 	std::vector<image_t *> images;
 	std::unordered_map<std::string, qhandle_t> imagesByName;
 	image_t *whiteImage = nullptr;
+	// Returned by RegisterShader*() when the real image/shader can't be
+	// resolved (e.g. a videoMap or other .shader-script-only reference this
+	// renderer doesn't parse yet - see README.md). Deliberately NOT the same
+	// as handle 0 ("white", a real API convention many callers rely on
+	// intentionally) - falling back to white for a failed lookup previously
+	// painted an opaque white square over part of the menu.
+	image_t *transparentImage = nullptr;
 
 } vkGlobals_t;
 

@@ -222,7 +222,13 @@ void VK_ShutdownImages( void )
 qhandle_t RE_RegisterShaderNoMip( const char *name )
 {
 	image_t *img = VK_FindImage( name );
-	if ( !img ) return 0;
+	if ( !img )
+	{
+		// Not "0" (draws opaque white) - a failed lookup (e.g. a videoMap or
+		// other .shader-script-only reference, see tr_local.h) should be
+		// invisible, not paint a solid white rectangle over the menu.
+		return vk.imagesByName[vk.transparentImage->name];
+	}
 	return vk.imagesByName[img->name];
 }
 
