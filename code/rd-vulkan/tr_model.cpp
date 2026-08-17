@@ -64,7 +64,101 @@ struct VulkanGhoul2Model
 	VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
 	VkBuffer indexBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
+	// Index into s_skeletons (0 = none/failed to load) - see VulkanSkeleton
+	// below. Only used for bolt lookups (G2API_AddBolt/GetBoltMatrix), never
+	// for mesh rendering - see this file's header comment on why mesh
+	// vertices don't need the skeleton at all.
+	int skeletonIndex = 0;
 };
+
+// A bind-pose-only skeleton: just bone names and their bind-pose object-
+// space matrices (mdxaSkel_t::BasePoseMat, already fully composed - not a
+// parent-relative delta needing a hierarchy walk, confirmed against
+// rd-vanilla's real G2_bones.cpp usage of it as a similarity-transform
+// pivot). No animation frame data is parsed at all (numFrames/ofsFrames/
+// ofsCompBonePool in mdxaHeader_t are never read) - consistent with this
+// renderer's bind-pose-only scope. This exists solely so a "bolt" (a named
+// attachment point other code queries via G2API_AddBolt/GetBoltMatrix, e.g.
+// a cutscene camera tracking a head bone) resolves to *something* correct
+// for a static pose, rather than the zeroed/failed matrix a stub would
+// return - see README.md for the real bug this fixed (a scripted camera
+// silently collapsing onto the NPC's own origin because a failed bolt
+// lookup was never error-checked by its caller).
+struct VulkanBone
+{
+	std::string name;
+	mdxaBone_t basePoseMat;
+};
+struct VulkanSkeleton
+{
+	std::vector<VulkanBone> bones;
+};
+// Index 0 reserved/invalid, same convention as every other cache in this
+// file. Keyed by the resolved ".gla" path (mdxmHeader_t::animName + ".gla"),
+// not by owning model, since multiple .glm files legitimately share one
+// skeleton (e.g. every humanoid player model uses
+// models/players/_humanoid/_humanoid.gla).
+static std::vector<VulkanSkeleton> s_skeletons;
+static std::unordered_map<std::string, int> s_skeletonsByName;
+
+int VK_LoadGhoul2Skeleton( const char *animName )
+{
+	std::string fileName = std::string( animName ) + ".gla";
+	auto cached = s_skeletonsByName.find( fileName );
+	if ( cached != s_skeletonsByName.end() )
+	{
+		return cached->second;
+	}
+
+	void *buffer = nullptr;
+	long len = ri.FS_ReadFile( fileName.c_str(), &buffer );
+	if ( !buffer || len <= 0 )
+	{
+		ri.Printf( PRINT_WARNING, "rd-vulkan: VK_LoadGhoul2Skeleton: %s not found\n", fileName.c_str() );
+		return 0;
+	}
+
+	const byte *base = (const byte *)buffer;
+	const mdxaHeader_t *hdr = (const mdxaHeader_t *)buffer;
+	if ( hdr->ident != MDXA_IDENT || hdr->version != MDXA_VERSION )
+	{
+		ri.Printf( PRINT_WARNING, "rd-vulkan: VK_LoadGhoul2Skeleton: %s is not a supported GLA (ident/version mismatch)\n", fileName.c_str() );
+		ri.FS_FreeFile( buffer );
+		return 0;
+	}
+
+	// Bones are a flat but variable-length array (mdxaSkel_t's trailing
+	// children[numChildren]), so - same idiom as mdxmSurfHierarchy_t in
+	// VK_LoadGhoul2Model below, and confirmed against rd-vanilla's real
+	// R_LoadMDXA/G2_Add_Bolt - they're reached through an offset table
+	// (mdxaSkelOffsets_t) rather than a fixed-size C array index.
+	VulkanSkeleton skel;
+	skel.bones.reserve( hdr->numBones );
+	const mdxaSkelOffsets_t *offsets = (const mdxaSkelOffsets_t *)( base + sizeof( mdxaHeader_t ) );
+	for ( int i = 0; i < hdr->numBones; i++ )
+	{
+		const mdxaSkel_t *bone = (const mdxaSkel_t *)( base + sizeof( mdxaHeader_t ) + offsets->offsets[i] );
+		VulkanBone vb;
+		vb.name = bone->name;
+		vb.basePoseMat = bone->BasePoseMat;
+		skel.bones.push_back( std::move( vb ) );
+	}
+
+	int numBones = (int)skel.bones.size(); // hdr/base alias buffer, freed next - can't read hdr->numBones after
+	ri.FS_FreeFile( buffer );
+
+	if ( s_skeletons.empty() )
+	{
+		s_skeletons.emplace_back(); // burn index 0, see the cache comment above
+	}
+	s_skeletons.push_back( std::move( skel ) );
+	int index = (int)s_skeletons.size() - 1;
+	s_skeletonsByName[fileName] = index;
+
+	ri.Printf( PRINT_ALL, "rd-vulkan: loaded Ghoul2 skeleton %s: %d bones\n", fileName.c_str(), numBones );
+
+	return index;
+}
 
 // Index 0 is reserved/invalid (mirrors CGhoul2Info::mModel's use as a
 // gameside-only qhandle_t, and this renderer's other 1-based/0-invalid
@@ -197,6 +291,11 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 		return 0;
 	}
 
+	// For bolt lookups only (G2API_AddBolt/GetBoltMatrix) - see
+	// VulkanSkeleton's comment. animName has no extension (matches
+	// R_LoadMDXM's real `va("%s.gla", mdxm->animName)` convention).
+	int skeletonIndex = VK_LoadGhoul2Skeleton( hdr->animName );
+
 	// Surface hierarchy: one variable-length mdxmSurfHierarchy_t per surface
 	// (mdx_format.h), giving each surface's name, shader name (usually empty
 	// for humanoid models - see the skin comment above), and
@@ -315,6 +414,7 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 
 	VulkanGhoul2Model model;
 	model.surfaces = std::move( drawSurfaces );
+	model.skeletonIndex = skeletonIndex;
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
 		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &model.vertexBuffer, &model.vertexBufferMemory );
 	VK_UploadDeviceLocalBuffer( cpuIndexes.data(), cpuIndexes.size() * sizeof( uint32_t ),
@@ -332,6 +432,48 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 		fileName, skinHandle, (int)s_ghoul2Models[index].surfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size() );
 
 	return index;
+}
+
+int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName )
+{
+	if ( modelCacheIndex <= 0 || (size_t)modelCacheIndex >= s_ghoul2Models.size() || !boneName )
+	{
+		return -1;
+	}
+	int skeletonIndex = s_ghoul2Models[modelCacheIndex].skeletonIndex;
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return -1;
+	}
+	const std::vector<VulkanBone> &bones = s_skeletons[skeletonIndex].bones;
+	for ( size_t i = 0; i < bones.size(); i++ )
+	{
+		if ( !Q_stricmp( bones[i].name.c_str(), boneName ) )
+		{
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t *out )
+{
+	if ( modelCacheIndex <= 0 || (size_t)modelCacheIndex >= s_ghoul2Models.size() || !out )
+	{
+		return false;
+	}
+	int skeletonIndex = s_ghoul2Models[modelCacheIndex].skeletonIndex;
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return false;
+	}
+	const std::vector<VulkanBone> &bones = s_skeletons[skeletonIndex].bones;
+	if ( boneIndex < 0 || (size_t)boneIndex >= bones.size() )
+	{
+		return false;
+	}
+	*out = bones[boneIndex].basePoseMat;
+	return true;
 }
 
 void VK_ShutdownGhoul2Models( void )

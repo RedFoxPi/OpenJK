@@ -342,26 +342,62 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
   academy1 NPCs' resolved-surface counts jumped similarly post-fix (e.g.
   `kyle` 5 -> 19, `jedi` -> 17, `protocol` 32 -> two distinct skin variants
   at 32 and 26).
-- **Caveat, not a bug**: academy1's spawn point is a scripted, *moving*
-  cutscene camera (a close-up character portrait shot that then pulls back
-  - confirmed by capturing the same scene at `wait_frames` 100/200/300
-  (near-first-person, camera essentially at the NPC's side) vs. 600/1000
-  (pulled back to a side/profile view of the same NPC) - the framing keeps
-  changing well past where static world geometry has long since settled).
-  Since `+wait N` waits for N *rendered client frames*, not N fixed
-  server ticks, and the underlying cutscene timeline advances in real
-  (wall-clock) time, two renderers with different per-frame cost reach
-  different points along that timeline by the time each has rendered its
-  Nth frame. That means a screenshot comparison at a fixed `wait_frames`
-  value is only meaningful for content that doesn't move - it's exactly
-  why the *static* world/sky/culling comparisons elsewhere in this file
-  hold up, but it also means a single-frame side-by-side against a vanilla
-  reference can show a legitimately different camera angle/NPC distance
-  through no fault of the renderer, and shouldn't be read as a position bug
-  on its own. (`tests/render-regression`'s `wait_frames: 300` for this
-  scene predates Ghoul2 rendering entirely - it was chosen when nothing
-  but static geometry was visible, so it was never tuned to land on any
-  particular cutscene beat.)
+- **Bind-pose bolt support added (`G2API_AddBolt`/`GetBoltMatrix`,
+  `VK_LoadGhoul2Skeleton` in `tr_model.cpp`) after a real, confirmed bug**:
+  comparing an academy1 screenshot against vanilla showed the camera
+  planted essentially *inside* an NPC (extreme close-up on a belt buckle
+  and gloved hand) at a point where vanilla shows a normal few-feet-away
+  portrait shot. Root cause, traced through `code/cgame/cg_camera.cpp`'s
+  `CGCam_FollowUpdate`: academy1's intro camera tracks a bolt (a named
+  bone attachment point) on the NPC via `G2API_AddBolt`/`GetBoltMatrix` to
+  frame the shot, then places the camera a fixed distance from that bolt.
+  This renderer's `G2API_GetBoltMatrix` was a stub that always returned a
+  *zeroed* matrix and `qfalse` - and `CGCam_FollowUpdate` never checks that
+  return value, so the "tracked point" silently collapsed to the NPC's own
+  origin, and the camera ended up parked on top of it. Fixed by parsing
+  the `.gla` skeleton file for real (`mdxaHeader_t`/`mdxaSkel_t`, bone
+  names + `BasePoseMat` - offset arithmetic matched field-for-field against
+  rd-vanilla's real `R_LoadMDXA`/`G2_Add_Bolt`, same discipline as the
+  `.glm` mesh parser) and implementing real bone-name-to-bolt resolution
+  and bind-pose bolt-matrix composition (matched against rd-vanilla's real
+  `Multiply_3x4Matrix`/`Create_Matrix`/`G2API_GetBoltMatrix`, a *different*
+  row-major 3x4 affine convention from the column-major `mat4` used
+  elsewhere in this renderer, so it's a fresh small matrix multiply, not a
+  reuse of `VK_MultiplyMatrix`). "Bind-pose" here matters: there's still no
+  skeletal animation, so a bolt on a bone that would move during an
+  animation reports that bone's *rest* position, not wherever the
+  animation would actually put it - correct for a standing-still NPC,
+  wrong once real animation exists.
+- **Verified the fix is doing real work, but not that it fully resolves
+  academy1's camera framing** - academy1's intro turned out to be a
+  multi-shot cinematic with several distinct camera setups (confirmed by
+  capturing `rd-vanilla` itself, not just this renderer, at matching
+  `wait_frames` values: 150 and 300 show the same close-up portrait, 600
+  shows a completely different wide shot of a room full of seated/standing
+  NPCs, 1000 shows yet another close-up from a different angle - this is
+  cutscene *cuts*, not a single continuous pan). Bone-name resolution now
+  works correctly (confirmed via a temporary trace: real bone names like
+  `pelvis`/`cervical`/`lower_lumbar` resolve to sane indices; the
+  `*`-prefixed surface-attachment names some models also request correctly
+  return "not found", since surface bolts - as opposed to bone bolts -
+  aren't implemented) and bolt matrices compose to plausible non-degenerate
+  positions (a believable few dozen units above the entity origin, not
+  zero). Despite that, this renderer's own camera still doesn't match
+  vanilla's framing at the shots tested - it stays close to a subject
+  throughout rather than settling into vanilla's portrait/wide-shot
+  sequence. Since `+wait N` waits for N *rendered client frames*, not N
+  fixed server ticks, and academy1's cutscene timeline advances in real
+  (wall-clock) time via ICARUS commands, two renderers with different
+  per-frame cost reach different points along that timeline - and possibly
+  different points in whatever dialogue/sound-gated waits the script uses,
+  which this test harness runs with sound disabled - by the time each has
+  rendered its Nth frame. That's a real confound this hasn't been
+  untangled from, on top of whatever's left of the original bug (if
+  anything is). Bottom line: the underlying bolt-matrix bug that was
+  found and root-caused is genuinely fixed, but full camera-framing parity
+  for this specific cutscene is **not** confirmed and would need more
+  investigation into `cg_camera.cpp`'s broader subject/distance logic (or
+  running with sound enabled) to pin down further.
 
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
@@ -443,21 +479,25 @@ touch this code)
   centered; drawn depth-test/write-disabled before world geometry.
 - Ghoul2 (character/weapon model) rendering (`tr_model.cpp`), in models'
   static bind pose - see "Ghoul2 rendering" above for what was verified and
-  its scope: no skeletal animation, LOD selection, bolts/attachments,
-  per-surface on/off overrides, or gore, but real `.glm` mesh parsing,
-  `.skin` texture resolution (single-file case only), and per-frame entity
-  dispatch through the same pipeline/vertex-format world geometry uses.
+  its scope: no skeletal animation, LOD selection, per-surface on/off
+  overrides, or gore, but real `.glm` mesh parsing, `.skin` texture
+  resolution (single-file case only), bind-pose bone bolts (see below), and
+  per-frame entity dispatch through the same pipeline/vertex-format world
+  geometry uses.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
 - Ghoul2 skeletal animation and everything downstream of it: bone math, LOD
-  selection, bolts/attachments (`AddBolt`/`AttachG2Model`), per-surface
-  on/off overrides (`SetSurfaceOnOff`), gore, tags, ragdoll. Models render
-  in a fixed bind pose only - see "Ghoul2 rendering" above for exactly what
-  *is* real (mesh parsing, `.skin` textures, entity dispatch) and "Ghoul2 is
+  selection, per-surface on/off overrides (`SetSurfaceOnOff`), gore, tags,
+  ragdoll, model-to-model attachment (`AttachG2Model`/`AttachEnt`) and
+  surface bolts (a bolt naming a *surface* rather than a bone - only bone
+  bolts are implemented, see "Ghoul2 rendering" above for the real, bind-
+  pose-only `AddBolt`/`GetBoltMatrix`). Models render in a fixed bind pose
+  only - see "Ghoul2 rendering" above for exactly what *is* real (mesh
+  parsing, `.skin` textures, bone bolts, entity dispatch) and "Ghoul2 is
   not reused from rd-vanilla" below for why the animation system in
-  particular is a separate, larger task. Every `G2API_*` entry point beyond
-  model loading/skin registration is still a safe stub.
+  particular is a separate, larger task. Every other `G2API_*` entry point
+  beyond model loading/skin registration/bone bolts is still a safe stub.
 - Dynamic lighting for world geometry (`AddLightToScene` is a stub) and
   vertex lighting/colors - only the map's precomputed, baked lightmap
   applies (see "3D world geometry" above). No shadows other than what's

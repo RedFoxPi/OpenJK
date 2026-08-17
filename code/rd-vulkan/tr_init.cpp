@@ -1245,7 +1245,45 @@ public:
 static CVulkanGhoul2InfoArray s_ghoul2InfoArray;
 IGhoul2InfoArray &TheGhoul2InfoArray() { return s_ghoul2InfoArray; }
 
-int G2API_AddBolt( CGhoul2Info *ghlInfo, const char *boneName ) { (void)ghlInfo; (void)boneName; return -1; }
+// Bone bolts only (bind-pose only, see README.md) - surface bolts
+// (G2API_AddBoltSurfNum, or a surface-name match here) aren't implemented.
+// Mirrors rd-vanilla's real G2_Add_Bolt (G2_bolts.cpp): reuse a bolt
+// already on this bone, or a freed (-1,-1) slot, else append - a bolt
+// index is a position in ghlInfo->mBltlist, not a global handle.
+int G2API_AddBolt( CGhoul2Info *ghlInfo, const char *boneName )
+{
+	if ( !ghlInfo || !boneName || !boneName[0] )
+	{
+		return -1;
+	}
+	int boneIndex = VK_FindGhoul2Bone( (int)ghlInfo->mModel, boneName );
+	if ( boneIndex < 0 )
+	{
+		return -1;
+	}
+	for ( size_t i = 0; i < ghlInfo->mBltlist.size(); i++ )
+	{
+		if ( ghlInfo->mBltlist[i].boneNumber == boneIndex )
+		{
+			ghlInfo->mBltlist[i].boltUsed++;
+			return (int)i;
+		}
+	}
+	for ( size_t i = 0; i < ghlInfo->mBltlist.size(); i++ )
+	{
+		if ( ghlInfo->mBltlist[i].boneNumber == -1 && ghlInfo->mBltlist[i].surfaceNumber == -1 )
+		{
+			ghlInfo->mBltlist[i].boneNumber = boneIndex;
+			ghlInfo->mBltlist[i].boltUsed = 1;
+			return (int)i;
+		}
+	}
+	boltInfo_t bolt;
+	bolt.boneNumber = boneIndex;
+	bolt.boltUsed = 1;
+	ghlInfo->mBltlist.push_back( bolt );
+	return (int)ghlInfo->mBltlist.size() - 1;
+}
 int G2API_AddBoltSurfNum( CGhoul2Info *ghlInfo, const int surfIndex ) { (void)ghlInfo; (void)surfIndex; return -1; }
 int G2API_AddSurface( CGhoul2Info *ghlInfo, int surfaceNumber, int polyNumber, float bi, float bj, int lod ) { (void)ghlInfo; (void)surfaceNumber; (void)polyNumber; (void)bi; (void)bj; (void)lod; return -1; }
 void G2API_AnimateG2Models( CGhoul2Info_v &ghoul2, int t, CRagDollUpdateParams *p ) { (void)ghoul2; (void)t; (void)p; }
@@ -1268,11 +1306,98 @@ qboolean G2API_GetAnimRangeIndex( CGhoul2Info *ghlInfo, const int boneIndex, int
 qboolean G2API_GetBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int t, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed, int *modelList ) { (void)ghlInfo; (void)boneName; (void)t; (void)modelList; if (currentFrame) *currentFrame = 0; if (startFrame) *startFrame = 0; if (endFrame) *endFrame = 0; if (flags) *flags = 0; if (animSpeed) *animSpeed = 0; return qfalse; }
 qboolean G2API_GetBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, const int t, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed, int *modelList ) { (void)ghlInfo; (void)boneIndex; (void)t; (void)modelList; if (currentFrame) *currentFrame = 0; if (startFrame) *startFrame = 0; if (endFrame) *endFrame = 0; if (flags) *flags = 0; if (animSpeed) *animSpeed = 0; return qfalse; }
 int G2API_GetBoneIndex( CGhoul2Info *ghlInfo, const char *boneName, qboolean bAddIfNotFound ) { (void)ghlInfo; (void)boneName; (void)bAddIfNotFound; return -1; }
+// Byte-for-byte-in-spirit copy of rd-vanilla's real Multiply_3x4Matrix
+// (tr_ghoul2.cpp) for mdxaBone_t's row-major 3x4 affine representation -
+// NOT the same convention as VK_MultiplyMatrix (tr_world.cpp)'s column-major
+// mat4 float[16], so it isn't reused from there. out = in2 applied after in
+// (i.e. "in" transforms first, then "in2" - out = in2 * in in ordinary
+// matrix-product notation, matching the real function's own doc comment
+// via its usage, not just its name).
+static void VK_Multiply3x4Matrix( mdxaBone_t *out, const mdxaBone_t *in2, const mdxaBone_t *in )
+{
+	for ( int row = 0; row < 3; row++ )
+	{
+		for ( int col = 0; col < 3; col++ )
+		{
+			out->matrix[row][col] =
+				in2->matrix[row][0] * in->matrix[0][col] +
+				in2->matrix[row][1] * in->matrix[1][col] +
+				in2->matrix[row][2] * in->matrix[2][col];
+		}
+		out->matrix[row][3] =
+			in2->matrix[row][0] * in->matrix[0][3] +
+			in2->matrix[row][1] * in->matrix[1][3] +
+			in2->matrix[row][2] * in->matrix[2][3] +
+			in2->matrix[row][3];
+	}
+}
+
+// Bind-pose-only (see README.md): frameNum/modelList are ignored - there is
+// no animation to select a frame of, a bolt always reports its rest-pose
+// position. This is what fixed academy1's cutscene camera collapsing onto
+// the NPC's own origin - see README.md's "Ghoul2 rendering" section for the
+// full story (CGCam_FollowUpdate, cg_camera.cpp, calls this every frame to
+// track a bolt on the NPC and never checks the qfalse this used to always
+// return).
 qboolean G2API_GetBoltMatrix( CGhoul2Info_v &ghoul2, const int modelIndex, const int boltIndex, mdxaBone_t *matrix, const vec3_t angles, const vec3_t position, const int frameNum, qhandle_t *modelList, const vec3_t scale )
 {
-	(void)ghoul2; (void)modelIndex; (void)boltIndex; (void)angles; (void)position; (void)frameNum; (void)modelList; (void)scale;
-	if ( matrix ) memset( matrix, 0, sizeof( *matrix ) );
-	return qfalse;
+	(void)frameNum; (void)modelList;
+	if ( !matrix )
+	{
+		return qfalse;
+	}
+
+	// Entity (world) transform - same construction as rd-vanilla's real
+	// Create_Matrix/G2_GenerateWorldMatrix (G2_misc.cpp): column c (i.e.
+	// matrix[row][c] for row 0-2) is AnglesToAxis's axis[c] - note `angles`
+	// here is a PITCH/YAW/ROLL Euler triple, a different representation
+	// from refEntity_t::axis (already a 3x3 basis) used elsewhere in this
+	// renderer, so this can't reuse that entity-matrix code either.
+	matrix3_t axis;
+	AnglesToAxis( angles, axis );
+	mdxaBone_t worldMatrix = {};
+	for ( int row = 0; row < 3; row++ )
+	{
+		worldMatrix.matrix[row][0] = axis[0][row];
+		worldMatrix.matrix[row][1] = axis[1][row];
+		worldMatrix.matrix[row][2] = axis[2][row];
+		worldMatrix.matrix[row][3] = position[row];
+	}
+
+	mdxaBone_t bolt = {};
+	bool ok = false;
+	if ( modelIndex >= 0 && modelIndex < ghoul2.size() )
+	{
+		CGhoul2Info &ghlInfo = ghoul2[modelIndex];
+		if ( boltIndex >= 0 && (size_t)boltIndex < ghlInfo.mBltlist.size() && ghlInfo.mBltlist[boltIndex].boneNumber >= 0 )
+		{
+			ok = VK_GetGhoul2BoneBasePoseMat( (int)ghlInfo.mModel, ghlInfo.mBltlist[boltIndex].boneNumber, &bolt );
+			if ( ok )
+			{
+				// Same conditional scale-the-translation step as the real
+				// G2API_GetBoltMatrix - scale[i]==0 means "no override" for
+				// this axis, not "scale to zero" (refEntity_t::modelScale's
+				// convention).
+				if ( scale[0] ) bolt.matrix[0][3] *= scale[0];
+				if ( scale[1] ) bolt.matrix[1][3] *= scale[1];
+				if ( scale[2] ) bolt.matrix[2][3] *= scale[2];
+			}
+		}
+	}
+	if ( !ok )
+	{
+		// Same fixed fallback rotation the real G2API_GetBoltMatrix uses on
+		// failure (its `identityMatrix` constant, G2_API.cpp) rather than a
+		// zeroed matrix - callers that don't check the qfalse return (like
+		// cg_camera.cpp's CGCam_FollowUpdate) still get a well-formed
+		// matrix instead of a degenerate one.
+		bolt.matrix[0][0] = 0; bolt.matrix[0][1] = -1; bolt.matrix[0][2] = 0;
+		bolt.matrix[1][0] = 1; bolt.matrix[1][1] = 0;  bolt.matrix[1][2] = 0;
+		bolt.matrix[2][0] = 0; bolt.matrix[2][1] = 0;  bolt.matrix[2][2] = 1;
+	}
+
+	VK_Multiply3x4Matrix( matrix, &worldMatrix, &bolt );
+	return ok ? qtrue : qfalse;
 }
 int G2API_GetGhoul2ModelFlags( CGhoul2Info *ghlInfo ) { (void)ghlInfo; return 0; }
 // game.so's G_StandardHumanoid (g_client.cpp) asserts this is non-null for
@@ -1288,7 +1413,50 @@ int G2API_GetSurfaceIndex( CGhoul2Info *ghlInfo, const char *surfaceName ) { (vo
 char *G2API_GetSurfaceName( CGhoul2Info *ghlInfo, int surfNumber ) { (void)ghlInfo; (void)surfNumber; return nullptr; }
 int G2API_GetSurfaceRenderStatus( CGhoul2Info *ghlInfo, const char *surfaceName ) { (void)ghlInfo; (void)surfaceName; return -1; }
 int G2API_GetTime( int argTime ) { return argTime; }
-void G2API_GiveMeVectorFromMatrix( mdxaBone_t &boltMatrix, Eorientations flags, vec3_t &vec ) { (void)boltMatrix; (void)flags; VectorClear( vec ); }
+// Faithful copy of rd-vanilla's real G2API_GiveMeVectorFromMatrix
+// (G2_API.cpp) - extracts a bolt matrix's origin (translation column) or
+// one of its three basis vectors (+/- X/Y/Z).
+void G2API_GiveMeVectorFromMatrix( mdxaBone_t &boltMatrix, Eorientations flags, vec3_t &vec )
+{
+	switch ( flags )
+	{
+		case ORIGIN:
+			vec[0] = boltMatrix.matrix[0][3];
+			vec[1] = boltMatrix.matrix[1][3];
+			vec[2] = boltMatrix.matrix[2][3];
+			break;
+		case POSITIVE_Y:
+			vec[0] = boltMatrix.matrix[0][1];
+			vec[1] = boltMatrix.matrix[1][1];
+			vec[2] = boltMatrix.matrix[2][1];
+			break;
+		case POSITIVE_X:
+			vec[0] = boltMatrix.matrix[0][0];
+			vec[1] = boltMatrix.matrix[1][0];
+			vec[2] = boltMatrix.matrix[2][0];
+			break;
+		case POSITIVE_Z:
+			vec[0] = boltMatrix.matrix[0][2];
+			vec[1] = boltMatrix.matrix[1][2];
+			vec[2] = boltMatrix.matrix[2][2];
+			break;
+		case NEGATIVE_Y:
+			vec[0] = -boltMatrix.matrix[0][1];
+			vec[1] = -boltMatrix.matrix[1][1];
+			vec[2] = -boltMatrix.matrix[2][1];
+			break;
+		case NEGATIVE_X:
+			vec[0] = -boltMatrix.matrix[0][0];
+			vec[1] = -boltMatrix.matrix[1][0];
+			vec[2] = -boltMatrix.matrix[2][0];
+			break;
+		case NEGATIVE_Z:
+			vec[0] = -boltMatrix.matrix[0][2];
+			vec[1] = -boltMatrix.matrix[1][2];
+			vec[2] = -boltMatrix.matrix[2][2];
+			break;
+	}
+}
 qboolean G2API_HaveWeGhoul2Models( CGhoul2Info_v &ghoul2 ) { return ghoul2.size() ? qtrue : qfalse; }
 qboolean G2API_IKMove( CGhoul2Info_v &ghoul2, int t, sharedIKMoveParams_t *params ) { (void)ghoul2; (void)t; (void)params; return qfalse; }
 int G2API_InitGhoul2Model( CGhoul2Info_v &ghoul2, const char *fileName, int modelIndex, qhandle_t customSkin, qhandle_t customShader, int modelFlags, int lodBias )

@@ -279,6 +279,14 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle );
 // VulkanSkin in tr_model.cpp), returns a handle usable as VK_LoadGhoul2Model's
 // skinHandle. Called from RE_RegisterSkin below.
 int VK_RegisterSkin( const char *name );
+// Bind-pose-only bolt support (see VulkanSkeleton's comment in
+// tr_model.cpp) - used by G2API_AddBolt/G2API_GetBoltMatrix below.
+// modelCacheIndex is a VK_LoadGhoul2Model return value (i.e.
+// CGhoul2Info::mModel). VK_FindGhoul2Bone returns -1 if not found (same
+// contract as G2API_AddBolt); VK_GetGhoul2BoneBasePoseMat returns false
+// (leaving *out untouched) on any invalid index.
+int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName );
+bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t *out );
 
 // tr_shader.cpp
 //
