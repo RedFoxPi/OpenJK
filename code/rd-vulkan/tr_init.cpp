@@ -858,6 +858,12 @@ static void VK_CreateWorldPipeline( void )
 	depthStencil.depthWriteEnable = VK_TRUE;
 	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
 
+	// Sky variant: test/write both off (see vk.skyPipeline's comment in
+	// tr_local.h) - otherwise identical, same layout/shaders/vertex format.
+	VkPipelineDepthStencilStateCreateInfo skyDepthStencil = depthStencil;
+	skyDepthStencil.depthTestEnable = VK_FALSE;
+	skyDepthStencil.depthWriteEnable = VK_FALSE;
+
 	VkPipelineColorBlendAttachmentState blendAttachment = {};
 	blendAttachment.blendEnable = VK_FALSE;
 	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
@@ -872,22 +878,29 @@ static void VK_CreateWorldPipeline( void )
 	dynState.dynamicStateCount = 2;
 	dynState.pDynamicStates = dynStates;
 
-	VkGraphicsPipelineCreateInfo pipeInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-	pipeInfo.stageCount = 2;
-	pipeInfo.pStages = stages;
-	pipeInfo.pVertexInputState = &vertexInput;
-	pipeInfo.pInputAssemblyState = &inputAssembly;
-	pipeInfo.pViewportState = &viewportState;
-	pipeInfo.pRasterizationState = &raster;
-	pipeInfo.pMultisampleState = &multisample;
-	pipeInfo.pDepthStencilState = &depthStencil;
-	pipeInfo.pColorBlendState = &colorBlend;
-	pipeInfo.pDynamicState = &dynState;
-	pipeInfo.layout = vk.worldPipelineLayout;
-	pipeInfo.renderPass = vk.renderPass;
-	pipeInfo.subpass = 0;
+	VkGraphicsPipelineCreateInfo pipeInfos[2] = {};
+	pipeInfos[0] = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+	pipeInfos[0].stageCount = 2;
+	pipeInfos[0].pStages = stages;
+	pipeInfos[0].pVertexInputState = &vertexInput;
+	pipeInfos[0].pInputAssemblyState = &inputAssembly;
+	pipeInfos[0].pViewportState = &viewportState;
+	pipeInfos[0].pRasterizationState = &raster;
+	pipeInfos[0].pMultisampleState = &multisample;
+	pipeInfos[0].pDepthStencilState = &depthStencil;
+	pipeInfos[0].pColorBlendState = &colorBlend;
+	pipeInfos[0].pDynamicState = &dynState;
+	pipeInfos[0].layout = vk.worldPipelineLayout;
+	pipeInfos[0].renderPass = vk.renderPass;
+	pipeInfos[0].subpass = 0;
 
-	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &vk.worldPipeline ), "vkCreateGraphicsPipelines (world)" );
+	pipeInfos[1] = pipeInfos[0];
+	pipeInfos[1].pDepthStencilState = &skyDepthStencil;
+
+	VkPipeline pipelines[2] = {};
+	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 2, pipeInfos, nullptr, pipelines ), "vkCreateGraphicsPipelines (world)" );
+	vk.worldPipeline = pipelines[0];
+	vk.skyPipeline = pipelines[1];
 
 	vkDestroyShaderModule( vk.device, vertModule, nullptr );
 	vkDestroyShaderModule( vk.device, fragModule, nullptr );
@@ -987,6 +1000,7 @@ void VK_Shutdown( qboolean destroyWindow )
 	VK_ShutdownWorld();
 
 	if ( vk.worldPipeline ) vkDestroyPipeline( vk.device, vk.worldPipeline, nullptr );
+	if ( vk.skyPipeline ) vkDestroyPipeline( vk.device, vk.skyPipeline, nullptr );
 	if ( vk.worldPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.worldPipelineLayout, nullptr );
 	if ( vk.worldSampler ) vkDestroySampler( vk.device, vk.worldSampler, nullptr );
 	if ( vk.worldDescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.worldDescriptorPool, nullptr );

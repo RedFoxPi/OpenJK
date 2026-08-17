@@ -107,6 +107,22 @@ frames:
   ceiling casting light bars across the floor) instead of flat, uniformly-lit
   surfaces, and reads as a recognizable game screenshot rather than a
   lighting-flattened render.
+- **Sky** now renders as a real camera-centered skybox (see `VK_LoadSky` in
+  `tr_world.cpp`) instead of `SURF_SKY` surfaces just being skipped: the
+  sky-flagged shader's name is used directly as a skybox basename (this
+  renderer doesn't parse `.shader` `skyparms`, see "What's not implemented
+  yet" below, so it can't follow a `skyparms` override to a *different*
+  basename - it works here because academy1's sky shader's own name matches
+  its face image names, the common case), its 6 `_rt`/`_lf`/`_bk`/`_ft`/
+  `_up`/`_dn` faces are loaded and built into a box using rd-vanilla's exact
+  `MakeSkyVec` corner formula (`tr_sky.cpp`) so face orientation matches
+  rather than being guessed, and it's drawn first with depth test/write
+  both off (a dedicated `vk.skyPipeline`) so ordinary depth-tested world
+  geometry drawn afterward always overdraws it correctly. It's a flat
+  6-quad box, not rd-vanilla's subdivided/warped dome, so expect visible
+  seams at the box edges up close - a deliberate first-pass simplification,
+  not a bug. Visually confirmed on academy1: the ceiling grate gaps now
+  show hazy blue sky instead of solid black/clear-color.
 - A pixel diff against an `rd-vanilla` reference (same map, same camera, no
   special cvars now that lighting is real) is still a **`MAJOR_DIFF`, ~40%
   mean pixel difference**, and that's expected, not a regression to chase
@@ -115,18 +131,18 @@ frames:
   independently, much earlier, with default settings - same framing both
   times, so this is genuinely the level's intro camera, not an artifact of
   any flag used here) where the player's own Ghoul2 model fills a large
-  fraction of the frame - and Ghoul2 rendering is entirely unimplemented
-  (see "Ghoul2 is not reused from rd-vanilla" below). Sky isn't implemented
-  either (see below). Given that, a large diff on *this specific scene* is
-  exactly what "no models, no sky yet" predicts - it's not evidence the
-  world-geometry or lighting path itself is wrong (see the hand-verified
-  matrix math above, and the visual lightmap check just above, for that).
-  Before lightmaps landed, the same comparison needed `r_fullbright 1` on
-  the vanilla side to be meaningful at all, and scored progressively 39%
-  (initial) then 23% (after the `SURF_NODRAW`/dust-quad fixes below) mean
-  diff - those numbers aren't directly comparable to the current ~40%,
-  since fullbright-vs-fullbright and lit-vs-lit are different comparisons,
-  not a regression between them.
+  fraction of the frame, and Ghoul2 rendering is entirely unimplemented
+  (see "Ghoul2 is not reused from rd-vanilla" below). Given that, a large
+  diff on *this specific scene* is exactly what "no models yet" predicts -
+  it's not evidence the world-geometry, lighting, or sky path itself is
+  wrong (see the hand-verified matrix math above, and the visual lightmap/
+  sky checks just above, for that). Before lightmaps and sky landed, the
+  same comparison needed `r_fullbright 1` on the vanilla side to be
+  meaningful at all, and scored progressively 39% (initial) then 23%
+  (after the `SURF_NODRAW`/dust-quad fixes below) mean diff - those numbers
+  aren't directly comparable to the current ~40%, since fullbright-vs-
+  fullbright and lit-vs-lit are different comparisons, not a regression
+  between them.
 - **Bug found and fixed**: `SURF_NODRAW`-flagged surfaces (editor-only
   geometry - caulk, clip, trigger volumes; 3 of academy1's 16 shaders) and
   `SURF_SKY`-flagged surfaces weren't excluded at all, so each painted a
@@ -265,6 +281,10 @@ touch this code)
   selection the 2D path has); drawn with a real per-frame camera built from
   `refdef_t` (see `VK_BuildViewMatrix`/`VK_BuildProjectionMatrix` in
   `tr_world.cpp`).
+- Skybox rendering (`tr_world.cpp`: `VK_LoadSky`) - see "3D world geometry"
+  above for what was verified. A flat (non-subdivided, non-warped) 6-face
+  box using the sky shader's own name as its basename, always camera-
+  centered; drawn depth-test/write-disabled before world geometry.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -284,10 +304,13 @@ touch this code)
   see "3D world geometry" above.
 - Curved surfaces/patches (`MST_PATCH`) and flares (`MST_FLARE`) - skipped
   entirely at load time, not just unlit.
-- Sky (`RDF_DRAWSKYBOX`/skyportal) - no portal/box rendering at all;
-  `SURF_SKY`-flagged surfaces are skipped rather than drawn (see "3D world
-  geometry" above), so sky-facing areas currently just show the clear color
-  instead of anything resembling a sky.
+- Proper sky rendering: what's implemented (see "3D world geometry" above)
+  is a flat, non-subdivided skybox using the sky shader's *name* as its
+  basename - no `.shader` `skyparms` parsing (so a level whose sky script
+  points at a different-named basename won't find its faces), no dome
+  warping/subdivision (visible seams at box edges), no `RDF_SKYBOXPORTAL`
+  (a portal showing a miniature separate scene - a distinct, unimplemented
+  feature from the base skybox).
 - Dynamic scene content: entities (`AddRefEntityToScene`), runtime polys
   (`AddPolyToScene`) - both still stubs, so nothing except the static world
   itself ever appears in a 3D scene yet.

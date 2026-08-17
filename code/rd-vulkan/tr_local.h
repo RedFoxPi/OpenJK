@@ -177,6 +177,12 @@ typedef struct
 	VkDescriptorPool worldDescriptorPool = VK_NULL_HANDLE;
 	VkPipelineLayout worldPipelineLayout = VK_NULL_HANDLE;
 	VkPipeline worldPipeline = VK_NULL_HANDLE;
+	// Same layout/vertex format as worldPipeline, but depth test/write both
+	// off - the skybox (tr_world.cpp: VK_LoadSky) is drawn camera-centered,
+	// before normal world geometry, and must never occlude or be occluded
+	// by anything; ordinary depth-tested world geometry drawn afterward
+	// naturally overdraws it wherever real geometry exists.
+	VkPipeline skyPipeline = VK_NULL_HANDLE;
 	VkSampler worldSampler = VK_NULL_HANDLE;
 
 	// Shared across tr_cmds.cpp's and tr_world.cpp's draw calls (both bind

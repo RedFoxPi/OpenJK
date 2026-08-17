@@ -74,6 +74,17 @@ static std::vector<image_t *> s_lightmapImages;
 // multiply is a no-op rather than requiring a separate unlit code path.
 static image_t *s_whiteLightmap = nullptr;
 
+// Skybox (see VK_LoadSky) - 6 faces, reuses WorldSurfaceBatch's shape (one
+// combined descriptor set + index range per face) even though it's not a
+// BSP surface, since the draw call shape (bind descriptor set, draw indexed)
+// is identical.
+static std::vector<WorldSurfaceBatch> s_skyFaces;
+static VkBuffer s_skyVertexBuffer = VK_NULL_HANDLE;
+static VkDeviceMemory s_skyVertexBufferMemory = VK_NULL_HANDLE;
+static VkBuffer s_skyIndexBuffer = VK_NULL_HANDLE;
+static VkDeviceMemory s_skyIndexBufferMemory = VK_NULL_HANDLE;
+static bool s_skyLoaded = false;
+
 static void VK_DestroyWorldImage( image_t *img )
 {
 	if ( !img ) return;
@@ -93,6 +104,12 @@ void VK_ShutdownWorld( void )
 	s_lightmapImages.clear();
 	VK_DestroyWorldImage( s_whiteLightmap );
 	s_whiteLightmap = nullptr;
+	if ( s_skyVertexBuffer ) { vkDestroyBuffer( vk.device, s_skyVertexBuffer, nullptr ); s_skyVertexBuffer = VK_NULL_HANDLE; }
+	if ( s_skyVertexBufferMemory ) { vkFreeMemory( vk.device, s_skyVertexBufferMemory, nullptr ); s_skyVertexBufferMemory = VK_NULL_HANDLE; }
+	if ( s_skyIndexBuffer ) { vkDestroyBuffer( vk.device, s_skyIndexBuffer, nullptr ); s_skyIndexBuffer = VK_NULL_HANDLE; }
+	if ( s_skyIndexBufferMemory ) { vkFreeMemory( vk.device, s_skyIndexBufferMemory, nullptr ); s_skyIndexBufferMemory = VK_NULL_HANDLE; }
+	s_skyFaces.clear();
+	s_skyLoaded = false;
 	// Descriptor sets allocated per-batch below come from this pool, not
 	// individually tracked - reclaim them all at once rather than freeing
 	// one by one (vk.worldDescriptorPool wasn't created with
@@ -203,6 +220,90 @@ static VkDescriptorSet VK_BuildWorldDescriptorSet( image_t *diffuse, image_t *li
 	return set;
 }
 
+// Standard Quake3 skybox: 6 face images named <baseName>_rt/_lf/_bk/_ft/_up/
+// _dn, forming a box always centered on the camera (see RE_RenderScene) so
+// it reads as infinitely distant. Face vertex XYZ/UV formulas are copied
+// from rd-vanilla's tr_sky.cpp MakeSkyVec, evaluated only at the four
+// s,t = +-1 corners - that function's actual job is subdividing/warping the
+// sky into SKY_SUBDIVISIONS quads per face for a smoother dome and to
+// texture-warp against the sky brush's real shape; this renderer draws each
+// face as one flat quad instead (visible seams at the box edges, no
+// per-brush warping) for a first pass, but uses the exact same corner
+// formula so face orientation (which image goes on which side, right way
+// up) matches rd-vanilla exactly rather than being guessed and gotten
+// subtly wrong.
+static void VK_LoadSky( const char *baseName )
+{
+	static const char *suffixes[6] = { "rt", "lf", "bk", "ft", "up", "dn" };
+	static const int st_to_vec[6][3] = {
+		{  3, -1,  2 }, { -3,  1,  2 },
+		{  1,  3,  2 }, { -1, -3,  2 },
+		{ -2, -1,  3 }, {  2, -1, -3 },
+	};
+
+	image_t *faces[6];
+	for ( int i = 0; i < 6; i++ )
+	{
+		char faceName[MAX_QPATH];
+		Com_sprintf( faceName, sizeof( faceName ), "%s_%s", baseName, suffixes[i] );
+		faces[i] = VK_FindImage( faceName );
+		if ( !faces[i] )
+		{
+			ri.Printf( PRINT_WARNING, "rd-vulkan: sky face '%s' not found, skipping sky\n", faceName );
+			return;
+		}
+	}
+
+	// Must be well inside [zNear, zFar] (see VK_BuildProjectionMatrix) so the
+	// box is never near-or-far-plane clipped regardless of view direction;
+	// its actual size is otherwise irrelevant since it's always camera-
+	// centered, so a fixed constant well clear of both planes is fine.
+	const float boxSize = 2048.0f;
+	static const float corners[4][2] = { { -1, -1 }, { 1, -1 }, { 1, 1 }, { -1, 1 } };
+
+	std::vector<WorldVertex> cpuVerts;
+	std::vector<uint32_t> cpuIndexes;
+	cpuVerts.reserve( 24 );
+	cpuIndexes.reserve( 36 );
+
+	for ( int axis = 0; axis < 6; axis++ )
+	{
+		uint32_t vertBase = (uint32_t)cpuVerts.size();
+		for ( int c = 0; c < 4; c++ )
+		{
+			float s = corners[c][0], t = corners[c][1];
+			float b[3] = { s * boxSize, t * boxSize, boxSize };
+
+			WorldVertex v = {};
+			for ( int j = 0; j < 3; j++ )
+			{
+				int k = st_to_vec[axis][j];
+				v.pos[j] = ( k < 0 ) ? -b[-k - 1] : b[k - 1];
+			}
+			v.uv[0] = ( s + 1.0f ) * 0.5f;
+			v.uv[1] = ( t + 1.0f ) * 0.5f;
+			v.lightmapUV[0] = 0.0f;
+			v.lightmapUV[1] = 0.0f;
+			cpuVerts.push_back( v );
+		}
+
+		uint32_t firstIndex = (uint32_t)cpuIndexes.size();
+		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 1 ); cpuIndexes.push_back( vertBase + 2 );
+		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 2 ); cpuIndexes.push_back( vertBase + 3 );
+
+		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( faces[axis], s_whiteLightmap );
+		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u } );
+	}
+
+	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &s_skyVertexBuffer, &s_skyVertexBufferMemory );
+	VK_UploadDeviceLocalBuffer( cpuIndexes.data(), cpuIndexes.size() * sizeof( uint32_t ),
+		VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &s_skyIndexBuffer, &s_skyIndexBufferMemory );
+
+	s_skyLoaded = true;
+	ri.Printf( PRINT_ALL, "rd-vulkan: loaded sky '%s'\n", baseName );
+}
+
 void RE_LoadWorldMap( const char *name )
 {
 	VK_ShutdownWorld();
@@ -240,6 +341,22 @@ void RE_LoadWorldMap( const char *name )
 	int numSurfaces = lumpCount( LUMP_SURFACES, sizeof( dsurface_t ) );
 
 	VK_LoadLightmaps( lumpData( LUMP_LIGHTMAPS ), header->lumps[LUMP_LIGHTMAPS].filelen );
+
+	// This renderer doesn't parse .shader `skyparms` (see README.md's notes
+	// on .shader script scope), so it uses the sky-flagged shader's own name
+	// as the skybox basename directly - matches the common case (e.g.
+	// academy1's textures/skies/yavin, whose _rt/_lf/.../_dn faces are named
+	// after the shader itself with no skyparms override needed) but would
+	// miss a level whose .shader script points skyparms at a differently-
+	// named basename. First sky shader found wins; a BSP normally has one.
+	for ( int i = 0; i < numShaders; i++ )
+	{
+		if ( shaders[i].surfaceFlags & SURF_SKY )
+		{
+			VK_LoadSky( shaders[i].shader );
+			break;
+		}
+	}
 
 	std::vector<WorldVertex> cpuVerts( (size_t)numVerts );
 	for ( int i = 0; i < numVerts; i++ )
@@ -474,6 +591,40 @@ void RE_RenderScene( const refdef_t *fd )
 	VkRect2D scissor = { { fd->x, fd->y }, { (uint32_t)fd->width, (uint32_t)fd->height } };
 	vkCmdSetViewport( cmd, 0, 1, &viewport );
 	vkCmdSetScissor( cmd, 0, 1, &scissor );
+
+	// Sky, drawn first with depth test/write both off (vk.skyPipeline) so it
+	// never occludes or is occluded by anything - normal depth-tested world
+	// geometry drawn afterward naturally overdraws it wherever real geometry
+	// exists. Uses a translation-stripped view matrix (origin forced to 0,
+	// same rotation) so the box is always camera-centered regardless of
+	// player position, i.e. reads as infinitely distant.
+	if ( s_skyLoaded )
+	{
+		refdef_t skyFd = *fd;
+		VectorClear( skyFd.vieworg );
+		float skyView[16], skyMvp[16];
+		VK_BuildViewMatrix( &skyFd, skyView );
+		VK_MultiplyMatrix( skyView, projMatrix, skyMvp );
+
+		if ( vk.skyPipeline != vk.lastBoundPipeline )
+		{
+			vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.skyPipeline );
+			vk.lastBoundPipeline = vk.skyPipeline;
+		}
+
+		vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof( skyMvp ), skyMvp );
+
+		VkDeviceSize skyVertexOffset = 0;
+		vkCmdBindVertexBuffers( cmd, 0, 1, &s_skyVertexBuffer, &skyVertexOffset );
+		vkCmdBindIndexBuffer( cmd, s_skyIndexBuffer, 0, VK_INDEX_TYPE_UINT32 );
+
+		for ( const WorldSurfaceBatch &face : s_skyFaces )
+		{
+			vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.worldPipelineLayout,
+				0, 1, &face.descriptorSet, 0, nullptr );
+			vkCmdDrawIndexed( cmd, face.indexCount, 1, face.firstIndex, 0, 0 );
+		}
+	}
 
 	if ( vk.worldPipeline != vk.lastBoundPipeline )
 	{
