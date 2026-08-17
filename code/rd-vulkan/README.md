@@ -309,21 +309,39 @@ frames:
   unaffected (identical batch/vertex/index counts and screenshot to before,
   as expected for a map with no patches to begin with).
   `hoth2`'s default `devmap` camera sits low and close to the ground rather
-  than at an elevated establishing shot like vanilla's, which combined with
-  the sky bug below to look badly broken at first - **this was checked
-  properly** (see below), not just eyeballed and dismissed: temporary
-  per-batch debug logging (shader name + world-space AABB for every surface
-  that actually passed frustum culling that frame) confirmed every drawn
-  batch was `textures/hoth/snow_01` with small, sane, correctly-positioned
-  extents - real terrain, not a stray or degenerate polygon. The camera
-  framing itself (why it's low/close instead of an elevated cutscene shot)
-  remains unexplained and is most likely a separate, pre-existing
-  cutscene/camera-script limitation, not a rendering bug - `vieworg` and
-  `viewaxis` come from shared client/cgame code the renderer doesn't
-  control, and academy1's cutscene camera only works correctly here because
-  of the Ghoul2 bolt-matrix work done specifically for it (see "Ghoul2
-  rendering" below); hoth2 likely drives its camera differently and that
-  path isn't verified to work yet.
+  than at an elevated establishing shot like vanilla's at the same
+  `wait_frames`, which combined with the sky bug below to look badly broken
+  at first - **this was checked properly** (see below), not just eyeballed
+  and dismissed: temporary per-batch debug logging (shader name + world-
+  space AABB for every surface that actually passed frustum culling that
+  frame) confirmed every drawn batch was `textures/hoth/snow_01` with
+  small, sane, correctly-positioned extents - real terrain, not a stray or
+  degenerate polygon.
+  **The camera framing itself turned out not to be a bug at all** - traced
+  to ground truth, not guessed at. hoth2's intro (`scripts/hoth2/intro1.ibi`,
+  triggered by a `target_scriptrunner` at spawn) cuts between four
+  `ref_tag` entities (`newcam01`-`04`) placed in the map, smoothly
+  interpolating position/angles between them over real time (ICARUS
+  `CAMERA MOVE`/`PAN` with a multi-second `duration`, shared client/cgame
+  code - the renderer doesn't touch this at all). Temporary logging added
+  to `code/game/Q3_Interface.cpp` (`CQuake3GameInterface::Set`/`CameraMove`/
+  `CameraPan`, reverted after use - not part of this repo's history) traced
+  the actual ICARUS command stream by wall-clock game time: at `wait 300`
+  vanilla had reached `t=5950ms` game time and started an NPC animation,
+  while this renderer had only reached `t=2100ms` - still sitting at the
+  very first camera cut (`newcam01`), its position/angles matching that
+  `ref_tag`'s `origin`/`angles` **exactly**, confirming the camera code
+  itself is correct and the harness's fixed `wait 300` had simply captured
+  two renderers at different points in the *same* real-time cutscene.
+  Confirmed conclusively by giving this renderer a much larger frame budget
+  (`wait 3000`): the same trace then reached `newcam02` - again an exact
+  origin/angles match - mid-flight through its 2000ms interpolation.
+  This renderer is simply far slower per frame than `rd-vanilla` under this
+  headless software rasterizer (lavapipe vs. llvmpipe), so the same
+  `wait_frames` budget lets much less real/game time elapse - the same
+  class of test-harness timing artifact already documented for academy1's
+  cutscene elsewhere in this file, just far more pronounced here. Not a
+  rendering, camera, or ICARUS bug, and no code change was needed.
 
 ### Ghoul2 rendering (tr_model.cpp)
 
