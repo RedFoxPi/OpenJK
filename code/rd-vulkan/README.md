@@ -177,6 +177,53 @@ frames:
   suffix and an unchanged screenshot; vjun1 falls back cleanly with no
   crash. The camera's low/close framing on `hoth2` itself - separate from
   this bug - is discussed in "Curved surfaces" above.
+- **World fog is now rendered.** Even with the sky fallback and camera
+  timing above understood, a `hoth2` screenshot still looked nothing like a
+  real game scene next to vanilla's soft, hazy snowscape - flagged again by
+  direct comparison, not eyeballed away a second time. Root cause: this
+  renderer had **no fog support at all** - `RE_SetRangedFog` and
+  `R_SetTempGlobalFogColor` were (and still are, see below) complete
+  no-ops, and `world.frag` had no fog term. hoth2's BSP defines exactly one
+  `LUMP_FOGS` entry, `textures/fogs/Hoth2fog` with `brushNum == -1`
+  (confirmed by parsing the lump directly) - rd-vanilla's own
+  `R_LoadFogs`/`tr_bsp.cpp` treats `brushNum == -1` as a **global** fog
+  covering the entire map, not bounded to one brush (verified by reading
+  that function, not assumed), and the shader's `fogparms` line
+  (`shaders/fogs.shader`) gives its real values: colour `(0.7 0.7 0.7)`,
+  opaque at `1800` units - real data, not guessed constants.
+  Implemented: `tr_shader.cpp`'s existing minimal `.shader` scanner (until
+  now only used for `blendFunc`) also records each shader's top-level
+  `fogparms` line into a second lookup table
+  (`VK_GetShaderFogParms`); `tr_world.cpp`'s new `VK_LoadWorldFog` reads
+  `LUMP_FOGS`, keeps only a `brushNum == -1` global entry (a real per-brush
+  local fog volume - hoth2 has none, but vjun1's `textures/fogs/fog_black`,
+  `brushNum 6685`, does - is correctly left unimplemented, not attempted),
+  and looks up its colour/distance via that table. `world.vert`/`world.frag`
+  gained a `camPos`/`fogColor` push constant (shared vertex+fragment stage
+  now, not vertex-only) and a `mix()` toward the fog colour based on
+  `distance(worldPos, camPos)`, saturating at the shader's declared opaque
+  distance. This is a **linear** distance ramp, not rd-vanilla's real fog
+  (`tr_shade_calc.cpp`'s `RB_CalcFogTexCoords` - a dot-product "depth along
+  the fog plane's normal" measure fed through a precomputed gradient
+  texture, i.e. a different falloff curve along a different axis) - same
+  "simplify the algorithm, keep the visual intent" tradeoff as the flat
+  skybox box and fixed-subdivision patches elsewhere in this file. Only
+  world geometry is fogged, not the sky (deliberately - see the push
+  constant comments) or Ghoul2 models (not attempted this pass).
+  **Verified**: hoth2 went from a stark, geometrically-flat black/white
+  cutout to a soft grey-white scene whose colour palette closely matches
+  the vanilla reference (both dominated by soft blue-grey/white tones with
+  a hazy horizon, instead of solid black); confirmed the `(0.7 0.7 0.7)`/
+  `1800` values load and log correctly, matching the shader text exactly.
+  Regression-checked three ways: academy1 (zero `LUMP_FOGS` entries,
+  confirmed by parsing) shows no "loaded global fog" log line and an
+  unchanged screenshot; vjun1 (one local + one global fog) correctly picks
+  only the global one (`textures/fogs/vjun1`, not `fog_black`) and loads/
+  runs/screenshots with no crash; a full clean rebuild is warning-free.
+  `RE_SetRangedFog`/`R_SetTempGlobalFogColor` (the *dynamic* fog API, used
+  for scripted fog changes mid-level, e.g. weather-effect entities in
+  `g_fx.cpp`) are still no-ops - only the BSP's static, load-time global
+  fog is implemented here.
 - A pixel diff against an `rd-vanilla` reference (same map, same camera, no
   special cvars now that lighting is real) is still a **`MAJOR_DIFF`, ~40%
   mean pixel difference**, and that's expected, not a regression to chase
@@ -603,6 +650,12 @@ touch this code)
   not reused from rd-vanilla" below for why the animation system in
   particular is a separate, larger task. Every other `G2API_*` entry point
   beyond model loading/skin registration/bone bolts is still a safe stub.
+- Dynamic/scripted fog changes (`RE_SetRangedFog`/`R_SetTempGlobalFogColor`
+  are stubs, used by e.g. weather-effect entities in `g_fx.cpp` for
+  mid-level fog changes) and per-brush *local* fog volumes (a `LUMP_FOGS`
+  entry with a real `brushNum`, bounded to one convex region) - only a
+  map's single static *global* fog (see "3D world geometry" above) is
+  implemented.
 - Dynamic lighting for world geometry (`AddLightToScene` is a stub) and
   vertex lighting/colors - only the map's precomputed, baked lightmap
   applies (see "3D world geometry" above). No shadows other than what's
@@ -631,9 +684,10 @@ touch this code)
   electricity, oriented quads, ...) is queued and silently ignored at draw
   time - nothing about those types renders yet.
 - Full `.shader` script parsing: only a defined shader's first stage's
-  `map`/`blendFunc` is read (see "What's actually implemented" above) -
-  later stages, `tcMod` animation, `rgbGen`/`alphaGen` waves, sky, and fog
-  are all ignored. World geometry doesn't even get the 2D path's blend-mode
+  `map`/`blendFunc`, and (for fog shaders specifically, see "3D world
+  geometry" above) a top-level `fogparms` line, are read - later stages,
+  `tcMod` animation, `rgbGen`/`alphaGen` waves, and `skyparms` are still
+  ignored. World geometry doesn't even get the 2D path's blend-mode
   selection yet (see above) - everything is one opaque pipeline.
 - Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, weather/world
   effects, dissolves, model bounds/tag queries.

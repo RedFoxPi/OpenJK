@@ -116,13 +116,19 @@ struct WorldVertex
 	float lightmapUV[2];
 };
 
-// Layout must match world.vert's `layout(push_constant) uniform PushConstants
-// { mat4 mvp; }`. A plain column-major float[16] matches GLSL's mat4 layout
-// directly (16-byte-aligned columns), unlike vkPushConstants_t above there's
-// no vec4-after-vec2 padding trap here since it's the only member.
+// Layout must match world.vert/world.frag's `layout(push_constant) uniform
+// PushConstants { mat4 mvp; vec4 camPos; vec4 fogColor; }`. A plain
+// column-major float[16] matches GLSL's mat4 layout directly (16-byte-
+// aligned columns); camPos/fogColor are already vec4-sized/aligned so no
+// padding trap there either. fogColor[3] doubles as the fog's "opaque"
+// distance (see VK_LoadWorldFog in tr_world.cpp) - 0 disables fog entirely
+// (the sky draw always passes 0 here; see RE_RenderScene), matching
+// world.frag's `if (fogColor.a > 0.0)` gate.
 struct vkWorldPushConstants_t
 {
 	float mvp[16];
+	float camPos[4];
+	float fogColor[4];
 };
 
 typedef struct
@@ -296,6 +302,7 @@ bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t
 // animation, rgbGen, sky/fog, or anything beyond that - see README.md.
 void VK_LoadShaderScripts( void );
 vkBlendMode_t VK_GetShaderBlendMode( const char *name );
+bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist );
 
 // tr_image.cpp
 image_t *VK_FindImage( const char *name );

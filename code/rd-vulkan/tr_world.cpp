@@ -91,6 +91,16 @@ static VkBuffer s_skyIndexBuffer = VK_NULL_HANDLE;
 static VkDeviceMemory s_skyIndexBufferMemory = VK_NULL_HANDLE;
 static bool s_skyLoaded = false;
 
+// World fog (see VK_LoadWorldFog) - this renderer only supports one global
+// fog volume per map (BSP LUMP_FOGS entries with brushNum == -1, matching
+// rd-vanilla's own R_LoadFogs/worldData.globalFog convention - see
+// tr_bsp.cpp), applied uniformly to all world geometry. Per-brush local fog
+// volumes (a fog entry with a real brushNum) are not implemented - see
+// README.md.
+static bool s_worldFogEnabled = false;
+static float s_worldFogColor[3];
+static float s_worldFogOpaqueDist;
+
 static void VK_DestroyWorldImage( image_t *img )
 {
 	if ( !img ) return;
@@ -116,6 +126,7 @@ void VK_ShutdownWorld( void )
 	if ( s_skyIndexBufferMemory ) { vkFreeMemory( vk.device, s_skyIndexBufferMemory, nullptr ); s_skyIndexBufferMemory = VK_NULL_HANDLE; }
 	s_skyFaces.clear();
 	s_skyLoaded = false;
+	s_worldFogEnabled = false;
 	// Descriptor sets allocated per-batch below come from this pool, not
 	// individually tracked - reclaim them all at once rather than freeing
 	// one by one (vk.worldDescriptorPool wasn't created with
@@ -361,6 +372,44 @@ static void VK_LoadSky( const char *baseName )
 		allFacesFound ? "" : " (using flat fallback colour, real faces not found)" );
 }
 
+// Loads this map's global fog volume, if any - the BSP's LUMP_FOGS entry
+// with brushNum == -1 (rd-vanilla's own R_LoadFogs/tr_bsp.cpp convention for
+// "not bounded to a specific brush, covers the whole map" - confirmed by
+// reading that function directly, not guessed), naming a shader whose
+// fogparms line gives the actual colour/opaque distance (see
+// VK_GetShaderFogParms, tr_shader.cpp). Per-brush local fog volumes (a fog
+// entry with a real brushNum, bounded to one convex region) are not
+// implemented - see README.md; this renderer only supports one fog, applied
+// uniformly to the whole world, which is the common case for outdoor/
+// weather levels like hoth2 that wrap the entire map in one fog brush.
+static void VK_LoadWorldFog( const byte *fogData, int fogDataLen )
+{
+	int numFogs = fogDataLen / (int)sizeof( dfog_t );
+	const dfog_t *fogs = (const dfog_t *)fogData;
+
+	for ( int i = 0; i < numFogs; i++ )
+	{
+		if ( fogs[i].brushNum != -1 )
+		{
+			continue;
+		}
+
+		float color[3];
+		float opaqueDist;
+		if ( VK_GetShaderFogParms( fogs[i].shader, color, &opaqueDist ) )
+		{
+			s_worldFogColor[0] = color[0];
+			s_worldFogColor[1] = color[1];
+			s_worldFogColor[2] = color[2];
+			s_worldFogOpaqueDist = opaqueDist;
+			s_worldFogEnabled = true;
+			ri.Printf( PRINT_ALL, "rd-vulkan: loaded global fog '%s' colour (%.2f %.2f %.2f) opaque dist %.0f\n",
+				fogs[i].shader, color[0], color[1], color[2], opaqueDist );
+		}
+		return; // rd-vanilla's own R_LoadFogs only allows one global fog per map
+	}
+}
+
 // Fixed subdivision level for MST_PATCH tessellation (see VK_TessellatePatchQuad
 // below) - a deliberate first-pass simplification of rd-vanilla's real
 // R_SubdividePatchToGrid (tr_curve.cpp), which adaptively subdivides only as
@@ -487,6 +536,7 @@ void RE_LoadWorldMap( const char *name )
 	int numSurfaces = lumpCount( LUMP_SURFACES, sizeof( dsurface_t ) );
 
 	VK_LoadLightmaps( lumpData( LUMP_LIGHTMAPS ), header->lumps[LUMP_LIGHTMAPS].filelen );
+	VK_LoadWorldFog( lumpData( LUMP_FOGS ), header->lumps[LUMP_FOGS].filelen );
 
 	// This renderer doesn't parse .shader `skyparms` (see README.md's notes
 	// on .shader script scope), so it uses the sky-flagged shader's own name
@@ -871,7 +921,19 @@ void RE_RenderScene( const refdef_t *fd )
 			vk.lastBoundPipeline = vk.skyPipeline;
 		}
 
-		vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof( skyMvp ), skyMvp );
+		// Sky never gets fogged (fogColor.a = 0 disables the mix in
+		// world.frag) - it's meant to read as infinitely distant, and this
+		// renderer's flat-colour fog fallback for farbox-less skies (see
+		// VK_LoadSky) already approximates the same "hazy backdrop" look
+		// fog would otherwise add here. camPos is irrelevant with fog off,
+		// left zeroed. Push the whole struct, not just mvp - an undersized
+		// push leaves camPos/fogColor holding whatever a previous draw call
+		// in this command buffer wrote there (Vulkan push constants persist
+		// across draws until overwritten), not zero.
+		vkWorldPushConstants_t skyPush = {};
+		memcpy( skyPush.mvp, skyMvp, sizeof( skyMvp ) );
+		vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+			0, sizeof( skyPush ), &skyPush );
 
 		VkDeviceSize skyVertexOffset = 0;
 		vkCmdBindVertexBuffers( cmd, 0, 1, &s_skyVertexBuffer, &skyVertexOffset );
@@ -891,7 +953,20 @@ void RE_RenderScene( const refdef_t *fd )
 		vk.lastBoundPipeline = vk.worldPipeline;
 	}
 
-	vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof( mvp ), mvp );
+	vkWorldPushConstants_t worldPush = {};
+	memcpy( worldPush.mvp, mvp, sizeof( mvp ) );
+	worldPush.camPos[0] = fd->vieworg[0];
+	worldPush.camPos[1] = fd->vieworg[1];
+	worldPush.camPos[2] = fd->vieworg[2];
+	if ( s_worldFogEnabled )
+	{
+		worldPush.fogColor[0] = s_worldFogColor[0];
+		worldPush.fogColor[1] = s_worldFogColor[1];
+		worldPush.fogColor[2] = s_worldFogColor[2];
+		worldPush.fogColor[3] = s_worldFogOpaqueDist;
+	}
+	vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+		0, sizeof( worldPush ), &worldPush );
 
 	VkDeviceSize vertexOffset = 0;
 	vkCmdBindVertexBuffers( cmd, 0, 1, &s_worldVertexBuffer, &vertexOffset );

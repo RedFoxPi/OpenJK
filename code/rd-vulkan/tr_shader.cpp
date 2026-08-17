@@ -34,6 +34,13 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 static std::unordered_map<std::string, vkBlendMode_t> s_shaderBlendModes;
 static bool s_shadersLoaded = false;
 
+struct vkShaderFogParms_t
+{
+	float color[3];
+	float opaqueDist;
+};
+static std::unordered_map<std::string, vkShaderFogParms_t> s_shaderFogParms;
+
 static vkBlendMode_t BlendFactorsToMode( const char *src, const char *dst )
 {
 	if ( !Q_stricmp( src, "GL_ONE" ) && !Q_stricmp( dst, "GL_ONE" ) )
@@ -84,6 +91,8 @@ static void ParseShaderFile( const char *text )
 		// keyword = blending disabled, see BLEND_OPAQUE) unless a blendFunc
 		// keyword says otherwise below.
 		vkBlendMode_t blendMode = BLEND_OPAQUE;
+		bool haveFogParms = false;
+		vkShaderFogParms_t fogParms = {};
 
 		while ( depth > 0 )
 		{
@@ -111,6 +120,26 @@ static void ParseShaderFile( const char *text )
 				{
 					inFirstStage = false;
 					sawFirstStage = true;
+				}
+				continue;
+			}
+
+			// fogparms is a top-level shader keyword (depth 1, same level
+			// as a stage's own opening brace), not something inside a
+			// stage - unlike blendFunc below. Syntax: `fogparms ( r g b )
+			// opaqueDistance` (a literal parenthesized triple, then a
+			// plain number - see fogs.shader for real examples).
+			if ( depth == 1 && !Q_stricmp( tok, "fogparms" ) )
+			{
+				const char *paren = COM_ParseExt( &p, qfalse );
+				if ( !strcmp( paren, "(" ) )
+				{
+					fogParms.color[0] = (float)atof( COM_ParseExt( &p, qfalse ) );
+					fogParms.color[1] = (float)atof( COM_ParseExt( &p, qfalse ) );
+					fogParms.color[2] = (float)atof( COM_ParseExt( &p, qfalse ) );
+					COM_ParseExt( &p, qfalse ); // closing ")"
+					fogParms.opaqueDist = (float)atof( COM_ParseExt( &p, qfalse ) );
+					haveFogParms = true;
 				}
 				continue;
 			}
@@ -146,6 +175,10 @@ static void ParseShaderFile( const char *text )
 		if ( s_shaderBlendModes.find( name ) == s_shaderBlendModes.end() )
 		{
 			s_shaderBlendModes[name] = blendMode;
+		}
+		if ( haveFogParms && s_shaderFogParms.find( name ) == s_shaderFogParms.end() )
+		{
+			s_shaderFogParms[name] = fogParms;
 		}
 	}
 
@@ -208,4 +241,24 @@ vkBlendMode_t VK_GetShaderBlendMode( const char *name )
 		return it->second;
 	}
 	return BLEND_ALPHA;
+}
+
+// Looks up a fog shader's `fogparms` (see VK_LoadWorldFog, tr_world.cpp,
+// the only caller - BSP LUMP_FOGS entries reference a shader by name for
+// its color/opaque-distance, not a texture). Returns false (color/dist
+// left untouched) if the shader wasn't found or never declared fogparms.
+bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderFogParms.find( name );
+	if ( it == s_shaderFogParms.end() )
+	{
+		return false;
+	}
+	color[0] = it->second.color[0];
+	color[1] = it->second.color[1];
+	color[2] = it->second.color[2];
+	*opaqueDist = it->second.opaqueDist;
+	return true;
 }

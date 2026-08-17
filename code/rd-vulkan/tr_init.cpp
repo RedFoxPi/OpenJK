@@ -800,7 +800,11 @@ static void VK_CreateWorldPipeline( void )
 	VK_Check( vkCreateSampler( vk.device, &worldSamplerInfo, nullptr, &vk.worldSampler ), "vkCreateSampler (world)" );
 
 	VkPushConstantRange pushRange = {};
-	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+	// Fragment stage needs camPos/fogColor too (world.frag does the actual
+	// fog mix), not just mvp - vertex and fragment share this one range
+	// rather than needing two, since both stages' SPIR-V just read the
+	// fields they care about out of the same layout.
+	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 	pushRange.offset = 0;
 	pushRange.size = sizeof( vkWorldPushConstants_t );
 
