@@ -101,6 +101,24 @@ struct vkPushConstants_t
 	float color[4];
 };
 
+// Static world geometry only (see tr_world.cpp): position + diffuse UV, no
+// normal/lightmap UV/vertex color yet - this first pass renders opaque,
+// unlit, single-texture-per-surface geometry only.
+struct WorldVertex
+{
+	float pos[3];
+	float uv[2];
+};
+
+// Layout must match world.vert's `layout(push_constant) uniform PushConstants
+// { mat4 mvp; }`. A plain column-major float[16] matches GLSL's mat4 layout
+// directly (16-byte-aligned columns), unlike vkPushConstants_t above there's
+// no vec4-after-vec2 padding trap here since it's the only member.
+struct vkWorldPushConstants_t
+{
+	float mvp[16];
+};
+
 typedef struct
 {
 	qboolean registered = qfalse;
@@ -139,6 +157,25 @@ typedef struct
 	VkDeviceMemory uiVertexBufferMemory = VK_NULL_HANDLE;
 	void *uiVertexBufferMapped = nullptr;
 
+	// Depth buffer - one persistent image reused across frames (safe because
+	// RE_EndFrame fully serializes frames with vkQueueWaitIdle already, so
+	// there's never more than one frame's draws in flight against it).
+	VkFormat depthFormat = VK_FORMAT_UNDEFINED;
+	VkImage depthImage = VK_NULL_HANDLE;
+	VkDeviceMemory depthImageMemory = VK_NULL_HANDLE;
+	VkImageView depthImageView = VK_NULL_HANDLE;
+
+	// 3D world geometry draw path (tr_world.cpp) - opaque, unlit, unculled
+	// static BSP surfaces only, see README.md for exactly what that means.
+	VkPipelineLayout worldPipelineLayout = VK_NULL_HANDLE;
+	VkPipeline worldPipeline = VK_NULL_HANDLE;
+
+	// Shared across tr_cmds.cpp's and tr_world.cpp's draw calls (both bind
+	// pipelines into the same per-frame command buffer) so a pipeline bound
+	// by one never gets silently assumed still-bound by the other. Reset to
+	// VK_NULL_HANDLE at the start of every frame in RE_BeginFrame.
+	VkPipeline lastBoundPipeline = VK_NULL_HANDLE;
+
 	vkFrame_t frames[VK_FRAMES_IN_FLIGHT];
 	uint32_t currentFrame = 0;
 	uint32_t currentSwapchainImage = 0;
@@ -166,6 +203,20 @@ extern vkGlobals_t vk;
 // tr_init.cpp
 void VK_Shutdown( qboolean destroyWindow );
 VkShaderModule VK_CreateShaderModule( const uint32_t *code, size_t codeSize );
+void VK_Check( VkResult r, const char *what );
+void VK_CreateBuffer( VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+	VkBuffer *buffer, VkDeviceMemory *memory );
+VkCommandBuffer VK_BeginOneShotCommands( void );
+void VK_EndOneShotCommands( VkCommandBuffer cmd );
+
+// tr_world.cpp
+//
+// Static world geometry only - see WorldVertex/README.md for exactly what
+// this does and does not draw (no lighting, no entities, no BSP culling).
+void RE_LoadWorldMap( const char *name );
+void RE_ClearScene( void );
+void RE_RenderScene( const refdef_t *fd );
+void VK_ShutdownWorld( void );
 
 // tr_shader.cpp
 //

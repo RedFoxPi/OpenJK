@@ -34,7 +34,6 @@ struct UiVertex
 };
 
 static uint32_t s_uiVertexCursor = 0;
-static VkPipeline s_boundPipeline = VK_NULL_HANDLE;
 
 void VK_CopySwapchainImageToReadback( VkCommandBuffer cmd, VkImage swapImage );
 void VK_DestroyReadbackImage( void );
@@ -89,10 +88,10 @@ void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, floa
 	{
 		pipeline = vk.uiPipelineOpaque;
 	}
-	if ( pipeline != s_boundPipeline )
+	if ( pipeline != vk.lastBoundPipeline )
 	{
 		vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline );
-		s_boundPipeline = pipeline;
+		vk.lastBoundPipeline = pipeline;
 	}
 
 	vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.uiPipelineLayout,
@@ -134,15 +133,16 @@ void RE_BeginFrame( stereoFrame_t stereoFrame )
 	VkCommandBufferBeginInfo beginInfo = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
 	vkBeginCommandBuffer( frame.commandBuffer, &beginInfo );
 
-	VkClearValue clearValue;
-	clearValue.color = { { vk.clearColor[0], vk.clearColor[1], vk.clearColor[2], vk.clearColor[3] } };
+	VkClearValue clearValues[2];
+	clearValues[0].color = { { vk.clearColor[0], vk.clearColor[1], vk.clearColor[2], vk.clearColor[3] } };
+	clearValues[1].depthStencil = { 1.0f, 0 };
 
 	VkRenderPassBeginInfo rpInfo = { VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
 	rpInfo.renderPass = vk.renderPass;
 	rpInfo.framebuffer = vk.swapchainFramebuffers[vk.currentSwapchainImage];
 	rpInfo.renderArea.extent = vk.swapchainExtent;
-	rpInfo.clearValueCount = 1;
-	rpInfo.pClearValues = &clearValue;
+	rpInfo.clearValueCount = 2;
+	rpInfo.pClearValues = clearValues;
 
 	vkCmdBeginRenderPass( frame.commandBuffer, &rpInfo, VK_SUBPASS_CONTENTS_INLINE );
 
@@ -154,9 +154,10 @@ void RE_BeginFrame( stereoFrame_t stereoFrame )
 	vk.activeCommandBuffer = frame.commandBuffer;
 	vk.frameActive = true;
 	s_uiVertexCursor = 0;
-	// Each command buffer starts with no pipeline bound - force RE_StretchPic's
-	// first draw this frame to bind one rather than trusting last frame's state.
-	s_boundPipeline = VK_NULL_HANDLE;
+	// Each command buffer starts with no pipeline bound - force the first
+	// draw this frame (2D or 3D) to bind one rather than trusting last
+	// frame's state.
+	vk.lastBoundPipeline = VK_NULL_HANDLE;
 }
 
 void RE_EndFrame( int *frontEndMsec, int *backEndMsec )

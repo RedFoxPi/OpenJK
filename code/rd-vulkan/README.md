@@ -70,6 +70,89 @@ the diff further, from 3.8% to **1.5%**, in two steps:
   dropped mean diff from 3.8% to 1.5% - more than the additive fix, despite
   being "just" a more accurate default.
 
+### 3D world geometry (tr_world.cpp)
+
+Run against `academy1` (SP's first tutorial level), headlessly, loading the
+real map via `devmap academy1` and letting it play out for several hundred
+frames:
+
+- The `.bsp`'s static, opaque, non-patch surfaces (see "What's actually
+  implemented" below for exactly which) load, upload to GPU buffers, and
+  render with a real camera derived from the game's own `refdef_t` each
+  frame - correct perspective (parallel level geometry visibly converges
+  toward vanishing points), correct depth testing (nearer surfaces occlude
+  farther ones), and correctly UV-mapped diffuse textures. No crashes, no
+  validation errors, across a full level load and several hundred rendered
+  frames.
+- This was **verified two ways**, not just by eyeballing a screenshot: (1)
+  by hand-transforming a known world-space BSP vertex through the exact
+  camera/projection matrices this code computes and confirming the resulting
+  NDC coordinates land in a sane, expected range (this is how the matrix
+  multiply order bug below was actually found and fixed - the screenshot
+  alone wouldn't have distinguished "camera math is wrong" from "camera math
+  is right but something else is missing"); (2) visually, the rendered
+  screenshot shows coherent architecture with correct-looking perspective,
+  not noise or a degenerate blob.
+- A pixel diff against an `rd-vanilla` reference (same map, same camera,
+  `r_fullbright 1` to remove lighting from the comparison) is a
+  **`MAJOR_DIFF`, ~39% mean pixel difference**, and that's expected, not a
+  regression to chase down: academy1's spawn point is a scripted
+  character-portrait shot (confirmed by comparing against a `capture.py`
+  reference captured independently, much earlier, with default settings -
+  same framing both times, so this is genuinely the level's intro camera,
+  not an artifact of any flag used here) where the player's own Ghoul2 model
+  fills a large fraction of the frame - and Ghoul2 rendering is entirely
+  unimplemented (see "Ghoul2 is not reused from rd-vanilla" below). Sky
+  isn't implemented either (see below), so sky-facing surfaces show as
+  whatever their `.shader` lookup falls back to. Given that, a large diff on
+  *this specific scene* is exactly what "no models, no sky, no lighting yet"
+  predicts - it's not evidence the world-geometry path itself is wrong (see
+  the hand-verified matrix math above for that).
+- **Bug found and fixed**: the view/projection matrix combination was
+  computed as `VK_MultiplyMatrix(projection, view, mvp)` - the "obvious"
+  argument order - but `VK_MultiplyMatrix` (a byte-for-byte copy of
+  rd-vanilla's `myGlMultMatrix`) computes `out = b * a` for column-major
+  matrices, not `out = a * b`; the arguments are effectively swapped
+  relative to normal multiplication notation. The wrong order silently
+  computed `view * projection` instead of `projection * view`, producing
+  clip-space coordinates in the thousands (should be roughly `[-1,1]` before
+  the perspective divide's denominator) - a screen-filling, garbled result
+  that LOOKED like "nothing renders" (actually: geometry projected so far
+  outside the frustum it was entirely clipped) rather than an obviously
+  wrong picture. Found by hand-transforming a known vertex and comparing
+  against the expected NDC range (see above), not by inspection. Fixed by
+  swapping the call to `VK_MultiplyMatrix(view, projection, mvp)`; see that
+  function's comment in `tr_world.cpp` for the full explanation of why the
+  arguments are order-swapped in the first place.
+- **Bug found and fixed, unrelated to rendering**: `academy1` (like most SP
+  levels) spawns the player as a Ghoul2 model, and this renderer's
+  `G2API_InitGhoul2Model`/`RE_RegisterModel` stubs originally reported
+  failure (`-1`/`0`). Game-side code (`g_client.cpp`'s
+  `G_SetG2PlayerModel`, `cg_main.cpp`'s `misc_model_static` spawning) treats
+  a failed model/skin registration as fatal (`Com_Error(ERR_DROP, ...)`),
+  which aborted map loading entirely - `RE_LoadWorldMap`/`RE_RenderScene`
+  never even got called. Fixed by having those stubs report success (with
+  believable-enough fake data - an allocated-but-empty Ghoul2 slot, a
+  standard-humanoid skeleton name) instead of failure; the model still
+  doesn't render (Ghoul2 is still entirely stubbed), but game logic no
+  longer treats "no Ghoul2 rendering yet" as a fatal error. Also needed:
+  `CVulkanGhoul2InfoArray::New()` must never return handle `0` -
+  `CGhoul2Info_v` (`game/ghoul2_shared.h`) uses `0` as its own "not
+  allocated" sentinel, so a genuinely-valid handle of `0` was
+  indistinguishable from "empty" and tripped `assert(mItem)` in
+  `CGhoul2Info_v::operator[]`.
+- **Bug found and fixed, unrelated to 3D specifically**: `VK_Shutdown`
+  originally tore down the entire `VkDevice`/`VkInstance` unconditionally.
+  `CL_FlushMemory()` (`client/cl_main.cpp`) calls `re.Shutdown(qfalse,
+  qfalse)` - "don't destroy window or context" - on *every* map load,
+  expecting a GL-style soft restart where the window/context survive and a
+  later `RE_BeginRegistration` cheaply rebuilds internal state. This
+  renderer has no equivalent of "recreate everything except the window" (and
+  `RE_BeginRegistration` doesn't attempt one), so tearing down the device
+  here left it null with nothing to recreate it, crashing the next texture
+  registration. Fixed by making `VK_Shutdown` a no-op unless `destroyWindow`
+  is true (i.e. an actual full shutdown, not a soft restart).
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -124,19 +207,50 @@ touch this code)
   copied out of the swapchain every frame - this is what
   `tests/render-regression` needs to work at all, and it's been verified to
   produce correct pixel data, not just "a file gets written."
+- Static world/BSP geometry (`tr_world.cpp`: `RE_LoadWorldMap`,
+  `RE_RenderScene`, `RE_ClearScene`) - see "3D world geometry" above for what
+  was actually verified. Concretely: a `.bsp`'s `LUMP_SHADERS`/
+  `LUMP_DRAWVERTS`/`LUMP_DRAWINDEXES`/`LUMP_SURFACES` lumps (shared,
+  GL-agnostic structs from `qcommon/qfiles.h`) are parsed; only
+  `MST_PLANAR`/`MST_TRIANGLE_SOUP` surfaces are kept (patches/curves and
+  flares are skipped, not tessellated or drawn); each surface's diffuse
+  texture is resolved through the same first-stage-only `.shader` lookup the
+  2D path uses; geometry is unlit (no lightmap/vertex-color term at all -
+  not even the `.shader`-driven blend-mode selection the 2D path has, every
+  surface uses one opaque pipeline), unculled (no BSP visibility culling,
+  no view-frustum culling, no back-face culling - see the "no culling"
+  comment on `VK_CreateWorldPipeline` in `tr_init.cpp` for why not even
+  back-face culling is safe to turn on yet), and drawn with a real
+  per-frame camera built from `refdef_t` (see `VK_BuildViewMatrix`/
+  `VK_BuildProjectionMatrix` in `tr_world.cpp`).
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
-- 3D world/BSP rendering (`RenderScene`, `LoadWorld`, `AddRefEntityToScene`,
-  `AddPolyToScene`, `AddLightToScene`) - the biggest remaining piece.
 - Ghoul2 (character/weapon model) rendering entirely, including the CPU-side
   bone/skeleton math - see "Ghoul2 is not reused from rd-vanilla" below for
   why. Every `G2API_*` entry point is a safe stub; no character or weapon
-  models will animate, attach, or render.
+  models will animate, attach, or render. (Registration now reports success
+  - see the "3D world geometry" bugs-found list above - so game logic
+  proceeds normally; it's specifically the rendering that's still a no-op.)
+- Lighting of any kind for world geometry - no lightmaps, no vertex
+  lighting, no dynamic lights (`AddLightToScene` is a stub). Every static
+  surface draws at flat, unlit texture brightness.
+- BSP visibility culling, view-frustum culling, and back-face culling for
+  world geometry - every loaded static surface is submitted every frame,
+  see "3D world geometry" above.
+- Curved surfaces/patches (`MST_PATCH`) and flares (`MST_FLARE`) - skipped
+  entirely at load time, not just unlit.
+- Sky (`RDF_DRAWSKYBOX`/skyportal) - not specially handled at all; a sky
+  surface is textured (or falls back to white) exactly like any other
+  surface, with no portal/box rendering.
+- Dynamic scene content: entities (`AddRefEntityToScene`), runtime polys
+  (`AddPolyToScene`) - both still stubs, so nothing except the static world
+  itself ever appears in a 3D scene yet.
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc` is read (see "What's actually implemented" above) -
   later stages, `tcMod` animation, `rgbGen`/`alphaGen` waves, sky, and fog
-  are all ignored.
+  are all ignored. World geometry doesn't even get the 2D path's blend-mode
+  selection yet (see above) - everything is one opaque pipeline.
 - Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, weather/world
   effects, dissolves, model bounds/tag queries.
 - Window resize / swapchain recreation - a resize will currently just log a
@@ -159,6 +273,21 @@ separate, larger task, `G2API_*` is stubbed instead for this pass (see
 implemented for real since it's small, self-contained, and lets UI code that
 merely checks "do I have a ghoul2 model" behave sanely.
 
+One easy-to-repeat mistake in that implementation, `CVulkanGhoul2InfoArray`
+(`tr_init.cpp`): its `New()` must never return handle `0` - `CGhoul2Info_v`
+(`game/ghoul2_shared.h`) uses `0` as its own "not allocated" sentinel, so a
+genuinely-valid handle of `0` is indistinguishable from "empty" and trips
+`assert(mItem)` in `CGhoul2Info_v::operator[]`. The constructor burns index 0
+at startup (permanently marked invalid) so real allocations start at 1 - see
+its comment.
+
+Also worth knowing: `G2API_InitGhoul2Model`/`RE_RegisterModel`/
+`RE_RegisterSkin` report *success* (with fake/empty data), not failure, even
+though nothing they "register" actually renders. That's deliberate, not an
+oversight - see "3D world geometry" above for the game-side fatal-error
+chain (`Com_Error(ERR_DROP, ...)`) that a failure return triggers, which
+otherwise aborts map loading before `RE_RenderScene` ever runs.
+
 ## Reuse strategy for the next passes
 
 `tr_shader.cpp`/`tr_bsp.cpp`/`tr_model.cpp` (and `tr_ghoul2.cpp`, `G2_*.cpp`)
@@ -172,6 +301,17 @@ upload, state changes) or depend on rd-vanilla's own directory-local
 tr_local.h, or restructuring rd-vanilla's includes to not rely on
 same-directory resolution) before anything from `code/rd-vanilla/` can be
 compiled into this target and get *this* target's types.
+
+`tr_world.cpp`'s BSP loader is the one place this has actually happened, and
+it's a useful data point for how much of the above holds up: the raw lump
+*structs* (`dheader_t`/`dshader_t`/`drawVert_t`/`dsurface_t`,
+`qcommon/qfiles.h`) needed zero adaptation - they were never the problem,
+being plain data with no rd-vanilla-specific types or GL calls anywhere near
+them. What got rewritten instead was the *parsing and submission logic*
+around them (`R_LoadSurfaces` et al. in rd-vanilla's `tr_bsp.cpp`), because
+that code is entangled with rd-vanilla's `world_t`/`shader_t`/GL upload calls
+throughout - confirming the split this section describes, not an exception
+to it.
 
 ## Building
 

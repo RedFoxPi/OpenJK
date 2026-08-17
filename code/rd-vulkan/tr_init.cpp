@@ -84,7 +84,7 @@ void *R_Hunk_Alloc( int iSize, qboolean bZeroit ) { return ri.Malloc( iSize, TAG
 // Small helpers
 // ============================================================================
 
-static void VK_Check( VkResult r, const char *what )
+void VK_Check( VkResult r, const char *what )
 {
 	if ( r != VK_SUCCESS )
 	{
@@ -403,6 +403,72 @@ static void VK_CreateSwapchain( void )
 	}
 }
 
+static VkFormat VK_FindDepthFormat( void )
+{
+	VkFormat candidates[] = { VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT };
+	for ( VkFormat format : candidates )
+	{
+		VkFormatProperties props;
+		vkGetPhysicalDeviceFormatProperties( vk.physicalDevice, format, &props );
+		if ( props.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT )
+		{
+			return format;
+		}
+	}
+	ri.Error( ERR_FATAL, "rd-vulkan: no supported depth format\n" );
+	return VK_FORMAT_UNDEFINED;
+}
+
+// One persistent depth image sized to the swapchain, reused every frame -
+// see the comment on vkGlobals_t::depthImage in tr_local.h for why that's
+// safe with this renderer's current (fully-serialized) frame pacing.
+static void VK_CreateDepthResources( void )
+{
+	vk.depthFormat = VK_FindDepthFormat();
+
+	VkImageCreateInfo imgInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+	imgInfo.imageType = VK_IMAGE_TYPE_2D;
+	imgInfo.extent = { vk.swapchainExtent.width, vk.swapchainExtent.height, 1 };
+	imgInfo.mipLevels = 1;
+	imgInfo.arrayLayers = 1;
+	imgInfo.format = vk.depthFormat;
+	imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+	imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	imgInfo.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+	imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VK_Check( vkCreateImage( vk.device, &imgInfo, nullptr, &vk.depthImage ), "vkCreateImage (depth)" );
+
+	VkMemoryRequirements memReq;
+	vkGetImageMemoryRequirements( vk.device, vk.depthImage, &memReq );
+
+	VkPhysicalDeviceMemoryProperties memProps;
+	vkGetPhysicalDeviceMemoryProperties( vk.physicalDevice, &memProps );
+	uint32_t memType = 0;
+	for ( uint32_t i = 0; i < memProps.memoryTypeCount; i++ )
+	{
+		if ( (memReq.memoryTypeBits & (1u << i)) &&
+			(memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) )
+		{
+			memType = i;
+			break;
+		}
+	}
+
+	VkMemoryAllocateInfo allocInfo = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+	allocInfo.allocationSize = memReq.size;
+	allocInfo.memoryTypeIndex = memType;
+	VK_Check( vkAllocateMemory( vk.device, &allocInfo, nullptr, &vk.depthImageMemory ), "vkAllocateMemory (depth)" );
+	vkBindImageMemory( vk.device, vk.depthImage, vk.depthImageMemory, 0 );
+
+	VkImageViewCreateInfo viewInfo = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+	viewInfo.image = vk.depthImage;
+	viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	viewInfo.format = vk.depthFormat;
+	viewInfo.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+	VK_Check( vkCreateImageView( vk.device, &viewInfo, nullptr, &vk.depthImageView ), "vkCreateImageView (depth)" );
+}
+
 static void VK_CreateRenderPass( void )
 {
 	VkAttachmentDescription colorAttachment = {};
@@ -415,12 +481,24 @@ static void VK_CreateRenderPass( void )
 	colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	colorAttachment.finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
 
+	VkAttachmentDescription depthAttachment = {};
+	depthAttachment.format = vk.depthFormat;
+	depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+	depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+	depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
 	VkAttachmentReference colorRef = { 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+	VkAttachmentReference depthRef = { 1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL };
 
 	VkSubpassDescription subpass = {};
 	subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
 	subpass.colorAttachmentCount = 1;
 	subpass.pColorAttachments = &colorRef;
+	subpass.pDepthStencilAttachment = &depthRef;
 
 	// Two dependencies: one governing entry into the subpass (a fresh
 	// swapchain image may still be in use by a previous present), and -
@@ -430,24 +508,29 @@ static void VK_CreateRenderPass( void )
 	// without an explicit EXTERNAL dependency here, nothing guarantees the
 	// color attachment writes are visible to that read (Vulkan does not
 	// order-of-submission-implies-visibility the way command order suggests).
+	// Both dependencies also cover the depth attachment's read/write stages
+	// so the depth image's load-clear-at-entry and write-during-subpass are
+	// correctly synchronized the same way the color attachment is.
 	VkSubpassDependency dependencies[2] = {};
 	dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
 	dependencies[0].dstSubpass = 0;
-	dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+	dependencies[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
 	dependencies[0].srcAccessMask = 0;
-	dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+	dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
 	dependencies[1].srcSubpass = 0;
 	dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-	dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+	dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 	dependencies[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
 	dependencies[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
+	VkAttachmentDescription attachments[] = { colorAttachment, depthAttachment };
+
 	VkRenderPassCreateInfo ci = { VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO };
-	ci.attachmentCount = 1;
-	ci.pAttachments = &colorAttachment;
+	ci.attachmentCount = 2;
+	ci.pAttachments = attachments;
 	ci.subpassCount = 1;
 	ci.pSubpasses = &subpass;
 	ci.dependencyCount = 2;
@@ -461,10 +544,10 @@ static void VK_CreateFramebuffers( void )
 	vk.swapchainFramebuffers.resize( vk.swapchainImageViews.size() );
 	for ( size_t i = 0; i < vk.swapchainImageViews.size(); i++ )
 	{
-		VkImageView attachments[] = { vk.swapchainImageViews[i] };
+		VkImageView attachments[] = { vk.swapchainImageViews[i], vk.depthImageView };
 		VkFramebufferCreateInfo ci = { VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO };
 		ci.renderPass = vk.renderPass;
-		ci.attachmentCount = 1;
+		ci.attachmentCount = 2;
 		ci.pAttachments = attachments;
 		ci.width = vk.swapchainExtent.width;
 		ci.height = vk.swapchainExtent.height;
@@ -668,6 +751,115 @@ static void VK_CreateUiPipeline( void )
 	vkMapMemory( vk.device, vk.uiVertexBufferMemory, 0, VK_WHOLE_SIZE, 0, &vk.uiVertexBufferMapped );
 }
 
+// Embedded SPIR-V for the 3D world pipeline (tr_world.cpp - static, opaque,
+// unlit BSP geometry only, see README.md).
+#include "world_vert_spv.h"
+#include "world_frag_spv.h"
+
+static void VK_CreateWorldPipeline( void )
+{
+	VkPushConstantRange pushRange = {};
+	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+	pushRange.offset = 0;
+	pushRange.size = sizeof( vkWorldPushConstants_t );
+
+	// Reuses the UI pipeline's descriptor set layout (one combined-image-
+	// sampler binding) - every image_t already gets a descriptor set from
+	// that layout regardless of whether it's used for 2D or 3D drawing, so
+	// no new per-texture setup is needed here.
+	VkPipelineLayoutCreateInfo plInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+	plInfo.setLayoutCount = 1;
+	plInfo.pSetLayouts = &vk.uiDescriptorSetLayout;
+	plInfo.pushConstantRangeCount = 1;
+	plInfo.pPushConstantRanges = &pushRange;
+	VK_Check( vkCreatePipelineLayout( vk.device, &plInfo, nullptr, &vk.worldPipelineLayout ), "vkCreatePipelineLayout (world)" );
+
+	VkShaderModule vertModule = VK_CreateShaderModule( world_vert_spv, sizeof( world_vert_spv ) );
+	VkShaderModule fragModule = VK_CreateShaderModule( world_frag_spv, sizeof( world_frag_spv ) );
+
+	VkPipelineShaderStageCreateInfo stages[2] = {};
+	stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vertModule;
+	stages[0].pName = "main";
+	stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = fragModule;
+	stages[1].pName = "main";
+
+	VkVertexInputBindingDescription binding = { 0, sizeof( WorldVertex ), VK_VERTEX_INPUT_RATE_VERTEX };
+	VkVertexInputAttributeDescription attrs[2] = {
+		{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof( WorldVertex, pos ) },
+		{ 1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof( WorldVertex, uv ) },
+	};
+
+	VkPipelineVertexInputStateCreateInfo vertexInput = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+	vertexInput.vertexBindingDescriptionCount = 1;
+	vertexInput.pVertexBindingDescriptions = &binding;
+	vertexInput.vertexAttributeDescriptionCount = 2;
+	vertexInput.pVertexAttributeDescriptions = attrs;
+
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VkPipelineViewportStateCreateInfo viewportState = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+	viewportState.viewportCount = 1;
+	viewportState.scissorCount = 1;
+
+	VkPipelineRasterizationStateCreateInfo raster = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	// No culling: this first pass doesn't know/trust winding order across
+	// every BSP surface type (planar polygons vs triangle soups), and a
+	// wrong cull direction silently drops geometry rather than erroring -
+	// worse than the minor overdraw cost of drawing both faces. Revisit once
+	// winding is verified surface-type by surface-type.
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	VkPipelineMultisampleStateCreateInfo multisample = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	VkPipelineDepthStencilStateCreateInfo depthStencil = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+	depthStencil.depthTestEnable = VK_TRUE;
+	depthStencil.depthWriteEnable = VK_TRUE;
+	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+	VkPipelineColorBlendAttachmentState blendAttachment = {};
+	blendAttachment.blendEnable = VK_FALSE;
+	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+		| VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+	VkPipelineColorBlendStateCreateInfo colorBlend = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+	colorBlend.attachmentCount = 1;
+	colorBlend.pAttachments = &blendAttachment;
+
+	VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo dynState = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+	dynState.dynamicStateCount = 2;
+	dynState.pDynamicStates = dynStates;
+
+	VkGraphicsPipelineCreateInfo pipeInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+	pipeInfo.stageCount = 2;
+	pipeInfo.pStages = stages;
+	pipeInfo.pVertexInputState = &vertexInput;
+	pipeInfo.pInputAssemblyState = &inputAssembly;
+	pipeInfo.pViewportState = &viewportState;
+	pipeInfo.pRasterizationState = &raster;
+	pipeInfo.pMultisampleState = &multisample;
+	pipeInfo.pDepthStencilState = &depthStencil;
+	pipeInfo.pColorBlendState = &colorBlend;
+	pipeInfo.pDynamicState = &dynState;
+	pipeInfo.layout = vk.worldPipelineLayout;
+	pipeInfo.renderPass = vk.renderPass;
+	pipeInfo.subpass = 0;
+
+	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &vk.worldPipeline ), "vkCreateGraphicsPipelines (world)" );
+
+	vkDestroyShaderModule( vk.device, vertModule, nullptr );
+	vkDestroyShaderModule( vk.device, fragModule, nullptr );
+}
+
 // ============================================================================
 // Public entry points
 // ============================================================================
@@ -696,10 +888,12 @@ void R_Init( void )
 	VK_PickPhysicalDevice();
 	VK_CreateLogicalDevice();
 	VK_CreateSwapchain();
+	VK_CreateDepthResources();
 	VK_CreateRenderPass();
 	VK_CreateFramebuffers();
 	VK_CreateCommandPoolsAndSync();
 	VK_CreateUiPipeline();
+	VK_CreateWorldPipeline();
 
 	vk.glConfig.renderer_string = vk.physicalDeviceProps.deviceName;
 	vk.glConfig.vendor_string = "rd-vulkan";
@@ -735,6 +929,21 @@ void R_Init( void )
 
 void VK_Shutdown( qboolean destroyWindow )
 {
+	// CL_FlushMemory() (client/cl_main.cpp) calls re.Shutdown(qfalse, qfalse)
+	// - "don't destroy window or context" - on every map load, expecting a
+	// GL-style soft restart where the window/context survive and
+	// RE_BeginRegistration's later R_Init() (rd-vanilla) or no-op
+	// (rd-vulkan) call cheaply rebuilds internal state. This renderer has no
+	// equivalent notion of "recreate everything except the window" - tearing
+	// down the VkDevice/VkInstance here when destroyWindow is false would
+	// invalidate them with nothing to recreate them (RE_BeginRegistration
+	// doesn't call R_Init again), crashing on the next texture registration.
+	// So: only do a real teardown when the window itself is going away.
+	if ( !destroyWindow )
+	{
+		return;
+	}
+
 	if ( vk.device )
 	{
 		vkDeviceWaitIdle( vk.device );
@@ -742,6 +951,14 @@ void VK_Shutdown( qboolean destroyWindow )
 
 	VK_ShutdownImages();
 	VK_DestroyReadbackImage();
+	VK_ShutdownWorld();
+
+	if ( vk.worldPipeline ) vkDestroyPipeline( vk.device, vk.worldPipeline, nullptr );
+	if ( vk.worldPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.worldPipelineLayout, nullptr );
+
+	if ( vk.depthImageView ) vkDestroyImageView( vk.device, vk.depthImageView, nullptr );
+	if ( vk.depthImage ) vkDestroyImage( vk.device, vk.depthImage, nullptr );
+	if ( vk.depthImageMemory ) vkFreeMemory( vk.device, vk.depthImageMemory, nullptr );
 
 	if ( vk.uiVertexBufferMemory ) vkUnmapMemory( vk.device, vk.uiVertexBufferMemory );
 	if ( vk.uiVertexBuffer ) vkDestroyBuffer( vk.device, vk.uiVertexBuffer, nullptr );
@@ -799,15 +1016,26 @@ void RE_BeginRegistration( glconfig_t *config )
 	vk.registered = qtrue;
 }
 
-// Everything below this point is 3D world/model rendering, which this first
-// pass of rd-vulkan does not implement yet - see README.md. These are
-// deliberately safe no-ops rather than left NULL, so the plugin doesn't
-// crash when e.g. a map is loaded; they just won't draw anything.
+// Everything below this point is 3D world/model rendering. Static opaque
+// world geometry is real now (tr_world.cpp: RE_LoadWorldMap/RE_RenderScene/
+// RE_ClearScene) - everything else here (models, lighting, effects) is still
+// a deliberately safe no-op rather than left NULL, so the plugin doesn't
+// crash when e.g. a map is loaded; they just won't draw anything. See
+// README.md for exactly what's real vs stubbed.
 
-qhandle_t RE_RegisterModel( const char *name ) { (void)name; return 0; }
-qhandle_t RE_RegisterSkin( const char *name ) { (void)name; return 0; }
+// Returning 0 ("failed to register") here isn't just "no model renders" -
+// some game-side code (e.g. cg_main.cpp's misc_model_static spawning) treats
+// a failed model registration as fatal (Com_Error(ERR_DROP, ...)), which
+// aborts map loading entirely before RE_RenderScene ever gets a chance to
+// draw the world. Models genuinely don't render yet (RE_AddRefEntityToScene
+// below is still a no-op, see README.md) - but registration itself
+// succeeding, with a fake non-zero handle nothing ever dereferences, is
+// enough to let map loading past that check.
+qhandle_t RE_RegisterModel( const char *name ) { (void)name; return 1; }
+qhandle_t RE_RegisterSkin( const char *name ) { (void)name; return 1; }
 int RE_GetAnimationCFG( const char *psCFGFilename, char *psDest, int iDestSize ) { (void)psCFGFilename; if (psDest && iDestSize) psDest[0] = 0; return 0; }
-void RE_LoadWorldMap( const char *name ) { (void)name; }
+// RE_LoadWorldMap, RE_ClearScene, RE_RenderScene are real implementations in
+// tr_world.cpp, not stubs - see README.md for exactly what they draw.
 void RE_RegisterMedia_LevelLoadBegin( const char *psMapName, ForceReload_e eForceReload, qboolean bAllowScreenDissolve ) { (void)psMapName; (void)eForceReload; (void)bAllowScreenDissolve; }
 void RE_RegisterMedia_LevelLoadEnd( void ) {}
 int RE_RegisterMedia_GetLevel( void ) { return 0; }
@@ -815,11 +1043,9 @@ qboolean RE_RegisterModels_LevelLoadEnd( qboolean bDeleteEverythingNotUsedThisLe
 qboolean RE_RegisterImages_LevelLoadEnd( void ) { return qfalse; }
 void RE_SetWorldVisData( const byte *vis ) { (void)vis; }
 void RE_EndRegistration( void ) {}
-void RE_ClearScene( void ) {}
 void RE_AddRefEntityToScene( const refEntity_t *re ) { (void)re; }
 void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts ) { (void)hShader; (void)numVerts; (void)verts; }
 void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, float b ) { (void)org; (void)intensity; (void)r; (void)g; (void)b; }
-void RE_RenderScene( const refdef_t *fd ) { (void)fd; }
 qboolean RE_GetLighting( const vec3_t org, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir )
 {
 	(void)org;
@@ -913,9 +1139,20 @@ class CVulkanGhoul2InfoArray : public IGhoul2InfoArray
 	std::vector<std::vector<CGhoul2Info>> mArray;
 	std::vector<bool> mValid;
 public:
+	// CGhoul2Info_v (game/ghoul2_shared.h) uses handle 0 as its own "not
+	// allocated yet" sentinel (mItem == 0 means empty/null throughout that
+	// class), so a *valid* handle from New() must never be 0 or every
+	// CGhoul2Info_v holding it would be indistinguishable from an empty one
+	// and hit its own assert(mItem) in operator[]. Burn index 0 permanently
+	// at construction so real allocations start at 1.
+	CVulkanGhoul2InfoArray()
+	{
+		mArray.emplace_back();
+		mValid.push_back( false );
+	}
 	int New() override
 	{
-		for ( size_t i = 0; i < mValid.size(); i++ )
+		for ( size_t i = 1; i < mValid.size(); i++ )
 		{
 			if ( !mValid[i] )
 			{
@@ -977,7 +1214,13 @@ qboolean G2API_GetBoltMatrix( CGhoul2Info_v &ghoul2, const int modelIndex, const
 	return qfalse;
 }
 int G2API_GetGhoul2ModelFlags( CGhoul2Info *ghlInfo ) { (void)ghlInfo; return 0; }
-char *G2API_GetGLAName( CGhoul2Info *ghlInfo ) { (void)ghlInfo; return nullptr; }
+// game.so's G_StandardHumanoid (g_client.cpp) asserts this is non-null for
+// any Ghoul2 model G2API_InitGhoul2Model reported as successfully loaded
+// (see that function's comment) - it doesn't treat "no skeleton name" as a
+// normal case. Returning the standard player skeleton path is a reasonable
+// stand-in since it's what the overwhelming majority of player/NPC models
+// actually use, and no real skeleton data backs this stub either way.
+char *G2API_GetGLAName( CGhoul2Info *ghlInfo ) { (void)ghlInfo; static char name[] = "models/players/_humanoid/_humanoid.glm"; return name; }
 int G2API_GetParentSurface( CGhoul2Info *ghlInfo, const int index ) { (void)ghlInfo; (void)index; return -1; }
 qboolean G2API_GetRagBonePos( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t pos, vec3_t entAngles, vec3_t entPos, vec3_t entScale ) { (void)ghoul2; (void)boneName; (void)entAngles; (void)entPos; (void)entScale; VectorClear( pos ); return qfalse; }
 int G2API_GetSurfaceIndex( CGhoul2Info *ghlInfo, const char *surfaceName ) { (void)ghlInfo; (void)surfaceName; return -1; }
@@ -989,9 +1232,19 @@ qboolean G2API_HaveWeGhoul2Models( CGhoul2Info_v &ghoul2 ) { return ghoul2.size(
 qboolean G2API_IKMove( CGhoul2Info_v &ghoul2, int t, sharedIKMoveParams_t *params ) { (void)ghoul2; (void)t; (void)params; return qfalse; }
 int G2API_InitGhoul2Model( CGhoul2Info_v &ghoul2, const char *fileName, int modelIndex, qhandle_t customSkin, qhandle_t customShader, int modelFlags, int lodBias )
 {
+	// Ghoul2 rendering itself is still entirely stubbed (see README.md) - no
+	// model will animate or draw - but returning -1 ("failed") here isn't
+	// just "no model renders": game.so's G_SetG2PlayerModel (g_client.cpp)
+	// treats a failed player model load as fatal (Com_Error(ERR_DROP, ...)
+	// after also failing its stormtrooper fallback), which aborts map
+	// loading entirely before RE_RenderScene ever gets a chance to draw the
+	// world. Reporting success with one default-constructed (empty) slot at
+	// index 0 - which callers like G2API_SetSkin then index as
+	// ghoul2[returnedIndex] - is enough for game logic to proceed with an
+	// invisible-but-"loaded" model, same spirit as RE_RegisterModel below.
 	(void)fileName; (void)modelIndex; (void)customSkin; (void)customShader; (void)modelFlags; (void)lodBias;
-	ghoul2.clear();
-	return -1;
+	ghoul2.resize( 1 );
+	return 0;
 }
 qboolean G2API_IsPaused( CGhoul2Info *ghlInfo, const char *boneName ) { (void)ghlInfo; (void)boneName; return qfalse; }
 void G2API_ListBones( CGhoul2Info *ghlInfo, int frame ) { (void)ghlInfo; (void)frame; }
