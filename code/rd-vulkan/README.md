@@ -23,18 +23,22 @@ scored with `tests/render-regression/diff.py` against a same-scene
   validation errors, no crashes.
 - The actual main menu renders correctly: title, background art, buttons,
   radar/starfield graphic, and glow/highlight compositing all match
-  `rd-vanilla`'s output closely. Currently **`MINOR_DIFF`, 3.8% mean pixel
+  `rd-vanilla`'s output closely. Currently **`MINOR_DIFF`, 1.5% mean pixel
   difference** (down from an initial 15.9%/`MAJOR_DIFF` - see "History" in
   this section).
 - `screenshot_png` reads back real, correct pixel data (used for the above).
 
-Remaining known gaps on this scene, all tied to `.shader` script parsing not
-being implemented (see below): one glow effect (`gfx/menus/menu_buttonback`)
-needs additive blending (`GL_ONE GL_ONE`) instead of the standard alpha blend
-every draw currently uses, and a starfield "twinkle" dot overlay on the radar
-graphic isn't drawn. Neither is a mystery - both are visible, specific,
-`.shader`-defined effects this renderer doesn't parse yet, not unexplained
-rendering bugs.
+Remaining known gaps on this scene: a starfield "twinkle" dot overlay on the
+radar graphic isn't drawn, the scrolling reflection overlay on the title logo
+(`gfx/menus/jediacademy`'s second stage) isn't drawn, and the scrolling
+Matrix-style side-column decorations differ (all three are genuinely
+*animated* effects - a screenshot taken at a slightly different frame will
+never match pixel-for-pixel even between two runs of the *same* renderer, so
+some residual diff here is expected, not just "not implemented yet"). Beyond
+that, this renderer's `.shader` support (see below) only ever looks at a
+shader's *first* stage, so any effect that depends on additional stages
+compositing on top (glow overlays, multi-layer detail texturing) won't
+reproduce those extra layers - only the base layer.
 
 **History**: the first working screenshot scored 15.9% mean diff
 (`MAJOR_DIFF`) despite the menu being visually recognizable, because a
@@ -46,6 +50,25 @@ passes 0, but wrong for a failed lookup. Splitting those two cases -
 `RE_RegisterShaderNoMip` now returns a dedicated transparent placeholder on
 failure instead of reusing handle 0 - dropped the diff to 3.8% in one fix,
 without touching `.shader` parsing at all.
+
+Adding minimal `.shader` parsing (`tr_shader.cpp` - first stage's `map`/
+`blendFunc` only, see below) and three blend-mode pipeline variants dropped
+the diff further, from 3.8% to **1.5%**, in two steps:
+- Additive blending (`blendFunc GL_ONE GL_ONE`, e.g. `menu_buttonback`'s glow)
+  had essentially no measurable effect on its own - that stage's contribution
+  to this particular scene turned out to be small.
+- The bigger win was realizing a *missing* `blendFunc` keyword is not the
+  same as standard alpha blending: rd-vanilla treats an unspecified
+  `blendFunc` as **blending disabled** (opaque overwrite - see
+  `tr_shader.cpp`'s `ParseStage` in `rd-vanilla`, which defaults
+  `blendSrcBits`/`blendDstBits` to 0). This renderer's default before this
+  fix was to alpha-blend everything, which made `gfx/menus/jediacademy` (the
+  "STAR WARS" title logo, whose first stage relies on rgbGen vertex + no
+  blendFunc = opaque) render washed-out/translucent against the dark
+  background instead of at full brightness. Fixing the *default* blend mode
+  for a defined-but-blendFunc-less stage (`BLEND_OPAQUE` in `tr_local.h`)
+  dropped mean diff from 3.8% to 1.5% - more than the additive fix, despite
+  being "just" a more accurate default.
 
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
@@ -81,12 +104,22 @@ touch this code)
 - A working, verified 2D textured-quad draw path (`RE_StretchPic`, the
   function the entire UI/menu layer and font glyph rendering go through).
   Blending, scissoring via viewport, and `SetColor` all work correctly.
-- Texture registration (`RegisterShader`/`RegisterShaderNoMip`) as a plain
-  image load - no `.shader` script (multi-stage/blend-mode/animation)
-  parsing, so a shader name is just decoded as one image and uploaded.
-  Covers the common "shader is just a diffuse image" case; will not
-  reproduce more elaborate shader effects (see "Verified state" above for
-  what this actually looks like on a real menu).
+- Texture registration (`RegisterShader`/`RegisterShaderNoMip`): the named
+  image is decoded and uploaded as a single RGBA texture (one `image_t` per
+  name, cached), same as before. What's new is `tr_shader.cpp`: a minimal
+  `.shader` script scanner that looks up the same name in the enumerated
+  `shaders/*.shader` files (`ri.FS_ListFiles("shaders", ".shader", ...)`,
+  matching rd-vanilla's convention) and records *only* its first stage's
+  blend mode (`vkBlendMode_t` in `tr_local.h`: `BLEND_ALPHA`,
+  `BLEND_ADDITIVE`, or `BLEND_OPAQUE` for a stage with no `blendFunc`
+  keyword at all - see "History" above for why that distinction matters).
+  `RE_StretchPic` picks the matching one of three baked `VkPipeline`
+  variants per draw. This is still not real `.shader` support: later
+  stages, `tcMod` animation, `rgbGen` (other than the implicit push-constant
+  color), sky, and fog are all ignored, so a shader whose *effect* depends
+  on more than its first stage's base texture and blend mode won't
+  reproduce that effect (see "Verified state" above for what this actually
+  looks like on a real menu, and what's specifically missing).
 - `screenshot_png` and `GetScreenShot`, via a persistent readback image
   copied out of the swapchain every frame - this is what
   `tests/render-regression` needs to work at all, and it's been verified to
@@ -100,7 +133,10 @@ touch this code)
   bone/skeleton math - see "Ghoul2 is not reused from rd-vanilla" below for
   why. Every `G2API_*` entry point is a safe stub; no character or weapon
   models will animate, attach, or render.
-- `.shader` script parsing (stages, blend modes, tcMod animation, sky, fog).
+- Full `.shader` script parsing: only a defined shader's first stage's
+  `map`/`blendFunc` is read (see "What's actually implemented" above) -
+  later stages, `tcMod` animation, `rgbGen`/`alphaGen` waves, sky, and fog
+  are all ignored.
 - Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, weather/world
   effects, dissolves, model bounds/tag queries.
 - Window resize / swapchain recreation - a resize will currently just log a

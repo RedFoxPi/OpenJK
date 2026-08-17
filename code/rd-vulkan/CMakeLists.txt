@@ -106,6 +106,7 @@ if(BuildSPRdVulkan)
 		"${SPDir}/rd-vulkan/tr_init.cpp"
 		"${SPDir}/rd-vulkan/tr_image.cpp"
 		"${SPDir}/rd-vulkan/tr_cmds.cpp"
+		"${SPDir}/rd-vulkan/tr_shader.cpp"
 		)
 	source_group("renderer" FILES ${SPRDVulkanMainFiles})
 	set(SPRDVulkanFiles ${SPRDVulkanFiles} ${SPRDVulkanMainFiles})

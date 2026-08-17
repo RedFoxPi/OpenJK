@@ -48,6 +48,25 @@ extern cvar_t *com_buildScript;
 #define VK_FRAMES_IN_FLIGHT 2
 #define UI_VERTEX_BUFFER_CAPACITY 4096u // quads per frame
 
+// Blend mode a UI draw needs, taken from the first stage of the image's
+// matching .shader script (see tr_shader.cpp). Vulkan bakes blend factors
+// into VkPipeline (unlike GL's dynamic glBlendFunc), so each mode here
+// corresponds to a distinct VkPipeline variant - keep this list small and
+// only add a mode once a pipeline for it actually exists.
+enum vkBlendMode_t
+{
+	// Default for images with no matching .shader script - matches
+	// rd-vanilla's implicit LIGHTMAP_2D fallback shader (tr_shader.cpp,
+	// R_FindShader's "GUI elements" case) for a bare image reference.
+	BLEND_ALPHA,	// blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA
+	BLEND_ADDITIVE,	// blendFunc GL_ONE GL_ONE / "add"
+	// Default for a *defined* shader's first stage when it has no blendFunc
+	// keyword at all - rd-vanilla treats a missing blendFunc as disabled
+	// blending (tr_shader.cpp ParseStage: blendSrcBits/blendDstBits default
+	// to 0, i.e. opaque overwrite), not as alpha blending.
+	BLEND_OPAQUE,
+};
+
 struct image_t
 {
 	std::string name;
@@ -56,6 +75,7 @@ struct image_t
 	VkDeviceMemory memory = VK_NULL_HANDLE;
 	VkImageView view = VK_NULL_HANDLE;
 	VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+	vkBlendMode_t blendMode = BLEND_ALPHA;
 };
 
 struct vkFrame_t
@@ -111,7 +131,9 @@ typedef struct
 	VkDescriptorSetLayout uiDescriptorSetLayout = VK_NULL_HANDLE;
 	VkDescriptorPool uiDescriptorPool = VK_NULL_HANDLE;
 	VkPipelineLayout uiPipelineLayout = VK_NULL_HANDLE;
-	VkPipeline uiPipeline = VK_NULL_HANDLE;
+	VkPipeline uiPipeline = VK_NULL_HANDLE;		// BLEND_ALPHA
+	VkPipeline uiPipelineAdditive = VK_NULL_HANDLE;	// BLEND_ADDITIVE
+	VkPipeline uiPipelineOpaque = VK_NULL_HANDLE;		// BLEND_OPAQUE
 	VkSampler uiSampler = VK_NULL_HANDLE;
 	VkBuffer uiVertexBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory uiVertexBufferMemory = VK_NULL_HANDLE;
@@ -144,6 +166,15 @@ extern vkGlobals_t vk;
 // tr_init.cpp
 void VK_Shutdown( qboolean destroyWindow );
 VkShaderModule VK_CreateShaderModule( const uint32_t *code, size_t codeSize );
+
+// tr_shader.cpp
+//
+// Minimal .shader script support: just enough to recover the blend mode a
+// shader's first stage wants, so RE_StretchPic (tr_cmds.cpp) can pick the
+// matching VkPipeline. Does NOT implement multi-stage compositing, tcMod
+// animation, rgbGen, sky/fog, or anything beyond that - see README.md.
+void VK_LoadShaderScripts( void );
+vkBlendMode_t VK_GetShaderBlendMode( const char *name );
 
 // tr_image.cpp
 image_t *VK_FindImage( const char *name );

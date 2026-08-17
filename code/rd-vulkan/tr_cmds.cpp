@@ -34,6 +34,7 @@ struct UiVertex
 };
 
 static uint32_t s_uiVertexCursor = 0;
+static VkPipeline s_boundPipeline = VK_NULL_HANDLE;
 
 void VK_CopySwapchainImageToReadback( VkCommandBuffer cmd, VkImage swapImage );
 void VK_DestroyReadbackImage( void );
@@ -78,6 +79,21 @@ void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, floa
 	verts[5] = { { x,     y + h }, { s1, t2 } };
 
 	VkCommandBuffer cmd = vk.activeCommandBuffer;
+
+	VkPipeline pipeline = vk.uiPipeline;
+	if ( img->blendMode == BLEND_ADDITIVE )
+	{
+		pipeline = vk.uiPipelineAdditive;
+	}
+	else if ( img->blendMode == BLEND_OPAQUE )
+	{
+		pipeline = vk.uiPipelineOpaque;
+	}
+	if ( pipeline != s_boundPipeline )
+	{
+		vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline );
+		s_boundPipeline = pipeline;
+	}
 
 	vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.uiPipelineLayout,
 		0, 1, &img->descriptorSet, 0, nullptr );
@@ -135,11 +151,12 @@ void RE_BeginFrame( stereoFrame_t stereoFrame )
 	vkCmdSetViewport( frame.commandBuffer, 0, 1, &viewport );
 	vkCmdSetScissor( frame.commandBuffer, 0, 1, &scissor );
 
-	vkCmdBindPipeline( frame.commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.uiPipeline );
-
 	vk.activeCommandBuffer = frame.commandBuffer;
 	vk.frameActive = true;
 	s_uiVertexCursor = 0;
+	// Each command buffer starts with no pipeline bound - force RE_StretchPic's
+	// first draw this frame to bind one rather than trusting last frame's state.
+	s_boundPipeline = VK_NULL_HANDLE;
 }
 
 void RE_EndFrame( int *frontEndMsec, int *backEndMsec )

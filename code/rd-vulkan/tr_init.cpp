@@ -582,6 +582,11 @@ static void VK_CreateUiPipeline( void )
 	VkPipelineMultisampleStateCreateInfo multisample = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
 	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+	// Three blend-mode variants (BLEND_ALPHA / BLEND_ADDITIVE / BLEND_OPAQUE
+	// - see vkBlendMode_t in tr_local.h). Vulkan bakes blend factors into the
+	// pipeline, unlike GL's dynamic glBlendFunc, so a distinct .shader
+	// blendFunc means a distinct VkPipeline, selected per draw in
+	// RE_StretchPic (tr_cmds.cpp) based on the image's parsed blend mode.
 	VkPipelineColorBlendAttachmentState blendAttachment = {};
 	blendAttachment.blendEnable = VK_TRUE;
 	blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
@@ -593,30 +598,56 @@ static void VK_CreateUiPipeline( void )
 	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
 		| VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
+	VkPipelineColorBlendAttachmentState blendAttachmentAdditive = blendAttachment;
+	blendAttachmentAdditive.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachmentAdditive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachmentAdditive.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachmentAdditive.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+
+	VkPipelineColorBlendAttachmentState blendAttachmentOpaque = blendAttachment;
+	blendAttachmentOpaque.blendEnable = VK_FALSE;
+
 	VkPipelineColorBlendStateCreateInfo colorBlend = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 	colorBlend.attachmentCount = 1;
 	colorBlend.pAttachments = &blendAttachment;
+
+	VkPipelineColorBlendStateCreateInfo colorBlendAdditive = colorBlend;
+	colorBlendAdditive.pAttachments = &blendAttachmentAdditive;
+
+	VkPipelineColorBlendStateCreateInfo colorBlendOpaque = colorBlend;
+	colorBlendOpaque.pAttachments = &blendAttachmentOpaque;
 
 	VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
 	VkPipelineDynamicStateCreateInfo dynState = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 	dynState.dynamicStateCount = 2;
 	dynState.pDynamicStates = dynStates;
 
-	VkGraphicsPipelineCreateInfo pipeInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
-	pipeInfo.stageCount = 2;
-	pipeInfo.pStages = stages;
-	pipeInfo.pVertexInputState = &vertexInput;
-	pipeInfo.pInputAssemblyState = &inputAssembly;
-	pipeInfo.pViewportState = &viewportState;
-	pipeInfo.pRasterizationState = &raster;
-	pipeInfo.pMultisampleState = &multisample;
-	pipeInfo.pColorBlendState = &colorBlend;
-	pipeInfo.pDynamicState = &dynState;
-	pipeInfo.layout = vk.uiPipelineLayout;
-	pipeInfo.renderPass = vk.renderPass;
-	pipeInfo.subpass = 0;
+	VkGraphicsPipelineCreateInfo pipeInfos[3] = {};
+	pipeInfos[0] = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+	pipeInfos[0].stageCount = 2;
+	pipeInfos[0].pStages = stages;
+	pipeInfos[0].pVertexInputState = &vertexInput;
+	pipeInfos[0].pInputAssemblyState = &inputAssembly;
+	pipeInfos[0].pViewportState = &viewportState;
+	pipeInfos[0].pRasterizationState = &raster;
+	pipeInfos[0].pMultisampleState = &multisample;
+	pipeInfos[0].pColorBlendState = &colorBlend;
+	pipeInfos[0].pDynamicState = &dynState;
+	pipeInfos[0].layout = vk.uiPipelineLayout;
+	pipeInfos[0].renderPass = vk.renderPass;
+	pipeInfos[0].subpass = 0;
 
-	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 1, &pipeInfo, nullptr, &vk.uiPipeline ), "vkCreateGraphicsPipelines" );
+	pipeInfos[1] = pipeInfos[0];
+	pipeInfos[1].pColorBlendState = &colorBlendAdditive;
+
+	pipeInfos[2] = pipeInfos[0];
+	pipeInfos[2].pColorBlendState = &colorBlendOpaque;
+
+	VkPipeline pipelines[3] = {};
+	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 3, pipeInfos, nullptr, pipelines ), "vkCreateGraphicsPipelines" );
+	vk.uiPipeline = pipelines[0];
+	vk.uiPipelineOpaque = pipelines[2];
+	vk.uiPipelineAdditive = pipelines[1];
 
 	vkDestroyShaderModule( vk.device, vertModule, nullptr );
 	vkDestroyShaderModule( vk.device, fragModule, nullptr );
@@ -717,6 +748,8 @@ void VK_Shutdown( qboolean destroyWindow )
 	if ( vk.uiVertexBufferMemory ) vkFreeMemory( vk.device, vk.uiVertexBufferMemory, nullptr );
 	if ( vk.uiSampler ) vkDestroySampler( vk.device, vk.uiSampler, nullptr );
 	if ( vk.uiPipeline ) vkDestroyPipeline( vk.device, vk.uiPipeline, nullptr );
+	if ( vk.uiPipelineAdditive ) vkDestroyPipeline( vk.device, vk.uiPipelineAdditive, nullptr );
+	if ( vk.uiPipelineOpaque ) vkDestroyPipeline( vk.device, vk.uiPipelineOpaque, nullptr );
 	if ( vk.uiPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.uiPipelineLayout, nullptr );
 	if ( vk.uiDescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.uiDescriptorPool, nullptr );
 	if ( vk.uiDescriptorSetLayout ) vkDestroyDescriptorSetLayout( vk.device, vk.uiDescriptorSetLayout, nullptr );

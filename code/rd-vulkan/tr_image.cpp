@@ -195,6 +195,7 @@ image_t *VK_FindImage( const char *name )
 
 	image_t *img = new image_t();
 	img->name = name;
+	img->blendMode = VK_GetShaderBlendMode( name );
 	VK_UploadImage( img, pic, width, height );
 	R_Free( pic );
 
