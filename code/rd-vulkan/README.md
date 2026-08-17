@@ -226,6 +226,90 @@ frames:
   registration. Fixed by making `VK_Shutdown` a no-op unless `destroyWindow`
   is true (i.e. an actual full shutdown, not a soft restart).
 
+### Ghoul2 rendering (tr_model.cpp)
+
+Character/weapon model (`.glm`) rendering, in the models' **static bind
+pose only** - no skeletal animation, no bone math at all. The scope-reducing
+fact making that small: `mdxmVertex_t::vertCoords` (`rd-common/mdx_format.h`)
+is already the model's bind-pose object-space position - bone weight data
+only matters for computing how a vertex should move *away* from bind pose
+during animation - so the `.gla` skeleton/animation file is never even
+opened. GLM parsing is a fresh implementation (see "Ghoul2 is not reused
+from rd-vanilla" below for why), but the offset/pointer arithmetic is
+copied field-for-field from rd-vanilla's real `R_LoadMDXM`
+(`rd-vanilla/tr_ghoul2.cpp`) rather than rederived from the struct comments
+alone. Loaded models reuse `tr_world.cpp`'s vertex format, pipeline, and
+descriptor-set-building helper wholesale - a Ghoul2 surface is, for drawing
+purposes, just another indexed triangle batch paired with `vk.whiteImage`
+as its "lightmap" (Ghoul2 meshes have no baked lightmap of their own).
+
+Run against `academy1`, headlessly, same as the world-geometry checks above:
+
+- The mesh parser was verified against real game data two ways: (1)
+  Python-parsing `models/players/kyle/model.glm`'s raw bytes independently
+  confirmed all 82 surfaces have an **empty** embedded shader name (see the
+  skin bullet below for why that matters) with plausible names/flags/child
+  counts, matching what the C++ parser reads; (2) non-humanoid models
+  (weapons, the `protocol` droid NPC) whose `.glm` *does* embed real shader
+  names loaded with correct, non-garbage surface/vertex/triangle counts
+  (e.g. `models/weapons2/saber/saber_w.glm`: 2 surfaces, 583 verts, 1602
+  indexes; `models/players/protocol/model.glm`: 32 surfaces, 3150 verts,
+  10455 indexes) and rendered without corruption.
+- Entity dispatch (`RE_AddRefEntityToScene`/`RE_ClearScene`/
+  `VK_DrawGhoul2Entities`) is real, not a stub: a per-frame queue of
+  `refEntity_t` is drawn each `RE_RenderScene` using the entity's own
+  `origin`/`axis` to build a model matrix (same column-major construction
+  as rd-vanilla's `R_RotateForEntity`, composed with the frame's `mvp` via
+  the same `VK_MultiplyMatrix` convention the camera/sky matrices use).
+  **Verified via a rate-limited load-bearing log line**, the same standard
+  frustum culling was held to: on academy1, 9 of 18 `RT_MODEL`+Ghoul2 scene
+  entities per frame actually draw (the other 9 have no drawable surfaces -
+  see the skin bullet), and those 9 are real, named NPCs with plausible
+  geometry (`kyle`: 5 surfaces/970 verts; `jedi_hf`: 10 surfaces/1883
+  verts; `jeditrainer`: 19 surfaces/2101 verts; the `protocol` droid: 32
+  surfaces/3150 verts) - not zero, not garbage.
+- **Skin (`.skin` file) support was required and added**, not originally
+  planned: humanoid player/NPC `.glm` files ship every surface's embedded
+  shader name **empty** - their actual per-surface textures come entirely
+  from an external `.skin` file (`surfacename,shaderpath` per line) applied
+  at runtime, confirmed against `models/players/kyle/model_default.skin`'s
+  real contents. Without parsing it, every humanoid model resolved zero
+  images and skipped every surface (confirmed: 0 drawable surfaces for
+  every player/NPC model tried, while weapon/droid models - which embed
+  real shader names directly - loaded fine). `VK_RegisterSkin`
+  (`tr_model.cpp`) parses the common single-file case (comma-separated
+  lines, `tag_` lines skipped); the three-part `head|torso|lower` macro
+  skin syntax is **not** implemented. `RE_RegisterSkin` now calls it for
+  real (previously a stub returning a fake handle `1`), and
+  `G2API_InitGhoul2Model`'s `customSkin` parameter is honored (previously
+  ignored) - the model cache key is `(fileName, skinHandle)`, not just
+  `fileName`, since the same `.glm` loaded with two different skins needs
+  two different sets of baked per-surface textures/descriptor sets.
+- **Bug found and fixed**: a single entity's Ghoul2 vector can (and
+  routinely does) hold several sub-models at once - body + weapon + saber
+  blade, each loaded via its own `G2API_InitGhoul2Model` call on the *same*
+  `CGhoul2Info_v`. The original stub (`ghoul2.resize(1)` on every call)
+  unconditionally kept only one slot, so a second call silently discarded
+  the first-loaded model instead of appending - harmless while rendering
+  was still stubbed, but would have meant "only ever draws the
+  last-loaded sub-model" once it wasn't. Fixed to match rd-vanilla's real
+  `G2API_InitGhoul2Model` (`G2_API.cpp`): find a free slot
+  (`mModelindex == -1`, `CGhoul2Info`'s default) or append; the returned
+  slot index is what game code indexes back into. `VK_DrawGhoul2Entities`
+  iterates every valid slot per entity, not just index `0`.
+- Not verified: a screenshot with a Ghoul2 model actually inside the frame.
+  The camera position `academy1`'s intro spawns at doesn't happen to have
+  any of the 9 successfully-loaded NPCs in view (confirmed by trying
+  `cg_thirdperson 1` and a `noclip`-based camera move, neither of which
+  changed what's visible - likely academy1-specific scripting/camera
+  behavior, not a rendering bug), so this checkpoint relies on the log-based
+  evidence above (real entities, real geometry, real per-frame draw calls,
+  no crash) rather than a positive screenshot. A `sp_academy1_spawn`
+  screenshot from this exact camera is unchanged (bit-for-bit, outside the
+  console-text log region) from before Ghoul2 rendering existed - i.e. this
+  is additive, not a regression to previously-verified world/sky/culling
+  rendering.
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -304,15 +388,23 @@ touch this code)
   above for what was verified. A flat (non-subdivided, non-warped) 6-face
   box using the sky shader's own name as its basename, always camera-
   centered; drawn depth-test/write-disabled before world geometry.
+- Ghoul2 (character/weapon model) rendering (`tr_model.cpp`), in models'
+  static bind pose - see "Ghoul2 rendering" above for what was verified and
+  its scope: no skeletal animation, LOD selection, bolts/attachments,
+  per-surface on/off overrides, or gore, but real `.glm` mesh parsing,
+  `.skin` texture resolution (single-file case only), and per-frame entity
+  dispatch through the same pipeline/vertex-format world geometry uses.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
-- Ghoul2 (character/weapon model) rendering entirely, including the CPU-side
-  bone/skeleton math - see "Ghoul2 is not reused from rd-vanilla" below for
-  why. Every `G2API_*` entry point is a safe stub; no character or weapon
-  models will animate, attach, or render. (Registration now reports success
-  - see the "3D world geometry" bugs-found list above - so game logic
-  proceeds normally; it's specifically the rendering that's still a no-op.)
+- Ghoul2 skeletal animation and everything downstream of it: bone math, LOD
+  selection, bolts/attachments (`AddBolt`/`AttachG2Model`), per-surface
+  on/off overrides (`SetSurfaceOnOff`), gore, tags, ragdoll. Models render
+  in a fixed bind pose only - see "Ghoul2 rendering" above for exactly what
+  *is* real (mesh parsing, `.skin` textures, entity dispatch) and "Ghoul2 is
+  not reused from rd-vanilla" below for why the animation system in
+  particular is a separate, larger task. Every `G2API_*` entry point beyond
+  model loading/skin registration is still a safe stub.
 - Dynamic lighting for world geometry (`AddLightToScene` is a stub) and
   vertex lighting/colors - only the map's precomputed, baked lightmap
   applies (see "3D world geometry" above). No shadows other than what's
@@ -332,9 +424,11 @@ touch this code)
   warping/subdivision (visible seams at box edges), no `RDF_SKYBOXPORTAL`
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
-- Dynamic scene content: entities (`AddRefEntityToScene`), runtime polys
-  (`AddPolyToScene`) - both still stubs, so nothing except the static world
-  itself ever appears in a 3D scene yet.
+- Runtime polys (`AddPolyToScene`) - still a stub. Entities
+  (`AddRefEntityToScene`) are real for Ghoul2 (`RT_MODEL`, see "Ghoul2
+  rendering" above), but every other `refEntityType_t` (sprites, beams,
+  electricity, oriented quads, ...) is queued and silently ignored at draw
+  time - nothing about those types renders yet.
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc` is read (see "What's actually implemented" above) -
   later stages, `tcMod` animation, `rgbGen`/`alphaGen` waves, sky, and fog
@@ -355,27 +449,44 @@ That turned out to be true but insufficient: those files use
 compiling them here silently pulls in rd-vanilla's real, GL-coupled
 `trGlobals_t`/`model_t`/`shader_t` types - and then needs rd-vanilla's actual
 model/shader/skin registry (`R_GetModelByHandle` et al., defined in
-`tr_model.cpp`/`tr_shader.cpp`) to actually link. That's not "free" reuse,
-it's "port rd-vanilla's whole asset-parsing layer too." Given that's a
-separate, larger task, `G2API_*` is stubbed instead for this pass (see
-`tr_init.cpp`); `CGhoul2Info_v`'s backing store (`IGhoul2InfoArray`) is
-implemented for real since it's small, self-contained, and lets UI code that
-merely checks "do I have a ghoul2 model" behave sanely.
+rd-vanilla's own `tr_model.cpp`/`tr_shader.cpp` - **not** the same file as
+this renderer's own `tr_model.cpp`, see below) to actually link. That's not
+"free" reuse, it's "port rd-vanilla's whole animation/bone-transform system
+too." Given that's a separate, larger task, every `G2API_*` entry point
+*beyond* model loading and skin registration is still stubbed (see
+`tr_init.cpp`) - no skeletal animation, bolts, LOD selection, surface on/off
+overrides, gore, or ragdoll.
 
-One easy-to-repeat mistake in that implementation, `CVulkanGhoul2InfoArray`
-(`tr_init.cpp`): its `New()` must never return handle `0` - `CGhoul2Info_v`
-(`game/ghoul2_shared.h`) uses `0` as its own "not allocated" sentinel, so a
-genuinely-valid handle of `0` is indistinguishable from "empty" and trips
-`assert(mItem)` in `CGhoul2Info_v::operator[]`. The constructor burns index 0
-at startup (permanently marked invalid) so real allocations start at 1 - see
-its comment.
+What **is** real, and *is* a from-scratch reuse-avoiding implementation
+rather than a stub: `.glm` mesh parsing and static bind-pose rendering
+(`tr_model.cpp` in *this* directory - see "Ghoul2 rendering" above). That
+file re-derives the offset arithmetic from `mdx_format.h`'s shared,
+GL-agnostic structs directly (checked field-for-field against rd-vanilla's
+real `R_LoadMDXM`) rather than needing rd-vanilla's model registry at all -
+bind-pose geometry doesn't need bone transforms, so it sidesteps the
+animation-system reuse problem entirely for this first pass.
+`CGhoul2Info_v`'s backing store (`IGhoul2InfoArray`, `tr_init.cpp`) is also
+real, small and self-contained.
 
-Also worth knowing: `G2API_InitGhoul2Model`/`RE_RegisterModel`/
-`RE_RegisterSkin` report *success* (with fake/empty data), not failure, even
-though nothing they "register" actually renders. That's deliberate, not an
-oversight - see "3D world geometry" above for the game-side fatal-error
-chain (`Com_Error(ERR_DROP, ...)`) that a failure return triggers, which
-otherwise aborts map loading before `RE_RenderScene` ever runs.
+One easy-to-repeat mistake in that backing-store implementation,
+`CVulkanGhoul2InfoArray` (`tr_init.cpp`): its `New()` must never return
+handle `0` - `CGhoul2Info_v` (`game/ghoul2_shared.h`) uses `0` as its own
+"not allocated" sentinel, so a genuinely-valid handle of `0` is
+indistinguishable from "empty" and trips `assert(mItem)` in
+`CGhoul2Info_v::operator[]`. The constructor burns index 0 at startup
+(permanently marked invalid) so real allocations start at 1 - see its
+comment. `tr_model.cpp`'s own model/skin caches (indices into
+`s_ghoul2Models`/`s_skins`) follow the identical "index 0 is reserved,
+0 == not-yet-loaded/failed-to-load" convention for the same reason.
+
+Also worth knowing: `G2API_InitGhoul2Model`/`RE_RegisterModel` still report
+*success* even when the underlying model fails to load or has no drawable
+surfaces (`mModel` just stays `0`, silently skipped at draw time) - that's
+deliberate, not an oversight, see "3D world geometry" above for the
+game-side fatal-error chain (`Com_Error(ERR_DROP, ...)`) that a failure
+return triggers, which would otherwise abort map loading before
+`RE_RenderScene` ever runs. `RE_RegisterSkin` is a real implementation now
+(see "Ghoul2 rendering" above), not part of that fake-success list.
 
 ## Reuse strategy for the next passes
 

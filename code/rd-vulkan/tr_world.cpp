@@ -126,7 +126,9 @@ void VK_ShutdownWorld( void )
 	s_worldLoaded = false;
 }
 
-static void VK_UploadDeviceLocalBuffer( const void *data, VkDeviceSize size, VkBufferUsageFlags usage,
+// Not static - reused by tr_model.cpp for Ghoul2 vertex/index buffers, see
+// tr_local.h.
+void VK_UploadDeviceLocalBuffer( const void *data, VkDeviceSize size, VkBufferUsageFlags usage,
 	VkBuffer *outBuffer, VkDeviceMemory *outMemory )
 {
 	VkBuffer staging;
@@ -189,11 +191,16 @@ static void VK_LoadLightmaps( const byte *lumpData, int lumpLen )
 // WorldSurfaceBatch's comment for why this can't be cached per-texture the
 // way the UI path's single-binding descriptor sets are (image_t::
 // descriptorSet, unused here): the same diffuse image can legitimately pair
-// with different lightmaps on different surfaces.
-static VkDescriptorSet VK_BuildWorldDescriptorSet( image_t *diffuse, image_t *lightmap )
+// with different lightmaps on different surfaces. Not static - also used by
+// tr_model.cpp for Ghoul2 surfaces (paired with vk.whiteImage, since Ghoul2
+// meshes have no lightmap of their own), see tr_local.h. Takes the pool
+// explicitly (rather than always using vk.worldDescriptorPool) since Ghoul2
+// models need their own pool with an independent lifetime - see
+// vkGlobals_t::ghoul2DescriptorPool's comment.
+VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diffuse, image_t *lightmap )
 {
 	VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-	alloc.descriptorPool = vk.worldDescriptorPool;
+	alloc.descriptorPool = pool;
 	alloc.descriptorSetCount = 1;
 	alloc.pSetLayouts = &vk.worldDescriptorSetLayout;
 
@@ -297,7 +304,7 @@ static void VK_LoadSky( const char *baseName )
 		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 1 ); cpuIndexes.push_back( vertBase + 2 );
 		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 2 ); cpuIndexes.push_back( vertBase + 3 );
 
-		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( faces[axis], s_whiteLightmap );
+		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, faces[axis], s_whiteLightmap );
 		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 } } );
 	}
 
@@ -465,7 +472,7 @@ void RE_LoadWorldMap( const char *name )
 			}
 		}
 
-		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( img, lightmap );
+		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf.numIndexes,
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] } } );
 	}
@@ -489,15 +496,6 @@ void RE_LoadWorldMap( const char *name )
 		name, (int)s_worldSurfaces.size(), numVerts, (int)cpuIndexes.size(), (int)s_lightmapImages.size() );
 }
 
-// No per-frame entity/poly/light list to clear yet (RE_AddRefEntityToScene
-// et al. are still stubs in tr_init.cpp) - the world itself is static and
-// always drawn by RE_RenderScene regardless, so there's nothing to do here
-// yet. Kept as a real (empty) function rather than folded away so the
-// refexport_t entry point has an obvious place to grow into.
-void RE_ClearScene( void )
-{
-}
-
 // Byte-for-byte copy of rd-vanilla's tr_main.cpp myGlMultMatrix (not
 // included, see file header) - kept identical since transform math is easy
 // to get subtly wrong by rederiving. IMPORTANT, and easy to get backwards
@@ -508,8 +506,10 @@ void RE_ClearScene( void )
 // notation. Callers must pass (secondTransformApplied, firstTransformApplied)
 // to get the usual "apply first, then second" composition - see
 // VK_BuildViewMatrix and RE_RenderScene's mvp computation for both call
-// sites and why each argument order is what it is.
-static void VK_MultiplyMatrix( const float *a, const float *b, float *out )
+// sites and why each argument order is what it is. Not static - tr_model.cpp
+// reuses it for entity model matrices rather than rederiving the same
+// easy-to-get-backwards math, see tr_local.h.
+void VK_MultiplyMatrix( const float *a, const float *b, float *out )
 {
 	for ( int i = 0; i < 4; i++ )
 	{
@@ -734,6 +734,11 @@ void RE_RenderScene( const refdef_t *fd )
 		ri.Printf( PRINT_ALL, "rd-vulkan: frustum culling: %d/%d world batches culled\n",
 			culledCount, (int)s_worldSurfaces.size() );
 	}
+
+	// Ghoul2 entities (tr_model.cpp) - drawn while the scene's 3D viewport/
+	// scissor (set above) is still active, same mvp (entities apply their own
+	// model matrix on top of it, see VK_DrawGhoul2Entities).
+	VK_DrawGhoul2Entities( mvp );
 
 	// Restore the full-screen viewport/scissor for any 2D drawing
 	// (RE_StretchPic) that follows this scene render within the same frame -

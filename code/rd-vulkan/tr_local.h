@@ -22,10 +22,13 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 
 // First-pass Vulkan renderer. See README.md in this directory for exactly
 // what is and is not implemented yet - in short: window/instance/device/
-// swapchain setup and a 2D textured-quad draw path (RE_StretchPic, used for
-// the whole UI/menu layer and for font glyphs) are real; 3D world/model
-// rendering (RenderScene and everything it touches) is not implemented yet
-// and is deliberately a safe no-op for now.
+// swapchain setup, a 2D textured-quad draw path (RE_StretchPic, used for
+// the whole UI/menu layer and for font glyphs), static world/BSP geometry,
+// and Ghoul2 (character/weapon model) rendering in a fixed bind pose are
+// real; skeletal animation and everything downstream of it (bolts, LOD
+// selection, surface on/off overrides, gore, ragdoll), dynamic lights, and
+// BSP visibility culling are not implemented yet and are deliberately safe
+// no-ops for now.
 
 #include <vulkan/vulkan.h>
 #include <vector>
@@ -184,6 +187,15 @@ typedef struct
 	// naturally overdraws it wherever real geometry exists.
 	VkPipeline skyPipeline = VK_NULL_HANDLE;
 	VkSampler worldSampler = VK_NULL_HANDLE;
+	// Separate pool, same vk.worldDescriptorSetLayout/vk.worldSampler -
+	// Ghoul2 model descriptor sets (tr_model.cpp) must NOT come from
+	// vk.worldDescriptorPool: that pool is reset on every RE_LoadWorldMap
+	// (see VK_ShutdownWorld), but a loaded Ghoul2 model - and the
+	// descriptor sets its surfaces hold - is cached by filename and expected
+	// to survive a world reload (e.g. the player model persisting across a
+	// level transition), same as vk.images. This pool is only reset at
+	// renderer shutdown (VK_ShutdownGhoul2Models), matching that lifetime.
+	VkDescriptorPool ghoul2DescriptorPool = VK_NULL_HANDLE;
 
 	// Shared across tr_cmds.cpp's and tr_world.cpp's draw calls (both bind
 	// pipelines into the same per-frame command buffer) so a pipeline bound
@@ -227,11 +239,46 @@ void VK_EndOneShotCommands( VkCommandBuffer cmd );
 // tr_world.cpp
 //
 // Static world geometry only - see WorldVertex/README.md for exactly what
-// this does and does not draw (no lighting, no entities, no BSP culling).
+// this does and does not draw (no lighting, no BSP culling). Entities (see
+// tr_model.cpp) are drawn from RE_RenderScene too, but queued/tracked
+// separately.
 void RE_LoadWorldMap( const char *name );
-void RE_ClearScene( void );
 void RE_RenderScene( const refdef_t *fd );
 void VK_ShutdownWorld( void );
+// Small helpers implemented in tr_world.cpp but reused by tr_model.cpp
+// (Ghoul2 models are just more indexed triangle batches drawn through the
+// same pipeline/descriptor-set shape as world surfaces - see tr_model.cpp's
+// file header) rather than duplicated.
+void VK_UploadDeviceLocalBuffer( const void *data, VkDeviceSize size, VkBufferUsageFlags usage,
+	VkBuffer *outBuffer, VkDeviceMemory *outMemory );
+VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diffuse, image_t *lightmap );
+// out = b * a when a/b/out are read as column-major matrices - see this
+// function's definition in tr_world.cpp for the full explanation of why the
+// argument order is backwards from what the name suggests.
+void VK_MultiplyMatrix( const float *a, const float *b, float *out );
+
+// tr_model.cpp
+//
+// Ghoul2 (character/weapon model) rendering - bind pose only, see README.md
+// for exactly what that means and what's still missing (animation, bolts,
+// LOD selection, surface on/off overrides, gore).
+void RE_ClearScene( void );
+void RE_AddRefEntityToScene( const refEntity_t *re );
+void VK_DrawGhoul2Entities( const float *mvp );
+void VK_ShutdownGhoul2Models( void );
+// Loads (or returns the cached index of, if already loaded with the same
+// skinHandle) the .glm at fileName. skinHandle (from VK_RegisterSkin, or 0
+// for "no skin") selects per-surface texture overrides for models whose own
+// embedded shader names are empty - see VulkanSkin's comment in tr_model.cpp
+// for why that's the common case for humanoid models. Returns 0 - never a
+// valid index, see the model cache's comment in tr_model.cpp - if the file
+// can't be read/parsed or has no drawable surfaces. Called from
+// G2API_InitGhoul2Model below.
+int VK_LoadGhoul2Model( const char *fileName, int skinHandle );
+// Parses a .skin file into a surfacename->shader override map (see
+// VulkanSkin in tr_model.cpp), returns a handle usable as VK_LoadGhoul2Model's
+// skinHandle. Called from RE_RegisterSkin below.
+int VK_RegisterSkin( const char *name );
 
 // tr_shader.cpp
 //

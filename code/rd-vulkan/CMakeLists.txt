@@ -54,7 +54,9 @@ if(BuildSPRdVulkan)
 	# shader_t types (and needs rd-vanilla's model/shader/skin registries -
 	# R_GetModelByHandle et al - to actually link). Real reuse needs rd-
 	# vanilla's asset-parsing layer ported over too, which is future work -
-	# see rd-vulkan/README.md. G2API_* is stubbed below instead.
+	# see rd-vulkan/README.md. G2API_* is stubbed in tr_init.cpp, except for
+	# model loading/rendering itself (tr_model.cpp), which parses .glm files
+	# directly using the shared, GL-agnostic mdx_format.h structs.
 
 	list(APPEND SPRDVulkanRendererIncludeDirectories ${JPEG_INCLUDE_DIR})
 	list(APPEND SPRDVulkanRendererLibraries          ${JPEG_LIBRARIES})
@@ -108,6 +110,7 @@ if(BuildSPRdVulkan)
 		"${SPDir}/rd-vulkan/tr_cmds.cpp"
 		"${SPDir}/rd-vulkan/tr_shader.cpp"
 		"${SPDir}/rd-vulkan/tr_world.cpp"
+		"${SPDir}/rd-vulkan/tr_model.cpp"
 		)
 	source_group("renderer" FILES ${SPRDVulkanMainFiles})
 	set(SPRDVulkanFiles ${SPRDVulkanFiles} ${SPRDVulkanMainFiles})

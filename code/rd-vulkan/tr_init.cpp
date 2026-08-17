@@ -785,6 +785,11 @@ static void VK_CreateWorldPipeline( void )
 	dpInfo.maxSets = MAX_VK_IMAGES;
 	VK_Check( vkCreateDescriptorPool( vk.device, &dpInfo, nullptr, &vk.worldDescriptorPool ), "vkCreateDescriptorPool (world)" );
 
+	// Ghoul2 models' own pool - see vkGlobals_t::ghoul2DescriptorPool's
+	// comment for why it can't share vk.worldDescriptorPool. Same layout/
+	// binding shape, so no separate VkDescriptorPoolSize/layout needed.
+	VK_Check( vkCreateDescriptorPool( vk.device, &dpInfo, nullptr, &vk.ghoul2DescriptorPool ), "vkCreateDescriptorPool (ghoul2)" );
+
 	VkSamplerCreateInfo worldSamplerInfo = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
 	worldSamplerInfo.magFilter = VK_FILTER_LINEAR;
 	worldSamplerInfo.minFilter = VK_FILTER_LINEAR;
@@ -997,12 +1002,14 @@ void VK_Shutdown( qboolean destroyWindow )
 
 	VK_ShutdownImages();
 	VK_DestroyReadbackImage();
+	VK_ShutdownGhoul2Models();
 	VK_ShutdownWorld();
 
 	if ( vk.worldPipeline ) vkDestroyPipeline( vk.device, vk.worldPipeline, nullptr );
 	if ( vk.skyPipeline ) vkDestroyPipeline( vk.device, vk.skyPipeline, nullptr );
 	if ( vk.worldPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.worldPipelineLayout, nullptr );
 	if ( vk.worldSampler ) vkDestroySampler( vk.device, vk.worldSampler, nullptr );
+	if ( vk.ghoul2DescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.ghoul2DescriptorPool, nullptr );
 	if ( vk.worldDescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.worldDescriptorPool, nullptr );
 	if ( vk.worldDescriptorSetLayout ) vkDestroyDescriptorSetLayout( vk.device, vk.worldDescriptorSetLayout, nullptr );
 
@@ -1067,25 +1074,30 @@ void RE_BeginRegistration( glconfig_t *config )
 }
 
 // Everything below this point is 3D world/model rendering. Static opaque
-// world geometry is real now (tr_world.cpp: RE_LoadWorldMap/RE_RenderScene/
-// RE_ClearScene) - everything else here (models, lighting, effects) is still
-// a deliberately safe no-op rather than left NULL, so the plugin doesn't
-// crash when e.g. a map is loaded; they just won't draw anything. See
-// README.md for exactly what's real vs stubbed.
+// world geometry (tr_world.cpp) and Ghoul2 character/weapon models in their
+// bind pose (tr_model.cpp) are real now - everything else here (dynamic
+// lights, polys, effects) is still a deliberately safe no-op rather than
+// left NULL, so the plugin doesn't crash when e.g. a map is loaded; they
+// just won't draw anything. See README.md for exactly what's real vs
+// stubbed.
 
 // Returning 0 ("failed to register") here isn't just "no model renders" -
 // some game-side code (e.g. cg_main.cpp's misc_model_static spawning) treats
 // a failed model registration as fatal (Com_Error(ERR_DROP, ...)), which
 // aborts map loading entirely before RE_RenderScene ever gets a chance to
-// draw the world. Models genuinely don't render yet (RE_AddRefEntityToScene
-// below is still a no-op, see README.md) - but registration itself
-// succeeding, with a fake non-zero handle nothing ever dereferences, is
-// enough to let map loading past that check.
+// draw the world. Non-Ghoul2 models (misc_model_static, MD3s) still don't
+// render - only Ghoul2 (G2API_InitGhoul2Model below) does - but registration
+// itself succeeding, with a fake non-zero handle nothing ever dereferences,
+// is enough to let map loading past that check.
 qhandle_t RE_RegisterModel( const char *name ) { (void)name; return 1; }
-qhandle_t RE_RegisterSkin( const char *name ) { (void)name; return 1; }
+// Real implementation (tr_model.cpp: VK_RegisterSkin) - Ghoul2 humanoid
+// models need it to resolve any texture at all, see G2API_InitGhoul2Model
+// below and VulkanSkin's comment in tr_model.cpp.
+qhandle_t RE_RegisterSkin( const char *name ) { return (qhandle_t)VK_RegisterSkin( name ); }
 int RE_GetAnimationCFG( const char *psCFGFilename, char *psDest, int iDestSize ) { (void)psCFGFilename; if (psDest && iDestSize) psDest[0] = 0; return 0; }
-// RE_LoadWorldMap, RE_ClearScene, RE_RenderScene are real implementations in
-// tr_world.cpp, not stubs - see README.md for exactly what they draw.
+// RE_LoadWorldMap/RE_RenderScene are real implementations in tr_world.cpp,
+// RE_ClearScene/RE_AddRefEntityToScene in tr_model.cpp - not stubs, see
+// README.md for exactly what they draw.
 void RE_RegisterMedia_LevelLoadBegin( const char *psMapName, ForceReload_e eForceReload, qboolean bAllowScreenDissolve ) { (void)psMapName; (void)eForceReload; (void)bAllowScreenDissolve; }
 void RE_RegisterMedia_LevelLoadEnd( void ) {}
 int RE_RegisterMedia_GetLevel( void ) { return 0; }
@@ -1093,7 +1105,6 @@ qboolean RE_RegisterModels_LevelLoadEnd( qboolean bDeleteEverythingNotUsedThisLe
 qboolean RE_RegisterImages_LevelLoadEnd( void ) { return qfalse; }
 void RE_SetWorldVisData( const byte *vis ) { (void)vis; }
 void RE_EndRegistration( void ) {}
-void RE_AddRefEntityToScene( const refEntity_t *re ) { (void)re; }
 void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts ) { (void)hShader; (void)numVerts; (void)verts; }
 void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, float b ) { (void)org; (void)intensity; (void)r; (void)g; (void)b; }
 qboolean RE_GetLighting( const vec3_t org, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir )
@@ -1282,19 +1293,51 @@ qboolean G2API_HaveWeGhoul2Models( CGhoul2Info_v &ghoul2 ) { return ghoul2.size(
 qboolean G2API_IKMove( CGhoul2Info_v &ghoul2, int t, sharedIKMoveParams_t *params ) { (void)ghoul2; (void)t; (void)params; return qfalse; }
 int G2API_InitGhoul2Model( CGhoul2Info_v &ghoul2, const char *fileName, int modelIndex, qhandle_t customSkin, qhandle_t customShader, int modelFlags, int lodBias )
 {
-	// Ghoul2 rendering itself is still entirely stubbed (see README.md) - no
-	// model will animate or draw - but returning -1 ("failed") here isn't
-	// just "no model renders": game.so's G_SetG2PlayerModel (g_client.cpp)
+	// Same "find a free slot (mModelindex == -1, CGhoul2Info's default), else
+	// append" logic as rd-vanilla's real G2API_InitGhoul2Model (G2_API.cpp) -
+	// a single entity's ghoul2 vector commonly holds several sub-models at
+	// once (body + weapon + saber blade, each loaded via its own call to
+	// this function on the SAME CGhoul2Info_v), so this renderer's original
+	// stub behavior (ghoul2.resize(1), unconditionally keeping only one slot)
+	// silently discarded all but the last-loaded model - VK_DrawGhoul2Entities
+	// (tr_model.cpp) draws every valid slot, not just [0], so that only
+	// mattered once model loading itself became real.
+	//
+	// Always succeeding (never returning -1 for a load failure) is still
+	// required regardless: game.so's G_SetG2PlayerModel (g_client.cpp)
 	// treats a failed player model load as fatal (Com_Error(ERR_DROP, ...)
-	// after also failing its stormtrooper fallback), which aborts map
+	// after also failing its stormtrooper fallback), which would abort map
 	// loading entirely before RE_RenderScene ever gets a chance to draw the
-	// world. Reporting success with one default-constructed (empty) slot at
-	// index 0 - which callers like G2API_SetSkin then index as
-	// ghoul2[returnedIndex] - is enough for game logic to proceed with an
-	// invisible-but-"loaded" model, same spirit as RE_RegisterModel below.
-	(void)fileName; (void)modelIndex; (void)customSkin; (void)customShader; (void)modelFlags; (void)lodBias;
-	ghoul2.resize( 1 );
-	return 0;
+	// world - same spirit as RE_RegisterModel below. A slot whose model
+	// fails to load (mModel stays 0, see VK_LoadGhoul2Model) is silently
+	// skipped at draw time instead. customSkin (a VK_RegisterSkin handle,
+	// see RE_RegisterSkin above) IS honored - it's what makes any humanoid
+	// player/NPC model resolve textures at all, see VulkanSkin's comment in
+	// tr_model.cpp. Custom shaders/LOD bias/modelFlags still aren't
+	// implemented (see README.md).
+	(void)modelIndex; (void)customShader; (void)modelFlags; (void)lodBias;
+
+	int slot = -1;
+	for ( int i = 0; i < ghoul2.size(); i++ )
+	{
+		if ( ghoul2[i].mModelindex == -1 )
+		{
+			ghoul2[i] = CGhoul2Info();
+			slot = i;
+			break;
+		}
+	}
+	if ( slot < 0 )
+	{
+		ghoul2.push_back( CGhoul2Info() );
+		slot = ghoul2.size() - 1;
+	}
+
+	Q_strncpyz( ghoul2[slot].mFileName, fileName, sizeof( ghoul2[slot].mFileName ) );
+	ghoul2[slot].mModelindex = slot;
+	ghoul2[slot].mCustomSkin = customSkin;
+	ghoul2[slot].mModel = (qhandle_t)VK_LoadGhoul2Model( fileName, (int)customSkin );
+	return slot;
 }
 qboolean G2API_IsPaused( CGhoul2Info *ghlInfo, const char *boneName ) { (void)ghlInfo; (void)boneName; return qfalse; }
 void G2API_ListBones( CGhoul2Info *ghlInfo, int frame ) { (void)ghlInfo; (void)frame; }
