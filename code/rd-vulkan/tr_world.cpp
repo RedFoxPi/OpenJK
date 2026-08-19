@@ -999,8 +999,9 @@ void RE_RenderScene( const refdef_t *fd )
 
 	// Ghoul2 entities (tr_model.cpp) - drawn while the scene's 3D viewport/
 	// scissor (set above) is still active, same mvp (entities apply their own
-	// model matrix on top of it, see VK_DrawGhoul2Entities).
-	VK_DrawGhoul2Entities( mvp );
+	// model matrix on top of it, see VK_DrawGhoul2Entities). fd->time drives
+	// each entity's live animation frame (VK_GetGhoul2PoseFrame).
+	VK_DrawGhoul2Entities( mvp, fd->time );
 
 	// Restore the full-screen viewport/scissor for any 2D drawing
 	// (RE_StretchPic) that follows this scene render within the same frame -

@@ -270,7 +270,7 @@ void VK_MultiplyMatrix( const float *a, const float *b, float *out );
 // LOD selection, surface on/off overrides, gore).
 void RE_ClearScene( void );
 void RE_AddRefEntityToScene( const refEntity_t *re );
-void VK_DrawGhoul2Entities( const float *mvp );
+void VK_DrawGhoul2Entities( const float *mvp, int currentTime );
 void VK_ShutdownGhoul2Models( void );
 // Loads (or returns the cached index of, if already loaded with the same
 // skinHandle) the .glm at fileName. skinHandle (from VK_RegisterSkin, or 0
@@ -299,6 +299,19 @@ bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t
 // skeletonIndex is VK_LoadGhoul2Skeleton's return value, not a model cache
 // index. Clears and leaves outBones empty on any invalid input.
 void VK_ComputeGhoul2Pose( int skeletonIndex, int frame, std::vector<mdxaBone_t> &outBones );
+// Live per-instance animation state (see VulkanGhoul2AnimState's comment in
+// tr_model.cpp for the real scope/simplifications) - backs
+// G2API_SetBoneAnim/GetBoneAnim/PauseBoneAnim/IsPaused/StopBoneAnim below.
+// ghlInfo is the exact CGhoul2Info pointer those G2API calls receive, used
+// as an opaque identity key, never dereferenced by this renderer.
+void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int startFrame, int endFrame, int flags, float animSpeed, int startTime );
+bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int currentTime, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed );
+bool VK_PauseGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int currentTime );
+bool VK_IsGhoul2BoneAnimPaused( const CGhoul2Info *ghlInfo );
+bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo );
+// The frame VK_DrawGhoul2Entities should skin this instance to right now -
+// 0 (the old static default) if SetBoneAnim was never called for it.
+int VK_GetGhoul2PoseFrame( const CGhoul2Info *ghlInfo, int currentTime );
 
 // tr_shader.cpp
 //

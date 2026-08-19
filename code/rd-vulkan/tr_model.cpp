@@ -18,15 +18,15 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 ===========================================================================
 */
 
-// Ghoul2 (character/weapon model, .glm) rendering - bind pose only. See
-// README.md for exactly what that means and what's still missing (skeletal
-// animation, bolts/attachments, LOD selection, per-surface on/off overrides,
-// gore, tags). The key scope-reducing fact making a first pass this small:
-// mdxmVertex_t::vertCoords (mdx_format.h) is already the model's bind-pose
-// object-space position - bone weight data only matters for computing how a
-// vertex should move *away* from bind pose during animation, so this file
-// never touches bone weights, and the .gla skeleton/animation file is never
-// even opened.
+// Ghoul2 (character/weapon model, .glm) rendering, including real per-bone
+// skeletal mesh skinning and live, time-driven animation playback - see
+// README.md's "Skeletal animation" section for the full picture: what's
+// real (bone hierarchy composition, frame decompression, weighted-blend
+// skinning, G2API_SetBoneAnim/GetBoneAnim driving an actual per-instance
+// current frame over time) and what's still a deliberate simplification
+// (a single whole-skeleton animation track per model instance rather than
+// independently-blended per-bone-subtree tracks, no animation blending/
+// crossfade, no LOD selection, no per-surface on/off overrides, no gore).
 //
 // GLM parsing here is a fresh implementation, not a reuse of rd-vanilla's
 // tr_ghoul2.cpp R_LoadMDXM (see CMakeLists.txt's comment on why Ghoul2 isn't
@@ -46,6 +46,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "tr_local.h"
 #include "../rd-common/mdx_format.h"
 #include "../qcommon/matcomp.h"
+#include <cmath>
 #include <cstring>
 #include <vector>
 #include <unordered_map>
@@ -76,16 +77,33 @@ struct GhoulSkinVertex
 	float boneWeight[iMAX_G2_BONEWEIGHTS_PER_VERT];
 };
 
+// How many independent poses one cached model's vertex buffer can hold at
+// once - see VulkanGhoul2Model::vertexBuffer's comment for why a model
+// needs more than one. Chosen generously for "a handful of the same NPC
+// visible at once" test scenes, not derived from any hard engine limit.
+static const uint32_t GHOUL2_SKIN_SLOTS_PER_MODEL = 8;
+
 struct VulkanGhoul2Model
 {
 	std::vector<GhoulSurfaceDraw> surfaces;
+	// Sized for GHOUL2_SKIN_SLOTS_PER_MODEL independent copies of this
+	// model's vertex data, not just one - now that animation is live (see
+	// VK_SetGhoul2BoneAnim), two entities sharing this one cached model
+	// (keyed by file+skin - see s_ghoul2ModelsByKey's comment, not by
+	// entity) can legitimately be at two different frames in the same
+	// drawn scene, and a *single* shared buffer would be a real bug, not
+	// just an inefficiency: every vkCmdDrawIndexed recorded against it
+	// would end up reading whichever entity's CPU skin write happened to
+	// land last, because a Vulkan command buffer's recorded commands don't
+	// actually execute until the whole buffer is submitted - by then every
+	// CPU memcpy this frame has already happened. Writing each entity's
+	// skin to its own byte range (see nextSkinSlot) instead of the same one
+	// avoids that entirely. Host-visible/coherent and persistently mapped
+	// (unlike tr_world.cpp's device-local geometry, which never changes
+	// post-upload), since VK_SkinGhoul2Model rewrites a slot's contents
+	// from the CPU on every draw, not just once at load time.
 	VkBuffer vertexBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
-	// Host-visible/coherent and persistently mapped (unlike tr_world.cpp's
-	// device-local geometry, which never changes post-upload) - see
-	// VK_SkinGhoul2Model's comment for why this buffer's contents are
-	// rewritten from the CPU every time a model instance's pose changes,
-	// not just once at load time.
 	void *vertexBufferMapped = nullptr;
 	VkBuffer indexBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
@@ -94,14 +112,18 @@ struct VulkanGhoul2Model
 	// now, real per-frame mesh skinning (VK_SkinGhoul2Model) - see this
 	// file's header comment for why that used to not be true.
 	int skeletonIndex = 0;
-	// Parallel to the vertex buffer's contents - see GhoulSkinVertex.
+	// Parallel to one slot's worth of the vertex buffer's contents - see
+	// GhoulSkinVertex. skinSource.size() vertices per slot.
 	std::vector<GhoulSkinVertex> skinSource;
-	// Cache of the last frame this model instance's vertex buffer was
-	// skinned to, so an already-up-to-date model isn't needlessly re-skinned
-	// and re-uploaded within the same draw when nothing has changed (e.g.
-	// several sub-models sharing one cache entry - see s_ghoul2ModelsByKey's
-	// comment). -1 = never skinned yet.
-	int lastSkinnedFrame = -1;
+	// Round-robins across this model's GHOUL2_SKIN_SLOTS_PER_MODEL vertex-
+	// buffer slots, one per drawn sub-model instance this frame - reset to
+	// 0 at the top of VK_DrawGhoul2Entities. Wrapping past
+	// GHOUL2_SKIN_SLOTS_PER_MODEL distinct simultaneous instances of the
+	// *same* cached model in one frame reuses an already-drawn-this-frame
+	// slot (a stale-for-one-frame pose on an instance beyond the 8th, not a
+	// crash or corruption) - accepted as a rare-scene edge case rather than
+	// an unbounded dynamic allocation.
+	uint32_t nextSkinSlot = 0;
 };
 
 // A bind-pose-only skeleton: just bone names and their bind-pose object-
@@ -496,21 +518,23 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	model.skeletonIndex = skeletonIndex;
 	model.skinSource = std::move( skinSource );
 
-	// Host-visible/coherent and persistently mapped, not device-local like
-	// tr_world.cpp's static geometry - VK_SkinGhoul2Model rewrites this
-	// buffer's contents directly from the CPU every time this model
-	// instance's pose changes (see its own comment), so there's no benefit
-	// to device-local memory's faster GPU-side read here, only the cost of
-	// a staging-buffer round trip on every re-skin. Initial contents are
-	// the raw bind pose (cpuVerts, built above) - correct until the first
-	// real VK_SkinGhoul2Model call for whatever frame this instance is
-	// actually posed to.
-	VkDeviceSize vbSize = cpuVerts.size() * sizeof( WorldVertex );
+	// Sized for GHOUL2_SKIN_SLOTS_PER_MODEL independent slots - see
+	// VulkanGhoul2Model::vertexBuffer's comment for why one slot isn't
+	// enough once animation is live. Host-visible/coherent and persistently
+	// mapped, not device-local like tr_world.cpp's static geometry -
+	// VK_SkinGhoul2Model rewrites a slot's contents directly from the CPU
+	// on every draw, so there's no benefit to device-local memory's faster
+	// GPU-side read here, only the cost of a staging-buffer round trip on
+	// every re-skin. Only slot 0 is initialized here (the raw bind pose,
+	// cpuVerts) - every slot is always fully rewritten by VK_SkinGhoul2Model
+	// before anything reads it, so the rest starting uninitialized is fine.
+	VkDeviceSize slotSize = cpuVerts.size() * sizeof( WorldVertex );
+	VkDeviceSize vbSize = slotSize * GHOUL2_SKIN_SLOTS_PER_MODEL;
 	VK_CreateBuffer( vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		&model.vertexBuffer, &model.vertexBufferMemory );
 	vkMapMemory( vk.device, model.vertexBufferMemory, 0, vbSize, 0, &model.vertexBufferMapped );
-	memcpy( model.vertexBufferMapped, cpuVerts.data(), (size_t)vbSize );
+	memcpy( model.vertexBufferMapped, cpuVerts.data(), (size_t)slotSize );
 
 	VK_UploadDeviceLocalBuffer( cpuIndexes.data(), cpuIndexes.size() * sizeof( uint32_t ),
 		VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &model.indexBuffer, &model.indexBufferMemory );
@@ -674,6 +698,146 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, int frame, std::vector<mdxaBone_t>
 	}
 }
 
+// Live animation state per Ghoul2 model instance, driven by
+// G2API_SetBoneAnim (tr_init.cpp's thin wrapper calls into
+// VK_SetGhoul2BoneAnim below) - a deliberate simplification of the real
+// engine's design: one whole-skeleton animation track per CGhoul2Info
+// instance, not independently-blended per-bone-subtree tracks (the real
+// game calls SetBoneAnim separately for e.g. "lower_lumbar"/"upper_lumbar"/
+// "thoracic" to blend legs/torso/arms independently - see bg_panimate.cpp).
+// Here the *last* SetBoneAnim call for a given instance simply wins for the
+// whole skeleton, regardless of which bone name it targeted - a visibly
+// cruder result than real independent limb blending, but a real, live,
+// correctly time-driven animation instead of a permanently frozen single
+// static frame. No animation blending/crossfade between two clips, and no
+// sub-frame interpolation between two adjacent whole frames either (both
+// real, visible-quality features of rd-vanilla's G2_TimingModel this
+// intentionally doesn't reproduce - see README.md).
+struct VulkanGhoul2AnimState
+{
+	int startFrame = 0;
+	int endFrame = 0;
+	int startTime = 0;
+	int pauseTime = 0; // 0 = not paused
+	float animSpeed = 0.0f;
+	int flags = 0;
+};
+// Keyed by CGhoul2Info identity - the exact pointer game code calls
+// G2API_SetBoneAnim with (e.g. &gent->ghoul2[gent->playerModel] in
+// bg_panimate.cpp). refEntity_t::ghoul2 (tr_types.h) is a pointer to the
+// game-owned CGhoul2Info_v, not a per-frame copy, so &(*ent.ghoul2)[slot]
+// in VK_DrawGhoul2Entities below is the same address on every frame for
+// the same in-game entity/sub-model.
+static std::unordered_map<const CGhoul2Info *, VulkanGhoul2AnimState> s_ghoul2AnimState;
+
+// BONE_ANIM_OVERRIDE_LOOP's real value (game/ghoul2_shared.h) - not
+// included from here (a game-side header this renderer doesn't otherwise
+// depend on) since this is the only flag bit this simplified
+// implementation actually interprets.
+static const int VK_BONE_ANIM_OVERRIDE_LOOP = 0x0010;
+
+// The G2_TimingModel formula (rd-vanilla/tr_ghoul2.cpp), copied verbatim
+// except for the parts this renderer doesn't implement (blending between
+// two animations, sub-frame lerp, reverse/negative animSpeed playback -
+// all real, visible-quality features left out, see README.md): frame
+// advances at animSpeed frames per 50ms of elapsed time. Confirmed against
+// the real caller convention (bg_panimate.cpp: `animSpeed = 50.0f /
+// curAnim.frameLerp * timeScaleMod`, i.e. the caller pre-scales animSpeed
+// so this formula's "/ 50" always means real elapsed milliseconds divided
+// by the clip's real per-frame duration, not a made-up constant).
+static float VK_ComputeGhoul2AnimFrame( const VulkanGhoul2AnimState &state, int currentTime )
+{
+	int effectiveTime = state.pauseTime ? state.pauseTime : currentTime;
+	float time = (float)( effectiveTime - state.startTime ) / 50.0f;
+	if ( time < 0.0f )
+	{
+		time = 0.0f;
+	}
+	float frame = (float)state.startFrame + time * state.animSpeed;
+
+	int animSize = state.endFrame - state.startFrame;
+	if ( animSize > 0 && state.animSpeed > 0.0f && frame > (float)state.endFrame )
+	{
+		if ( state.flags & VK_BONE_ANIM_OVERRIDE_LOOP )
+		{
+			frame = (float)state.startFrame + fmodf( frame - (float)state.startFrame, (float)animSize );
+		}
+		else
+		{
+			frame = (float)state.endFrame;
+		}
+	}
+	return frame;
+}
+
+void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int startFrame, int endFrame, int flags, float animSpeed, int startTime )
+{
+	if ( !ghlInfo )
+	{
+		return;
+	}
+	VulkanGhoul2AnimState &state = s_ghoul2AnimState[ghlInfo];
+	state.startFrame = startFrame;
+	state.endFrame = endFrame;
+	state.startTime = startTime;
+	state.pauseTime = 0;
+	state.animSpeed = animSpeed;
+	state.flags = flags;
+}
+
+bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int currentTime, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed )
+{
+	auto it = s_ghoul2AnimState.find( ghlInfo );
+	if ( it == s_ghoul2AnimState.end() )
+	{
+		return false;
+	}
+	const VulkanGhoul2AnimState &state = it->second;
+	if ( startFrame ) *startFrame = state.startFrame;
+	if ( endFrame ) *endFrame = state.endFrame;
+	if ( flags ) *flags = state.flags;
+	if ( animSpeed ) *animSpeed = state.animSpeed;
+	if ( currentFrame ) *currentFrame = VK_ComputeGhoul2AnimFrame( state, currentTime );
+	return true;
+}
+
+bool VK_PauseGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int currentTime )
+{
+	auto it = s_ghoul2AnimState.find( ghlInfo );
+	if ( it == s_ghoul2AnimState.end() )
+	{
+		return false;
+	}
+	it->second.pauseTime = currentTime;
+	return true;
+}
+
+bool VK_IsGhoul2BoneAnimPaused( const CGhoul2Info *ghlInfo )
+{
+	auto it = s_ghoul2AnimState.find( ghlInfo );
+	return it != s_ghoul2AnimState.end() && it->second.pauseTime != 0;
+}
+
+bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo )
+{
+	return s_ghoul2AnimState.erase( ghlInfo ) > 0;
+}
+
+// The frame to skin a model instance to right now - VK_ComputeGhoul2Pose's
+// frame argument. No recorded animation state (SetBoneAnim was never
+// called for this instance) falls back to frame 0, the prior static
+// behavior - see README.md's frame-0 caveat for what that does and doesn't
+// mean.
+int VK_GetGhoul2PoseFrame( const CGhoul2Info *ghlInfo, int currentTime )
+{
+	auto it = s_ghoul2AnimState.find( ghlInfo );
+	if ( it == s_ghoul2AnimState.end() )
+	{
+		return 0;
+	}
+	return (int)VK_ComputeGhoul2AnimFrame( it->second, currentTime );
+}
+
 // Recomputes one model instance's vertex buffer for a given pose - linear
 // blend skinning, weighted sum of (bone.matrix applied to bindPos) over
 // each vertex's up-to-4 weighted bones. Formula (including applying the
@@ -684,9 +848,13 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, int frame, std::vector<mdxaBone_t>
 // (pose.empty()) falls back to unskinned bind pose - the original
 // behavior, still correct for e.g. single-bone weapon models attached via
 // a bolt rather than posed themselves.
-static void VK_SkinGhoul2Model( VulkanGhoul2Model &model, const std::vector<mdxaBone_t> &pose )
+// Writes into the given slot's byte range of model.vertexBufferMapped
+// (slot < GHOUL2_SKIN_SLOTS_PER_MODEL) rather than always slot 0 - see
+// VulkanGhoul2Model::vertexBuffer's comment for why a single shared slot
+// stopped being safe once animation went live.
+static void VK_SkinGhoul2Model( VulkanGhoul2Model &model, const std::vector<mdxaBone_t> &pose, uint32_t slot )
 {
-	WorldVertex *out = (WorldVertex *)model.vertexBufferMapped;
+	WorldVertex *out = (WorldVertex *)model.vertexBufferMapped + (size_t)slot * model.skinSource.size();
 	for ( size_t v = 0; v < model.skinSource.size(); v++ )
 	{
 		const GhoulSkinVertex &sv = model.skinSource[v];
@@ -737,6 +905,11 @@ void VK_ShutdownGhoul2Models( void )
 	s_ghoul2Models.clear();
 	s_ghoul2ModelsByKey.clear();
 	s_sceneEntities.clear();
+	// Stale CGhoul2Info* keys (game-owned instances this renderer never
+	// allocated, freed on the game side across a map load) could otherwise
+	// collide with a genuinely different instance later allocated at the
+	// same address - see s_ghoul2AnimState's comment.
+	s_ghoul2AnimState.clear();
 	// Descriptor sets built above come from vk.ghoul2DescriptorPool, not
 	// individually tracked - reclaim them all at once, same reasoning as
 	// tr_world.cpp's VK_ShutdownWorld and vk.worldDescriptorPool.
@@ -757,7 +930,7 @@ void RE_AddRefEntityToScene( const refEntity_t *re )
 	s_sceneEntities.push_back( *re );
 }
 
-void VK_DrawGhoul2Entities( const float *mvp )
+void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 {
 	if ( s_sceneEntities.empty() || !vk.frameActive )
 	{
@@ -765,6 +938,15 @@ void VK_DrawGhoul2Entities( const float *mvp )
 	}
 
 	VkCommandBuffer cmd = vk.activeCommandBuffer;
+
+	// Reset every cached model's skin-slot round-robin once per drawn scene
+	// (not once per sub-model draw below) - see VulkanGhoul2Model::
+	// vertexBuffer's comment for why each drawn sub-model instance needs
+	// its own slot within a shared cache entry's buffer this frame.
+	for ( VulkanGhoul2Model &model : s_ghoul2Models )
+	{
+		model.nextSkinSlot = 0;
+	}
 
 	// Ghoul2 meshes reuse the world pipeline/vertex format wholesale (see
 	// this file's header comment) rather than a dedicated model pipeline -
@@ -816,9 +998,10 @@ void VK_DrawGhoul2Entities( const float *mvp )
 		VK_MultiplyMatrix( model_, mvp, entityMvp );
 
 		bool drewAnySubModel = false;
-		for ( int slot = 0; slot < ent.ghoul2->size(); slot++ )
+		for ( int subModelIdx = 0; subModelIdx < ent.ghoul2->size(); subModelIdx++ )
 		{
-			int modelIndex = (*ent.ghoul2)[slot].mModel;
+			const CGhoul2Info &g2Instance = (*ent.ghoul2)[subModelIdx];
+			int modelIndex = g2Instance.mModel;
 			if ( modelIndex <= 0 || (size_t)modelIndex >= s_ghoul2Models.size() )
 			{
 				continue;
@@ -829,23 +1012,17 @@ void VK_DrawGhoul2Entities( const float *mvp )
 				continue;
 			}
 
-			// TEMPORARY: always frame 0 - real per-entity animation state
-			// (G2API_SetBoneAnim tracking + time-based frame selection) is
-			// a follow-up step, not implemented yet (see README.md). Every
-			// entity sharing this cached model (model.skinSource, keyed by
-			// file+skin, not by entity - see s_ghoul2ModelsByKey's comment)
-			// necessarily shares one vertex buffer and therefore one pose
-			// for now; once entities can be at genuinely different frames
-			// this per-model buffer/cache will need to become per-entity
-			// instead, see the same follow-up note.
-			int targetFrame = 0;
-			if ( model.lastSkinnedFrame != targetFrame )
-			{
-				std::vector<mdxaBone_t> pose;
-				VK_ComputeGhoul2Pose( model.skeletonIndex, targetFrame, pose );
-				VK_SkinGhoul2Model( model, pose );
-				model.lastSkinnedFrame = targetFrame;
-			}
+			// Live, per-instance animation frame (see VK_GetGhoul2PoseFrame's
+			// comment) - &g2Instance is the same CGhoul2Info identity real
+			// game code calls G2API_SetBoneAnim with, so this is genuinely
+			// that instance's own current frame, not shared with any other
+			// entity that happens to use the same cached model.
+			int targetFrame = VK_GetGhoul2PoseFrame( &g2Instance, currentTime );
+			uint32_t skinSlot = model.nextSkinSlot;
+			model.nextSkinSlot = ( model.nextSkinSlot + 1 ) % GHOUL2_SKIN_SLOTS_PER_MODEL;
+			std::vector<mdxaBone_t> pose;
+			VK_ComputeGhoul2Pose( model.skeletonIndex, targetFrame, pose );
+			VK_SkinGhoul2Model( model, pose, skinSlot );
 
 			// Full push constant struct (mvp + camPos + fogColor), both
 			// stages - matching vk.worldPipelineLayout's actual range (see
@@ -859,7 +1036,7 @@ void VK_DrawGhoul2Entities( const float *mvp )
 			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				0, sizeof( entityPush ), &entityPush );
 
-			VkDeviceSize vertexOffset = 0;
+			VkDeviceSize vertexOffset = (VkDeviceSize)skinSlot * model.skinSource.size() * sizeof( WorldVertex );
 			vkCmdBindVertexBuffers( cmd, 0, 1, &model.vertexBuffer, &vertexOffset );
 			vkCmdBindIndexBuffer( cmd, model.indexBuffer, 0, VK_INDEX_TYPE_UINT32 );
 

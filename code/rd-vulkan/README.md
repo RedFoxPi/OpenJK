@@ -553,18 +553,19 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
 
 ### Skeletal animation (tr_model.cpp)
 
-Real per-bone mesh skinning - the biggest remaining gap this file used to
-document ("no skeletal animation, no bone math at all"). Scope, precisely:
-every model instance is posed to a single, correctly-computed static frame
-(frame 0 of its `.gla`) instead of the old fixed bind pose - real bone math,
-real per-vertex weighted blending, verified against actual game data - but
-**not yet live**: `G2API_SetBoneAnim`/`GetBoneAnim`/`GetAnimRange` etc are
-still stubs, so nothing yet drives *which* frame plays or advances it over
-time. That's the natural next step, not done here. **Frame 0 specifically
-is not a meaningful body pose** - see the caveat bullet below (checked
-directly: it's a 2-frame *facial-expression* clip, `FACE_ALERT`, not
-anything resembling a rest/idle stance) - don't read anything into a
-frame-0 screenshot's arm position or facing beyond "the skinning math ran."
+Real per-bone mesh skinning, now **live and time-driven** - the biggest
+remaining gap this file used to document ("no skeletal animation, no bone
+math at all"). `G2API_SetBoneAnim`/`GetBoneAnim`/`GetAnimRange`/
+`PauseBoneAnim`/`IsPaused`/`StopBoneAnim` (and their `...Index` siblings)
+are real now, not stubs: each Ghoul2 model instance tracks its own
+start/end frame, playback speed, and start time, and is skinned to its
+actual current frame - computed from real elapsed game time - every frame
+it's drawn. This replaced the previous checkpoint's fixed single frame
+(always frame 0, regardless of what the game asked for). See "Live
+animation" below for the implementation and its verification, and the
+frame-0 caveat bullet further down for what the *previous* checkpoint's
+static screenshots did and didn't prove (still true of any instance that
+genuinely never gets a `SetBoneAnim` call - frame 0 remains the fallback).
 
 The math (bone-hierarchy composition, frame decompression, the skinning
 formula itself) is copied verbatim from rd-vanilla's real, working
@@ -681,6 +682,91 @@ plausible while being wrong.
   live animation state (picking the frame the game actually asked for) is
   the natural next step.
 
+### Live animation (tr_model.cpp)
+
+The follow-up to the above: `G2API_SetBoneAnim` and friends now really
+work, so a model instance plays the animation the game actually asked for,
+advancing over real time, instead of a permanently frozen frame 0.
+
+Scope, precisely - **one whole-skeleton animation track per model
+instance**, not the real engine's independently-blended per-bone-subtree
+tracks. rd-vanilla's real game code calls `G2API_SetBoneAnim` separately
+per body region (`bg_panimate.cpp`: `"lower_lumbar"`/`"upper_lumbar"`/
+`"thoracic"` etc. for legs/torso/arms, blended together at draw time via a
+real bone-hierarchy walk that checks each bone for its own or an ancestor's
+override); here, whichever call landed *last* for a given instance simply
+wins for the *entire* skeleton, regardless of which bone name or index it
+targeted. So legs and torso can't play independent animations (walking
+while gesturing, say) - a visibly cruder result than the real engine's, but
+a real, live, correctly time-driven single animation instead of a static
+pose. Also not implemented: blending/crossfade between two animations
+(`BONE_ANIM_BLEND`), sub-frame interpolation between two adjacent whole
+frames (frames step discretely), and reverse/negative-speed playback -
+three more real, visible-quality features of rd-vanilla's
+`G2_TimingModel` (`tr_ghoul2.cpp`) this doesn't reproduce.
+
+The frame-advance formula is copied from that same function, not
+rederived, and cross-checked against its real caller: `G2_TimingModel`
+computes `frame = startFrame + ((currentTime - startTime) / 50.0) *
+animSpeed`, and `bg_panimate.cpp` computes the `animSpeed` it passes in as
+`50.0f / curAnim.frameLerp` (`frameLerp` being the clip's real
+milliseconds-per-frame from `animation.cfg`) - so the "50" in both places
+cancels out to exactly "elapsed milliseconds ÷ the clip's real per-frame
+duration," not an arbitrary constant. `BONE_ANIM_OVERRIDE_LOOP`'s real flag
+value (`0x0010`, `game/ghoul2_shared.h`) is honored for looping playback;
+any other flag bit is ignored.
+
+**A real, separate bug found and fixed while wiring this up, not just a
+missing feature**: caching a model's skinned vertex buffer per *cached
+model* (keyed by file+skin, shared across every entity using that model -
+see `s_ghoul2ModelsByKey`'s comment) was fine when every instance was
+always frame 0, but is a genuine correctness bug once instances can be at
+different frames - and multiple identical NPCs sharing one model is a
+completely ordinary scene, not a rare edge case. The failure mode is subtle
+because of how a Vulkan command buffer actually executes: recording several
+`vkCmdDrawIndexed` calls against the *same* vertex buffer, with a CPU
+`memcpy` re-skinning it in between each recording, does **not** give each
+draw call "its skin as of when it was recorded" - the buffer only holds
+whatever the *last* CPU write left there by the time the whole command
+buffer is actually submitted and executed, well after all the recording
+(and all the memcpys) already happened. Every instance of a shared model
+would have silently rendered with whichever instance's pose was skinned
+last, not its own. Fixed by giving each cached model's vertex buffer
+`GHOUL2_SKIN_SLOTS_PER_MODEL` (8) independent slots and round-robin
+assigning one slot per drawn sub-model instance each frame
+(`VulkanGhoul2Model::nextSkinSlot`, reset once per `VK_DrawGhoul2Entities`
+call) - past 8 simultaneous instances of the exact same model in one frame,
+slots wrap and reuse an already-claimed one (a stale-for-one-frame pose,
+not corruption or a crash), a deliberately accepted rare-scene limit rather
+than unbounded per-frame allocation.
+
+**Verified**: academy1, with `com_fixedtime 16` (see "Testing headlessly"
+below) for a controlled, renderer-speed-independent comparison. At
+`wait 100` (~1.6s of simulated time) the pose has visibly changed from the
+old static frame 0, and the shot is a close character portrait in both
+this renderer and `rd-vanilla` at the identical simulated time - a
+reasonably close match this early, before much can have drifted. At
+`wait 400` (~6.4s), academy1's camera has advanced to a wide balcony shot
+showing **three simultaneous instances of the same officer NPC model**
+side by side, each independently and correctly posed (one arm raised, not
+three copies of whatever the last-skinned instance happened to be) -
+direct, real-scene confirmation that the per-slot buffer fix above actually
+works, not just a synthetic test. `rd-vanilla` at that same simulated time
+shows a different shot (a face close-up) rather than the same wide balcony
+view - an expected consequence of the scope cuts above, not a new bug:
+`rd-vanilla`'s real animation system tracks legs/torso/face independently
+and signals ICARUS's "wait for anim complete" the moment the *specific*
+targeted bone's true, blended animation finishes, while this renderer's
+single whole-skeleton, no-blend approximation reaches its own notion of
+"done" at a different real time, which cascades into ICARUS reaching its
+next scripted camera cut earlier or later than vanilla does - camera-cut
+*parity* with vanilla was never a target of this checkpoint (chasing it
+would mean reproducing rd-vanilla's real multi-track blended timing model
+exactly, a much larger undertaking than live single-track animation
+itself), only genuinely live, per-instance, mathematically real animation
+playback, which this demonstrably now is. No crash across
+academy1/vjun1/hoth2, clean rebuild, zero warnings.
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -764,24 +850,33 @@ touch this code)
 - Ghoul2 (character/weapon model) rendering (`tr_model.cpp`) - real `.glm`
   mesh parsing, `.skin` texture resolution (single-file case only),
   bind-pose bone bolts, per-frame entity dispatch through the same
-  pipeline/vertex-format world geometry uses, and (see "Skeletal animation"
-  above) real per-bone mesh skinning to a single correctly-computed static
-  frame - not yet *live*, time-driven, game-selected animation (see "What's
-  not implemented yet" below), but real bone math and weighted blending,
-  not the old fixed bind pose. Still missing: LOD selection, per-surface
-  on/off overrides, gore.
+  pipeline/vertex-format world geometry uses, and (see "Skeletal animation"/
+  "Live animation" above) real per-bone mesh skinning driven by a real,
+  live, time-driven animation state per model instance
+  (`G2API_SetBoneAnim`/`GetBoneAnim`/etc genuinely work now) - one
+  whole-skeleton animation track per instance, not the real engine's
+  independently-blended per-bone-subtree tracks, and no animation
+  blending/crossfade or sub-frame interpolation, but real bone math and
+  weighted skinning driving an actually-moving model, not a static pose.
+  Still missing: LOD selection, per-surface on/off overrides, gore.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
-- **Live** Ghoul2 skeletal animation: `G2API_SetBoneAnim`/`GetBoneAnim`/
-  `GetAnimRange`/`SetAnimIndex`/etc are still stubs, so nothing yet tells a
-  model instance which animation to play or advances it over time - see
-  "Skeletal animation" above for what *is* real now (per-bone mesh skinning,
-  correctly posed to a single static frame - frame 0 - instead of the old
-  fixed bind pose). Also still missing: LOD selection, per-surface on/off
-  overrides (`SetSurfaceOnOff`), gore, tags, ragdoll, model-to-model
-  attachment (`AttachG2Model`/`AttachEnt`), animation *blending* (a single
-  pose only, no crossfade between two), and surface bolts (a bolt naming a
+- Ghoul2 skeletal animation is live now (see "Live animation" above:
+  `G2API_SetBoneAnim`/`GetBoneAnim`/etc really work, time-driven, not
+  stubs) but only as **one whole-skeleton animation track per model
+  instance** - not the real engine's independently-blended per-bone-subtree
+  tracks (legs/torso/face playing different animations at once), and with
+  no blending/crossfade between two animations, no sub-frame interpolation
+  (frames step discretely), and no reverse/negative-speed playback. `
+  SetAnimIndex`/`GetAnimIndex` (selecting *which* `.gla`/animation-file a
+  model uses, a different concept from which frame within one - relevant
+  for NPCs with a per-level animation-file override, e.g.
+  `_humanoid_academy1.gla`) are still stubs; every model always uses
+  whichever single `.gla` `VK_LoadGhoul2Skeleton` first resolved for it.
+  Also still missing: LOD selection, per-surface on/off overrides
+  (`SetSurfaceOnOff`), gore, tags, ragdoll, model-to-model attachment
+  (`AttachG2Model`/`AttachEnt`), and surface bolts (a bolt naming a
   *surface* rather than a bone - only bone bolts are implemented, see
   "Ghoul2 rendering" above for `AddBolt`/`GetBoltMatrix`, itself still
   bind-pose-only regardless of what the mesh is doing). See "Ghoul2 is not
