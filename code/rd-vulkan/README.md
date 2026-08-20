@@ -767,6 +767,66 @@ itself), only genuinely live, per-instance, mathematically real animation
 playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
+### Runtime polys (tr_model.cpp)
+
+`RE_AddPolyToScene` was a stub until now - every call from game code (blaster
+bolt trails/impacts, saber marks, and other one-off effect geometry that
+isn't a Ghoul2 model or a world surface: see `code/cgame/FxPrimitives.cpp`,
+`FxSystem.cpp`, `cg_localents.cpp`, `cg_marks.cpp`) was silently dropped.
+Polys are now queued per scene (`s_scenePolys`, cleared by `RE_ClearScene`
+same as Ghoul2 entities) and drawn by `VK_DrawScenePolys`, called from
+`RE_RenderScene` right after `VK_DrawGhoul2Entities`.
+
+Each `RE_AddPolyToScene` call copies its `polyVert_t` array immediately
+(the caller's buffer isn't guaranteed to survive to draw time - real
+`RE_AddPolyToScene`, `rd-vanilla/tr_scene.cpp`, does the same for the same
+reason), capped at `MAX_SCENE_POLYS` (2048, the same order of magnitude as
+rd-vanilla's real `MAX_POLYS`, `tr_local.h` - not a hard engine-parity
+number, just a generous per-scene cap). A `polyVert_t` array is a **triangle
+fan** (vertex 0 is the pivot) - confirmed against rd-vanilla's real
+`RB_SurfacePolychain` (`tr_surface.cpp`), which generates `(0, i+1, i+2)`
+triangles for `i` in `[0, numVerts-2)`. This renderer expands that fan into
+a plain triangle list on the CPU at draw time (same "no GPU fan topology,
+no index buffer" choice already made for the UI path) rather than using
+`VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN`.
+
+A small dedicated pipeline (`poly.vert`/`poly.frag`, `VK_CreatePolyPipeline`
+in `tr_init.cpp`) draws them: world-space position, one UV set, and a
+per-vertex RGBA modulate colour (`polyVert_t`, `rd-common/tr_types.h`) -
+closer to the UI path's vertex shape than to `WorldVertex`'s (no lightmap
+UV, no world fog - same scope cut already made for Ghoul2 models), but with
+a real `mvp` and real depth testing (test on, write off, so a poly behind a
+wall is correctly hidden but two overlapping polys don't fight each other -
+`rd-vanilla` doesn't depth-sort/write polys against each other either) and
+three blend-mode pipeline variants (alpha/additive/opaque, mirroring the UI
+path's `vkBlendMode_t` handling) selected per-poly from its shader's parsed
+blend mode. No new descriptor infrastructure was needed for this: an
+`image_t`'s `descriptorSet` is built once at upload time
+(`VK_UploadImage`, `tr_image.cpp`) against `vk.uiDescriptorSetLayout`/
+`vk.uiSampler`, and the poly pipeline layout reuses that exact same set
+layout (it needs the same "one plain texture" shape), so it's reused
+directly rather than allocated again. Vertices are written into a
+per-scene host-visible/coherent scratch buffer (`vk.polyVertexBuffer`,
+`POLY_VERTEX_BUFFER_CAPACITY` = 16384 vertices), with a cursor reset once
+per `VK_DrawScenePolys` call - a per-*scene*, not per-*frame*, reset, unlike
+the UI path's `s_uiVertexCursor` (reset in `RE_BeginFrame`), because polys
+are drawn once per `RE_RenderScene` call rather than interleaved with many
+separate 2D draws across a frame; the same "drop the draw rather than
+corrupt the buffer" overflow guard applies if a scene somehow queues more
+vertices than the scratch buffer holds.
+
+**Verified**: clean rebuild, zero warnings. No crash and no Vulkan
+validation errors across all five map-based scenes (`sp_academy1_spawn`,
+`sp_hoth2_spawn`, `sp_yavin1_spawn`, `sp_vjun1_spawn`) plus `sp_menu`, and
+no visible regression in any of their screenshots. None of those scenes'
+fixed spawn-time captures happen to catch a moment with an actual poly
+effect on screen (blaster fire, saber marks, etc. are transient and
+combat-triggered, not present at a cutscene's opening beats), so this is a
+"doesn't crash, doesn't corrupt other rendering, wires up cleanly to real
+game calls" verification rather than a pixel-level "a poly effect actually
+appeared and looked right" one - the latter would need a scene manifest
+entry timed to a specific in-game effect trigger, which doesn't exist yet.
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -859,6 +919,11 @@ touch this code)
   blending/crossfade or sub-frame interpolation, but real bone math and
   weighted skinning driving an actually-moving model, not a static pose.
   Still missing: LOD selection, per-surface on/off overrides, gore.
+- Runtime polys (`RE_AddPolyToScene`, `tr_model.cpp`) - see "Runtime polys"
+  above. Real per-scene queueing, CPU fan-to-triangle-list expansion, and a
+  dedicated pipeline with the same three blend-mode variants (alpha/
+  additive/opaque) the UI path has, reusing the UI descriptor-set layout/
+  sampler rather than new descriptor infrastructure.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -910,11 +975,12 @@ touch this code)
   warping/subdivision (visible seams at box edges), no `RDF_SKYBOXPORTAL`
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
-- Runtime polys (`AddPolyToScene`) - still a stub. Entities
-  (`AddRefEntityToScene`) are real for Ghoul2 (`RT_MODEL`, see "Ghoul2
-  rendering" above), but every other `refEntityType_t` (sprites, beams,
-  electricity, oriented quads, ...) is queued and silently ignored at draw
-  time - nothing about those types renders yet.
+- Non-Ghoul2 ref entities. `AddRefEntityToScene` is real for Ghoul2
+  (`RT_MODEL`, see "Ghoul2 rendering" above) and runtime polys
+  (`AddPolyToScene`, see "Runtime polys" above) are real too now, but every
+  other `refEntityType_t` (sprites, beams, electricity, oriented quads, ...)
+  is queued and silently ignored at draw time - nothing about those types
+  renders yet.
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc`, and (for fog shaders specifically, see "3D world
   geometry" above) a top-level `fogparms` line, are read - later stages,

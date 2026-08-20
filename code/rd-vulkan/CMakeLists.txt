@@ -156,6 +156,8 @@ if(BuildSPRdVulkan)
 	compile_and_embed_shader("ui.frag" "ui_frag_spv")
 	compile_and_embed_shader("world.vert" "world_vert_spv")
 	compile_and_embed_shader("world.frag" "world_frag_spv")
+	compile_and_embed_shader("poly.vert" "poly_vert_spv")
+	compile_and_embed_shader("poly.frag" "poly_frag_spv")
 
 	list(APPEND SPRDVulkanRendererIncludeDirectories ${SPRDVulkanShaderGenDir})
 

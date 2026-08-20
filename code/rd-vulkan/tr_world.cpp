@@ -1003,6 +1003,11 @@ void RE_RenderScene( const refdef_t *fd )
 	// each entity's live animation frame (VK_GetGhoul2PoseFrame).
 	VK_DrawGhoul2Entities( mvp, fd->time );
 
+	// Runtime polys (RE_AddPolyToScene) - particles/sparks/decals queued this
+	// scene, world-space so they use the same mvp directly (no per-entity
+	// model matrix, unlike Ghoul2 above). See VK_DrawScenePolys (tr_model.cpp).
+	VK_DrawScenePolys( mvp );
+
 	// Restore the full-screen viewport/scissor for any 2D drawing
 	// (RE_StretchPic) that follows this scene render within the same frame -
 	// it doesn't set its own, it relies on whatever RE_BeginFrame or the

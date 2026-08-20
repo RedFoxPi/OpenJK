@@ -57,7 +57,7 @@ void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, floa
 		return;
 	}
 
-	image_t *img = ( hShader > 0 && (size_t)hShader < vk.images.size() ) ? vk.images[hShader] : vk.whiteImage;
+	image_t *img = VK_GetImageByHandle( hShader );
 	if ( !img )
 	{
 		return;

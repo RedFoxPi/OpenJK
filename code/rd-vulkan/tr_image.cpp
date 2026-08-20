@@ -206,6 +206,11 @@ image_t *VK_FindImage( const char *name )
 	return img;
 }
 
+image_t *VK_GetImageByHandle( qhandle_t hShader )
+{
+	return ( hShader > 0 && (size_t)hShader < vk.images.size() ) ? vk.images[hShader] : vk.whiteImage;
+}
+
 void VK_ShutdownImages( void )
 {
 	for ( image_t *img : vk.images )

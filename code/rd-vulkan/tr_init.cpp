@@ -915,6 +915,157 @@ static void VK_CreateWorldPipeline( void )
 	vkDestroyShaderModule( vk.device, fragModule, nullptr );
 }
 
+// Embedded SPIR-V for runtime polys (RE_AddPolyToScene) - see
+// shaders/poly.vert/poly.frag and VulkanGlobals_t::polyPipeline's comment.
+#include "poly_vert_spv.h"
+#include "poly_frag_spv.h"
+
+static void VK_CreatePolyPipeline( void )
+{
+	// Reuses vk.uiDescriptorSetLayout/vk.uiSampler (one plain texture, no
+	// lightmap) rather than allocating a third descriptor set layout/pool -
+	// see vkGlobals_t::polyPipelineLayout's comment. Must run after
+	// VK_CreateUiPipeline, which is where that layout is actually created.
+	VkPushConstantRange pushRange = {};
+	pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+	pushRange.offset = 0;
+	pushRange.size = sizeof( float ) * 16; // mat4 mvp only - see poly.vert
+
+	VkPipelineLayoutCreateInfo plInfo = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+	plInfo.setLayoutCount = 1;
+	plInfo.pSetLayouts = &vk.uiDescriptorSetLayout;
+	plInfo.pushConstantRangeCount = 1;
+	plInfo.pPushConstantRanges = &pushRange;
+	VK_Check( vkCreatePipelineLayout( vk.device, &plInfo, nullptr, &vk.polyPipelineLayout ), "vkCreatePipelineLayout (poly)" );
+
+	VkShaderModule vertModule = VK_CreateShaderModule( poly_vert_spv, sizeof( poly_vert_spv ) );
+	VkShaderModule fragModule = VK_CreateShaderModule( poly_frag_spv, sizeof( poly_frag_spv ) );
+
+	VkPipelineShaderStageCreateInfo stages[2] = {};
+	stages[0] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+	stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+	stages[0].module = vertModule;
+	stages[0].pName = "main";
+	stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
+	stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+	stages[1].module = fragModule;
+	stages[1].pName = "main";
+
+	VkVertexInputBindingDescription binding = { 0, sizeof( PolyVertex ), VK_VERTEX_INPUT_RATE_VERTEX };
+	VkVertexInputAttributeDescription attrs[3] = {
+		{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof( PolyVertex, pos ) },
+		{ 1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof( PolyVertex, uv ) },
+		{ 2, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof( PolyVertex, color ) },
+	};
+
+	VkPipelineVertexInputStateCreateInfo vertexInput = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+	vertexInput.vertexBindingDescriptionCount = 1;
+	vertexInput.pVertexBindingDescriptions = &binding;
+	vertexInput.vertexAttributeDescriptionCount = 3;
+	vertexInput.pVertexAttributeDescriptions = attrs;
+
+	VkPipelineInputAssemblyStateCreateInfo inputAssembly = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+	inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+	VkPipelineViewportStateCreateInfo viewportState = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+	viewportState.viewportCount = 1;
+	viewportState.scissorCount = 1;
+
+	VkPipelineRasterizationStateCreateInfo raster = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+	raster.polygonMode = VK_POLYGON_MODE_FILL;
+	// No culling - particle/effect polys are usually meant to be visible
+	// from both sides (billboards, fans with no guaranteed winding).
+	raster.cullMode = VK_CULL_MODE_NONE;
+	raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+	raster.lineWidth = 1.0f;
+
+	VkPipelineMultisampleStateCreateInfo multisample = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+	multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+	// Test against world/Ghoul2 depth so a poly behind a wall is correctly
+	// hidden; no write, for all three blend variants uniformly - see
+	// vkGlobals_t::polyPipeline's comment for why.
+	VkPipelineDepthStencilStateCreateInfo depthStencil = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+	depthStencil.depthTestEnable = VK_TRUE;
+	depthStencil.depthWriteEnable = VK_FALSE;
+	depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+
+	// Same three blend-mode variants as VK_CreateUiPipeline (vkBlendMode_t) -
+	// see that function for the real blend-factor values, copied verbatim
+	// rather than rederived.
+	VkPipelineColorBlendAttachmentState blendAlpha = {};
+	blendAlpha.blendEnable = VK_TRUE;
+	blendAlpha.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+	blendAlpha.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	blendAlpha.colorBlendOp = VK_BLEND_OP_ADD;
+	blendAlpha.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAlpha.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+	blendAlpha.alphaBlendOp = VK_BLEND_OP_ADD;
+	blendAlpha.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+		| VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+	VkPipelineColorBlendAttachmentState blendAdditive = blendAlpha;
+	blendAdditive.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAdditive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAdditive.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAdditive.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+
+	VkPipelineColorBlendAttachmentState blendOpaque = blendAlpha;
+	blendOpaque.blendEnable = VK_FALSE;
+
+	VkPipelineColorBlendStateCreateInfo colorBlendAlpha = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+	colorBlendAlpha.attachmentCount = 1;
+	colorBlendAlpha.pAttachments = &blendAlpha;
+
+	VkPipelineColorBlendStateCreateInfo colorBlendAdditive = colorBlendAlpha;
+	colorBlendAdditive.pAttachments = &blendAdditive;
+
+	VkPipelineColorBlendStateCreateInfo colorBlendOpaque = colorBlendAlpha;
+	colorBlendOpaque.pAttachments = &blendOpaque;
+
+	VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+	VkPipelineDynamicStateCreateInfo dynState = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+	dynState.dynamicStateCount = 2;
+	dynState.pDynamicStates = dynStates;
+
+	VkGraphicsPipelineCreateInfo pipeInfos[3] = {};
+	pipeInfos[0] = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+	pipeInfos[0].stageCount = 2;
+	pipeInfos[0].pStages = stages;
+	pipeInfos[0].pVertexInputState = &vertexInput;
+	pipeInfos[0].pInputAssemblyState = &inputAssembly;
+	pipeInfos[0].pViewportState = &viewportState;
+	pipeInfos[0].pRasterizationState = &raster;
+	pipeInfos[0].pMultisampleState = &multisample;
+	pipeInfos[0].pDepthStencilState = &depthStencil;
+	pipeInfos[0].pColorBlendState = &colorBlendAlpha;
+	pipeInfos[0].pDynamicState = &dynState;
+	pipeInfos[0].layout = vk.polyPipelineLayout;
+	pipeInfos[0].renderPass = vk.renderPass;
+	pipeInfos[0].subpass = 0;
+
+	pipeInfos[1] = pipeInfos[0];
+	pipeInfos[1].pColorBlendState = &colorBlendAdditive;
+
+	pipeInfos[2] = pipeInfos[0];
+	pipeInfos[2].pColorBlendState = &colorBlendOpaque;
+
+	VkPipeline pipelines[3] = {};
+	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 3, pipeInfos, nullptr, pipelines ), "vkCreateGraphicsPipelines (poly)" );
+	vk.polyPipeline = pipelines[0];
+	vk.polyPipelineAdditive = pipelines[1];
+	vk.polyPipelineOpaque = pipelines[2];
+
+	vkDestroyShaderModule( vk.device, vertModule, nullptr );
+	vkDestroyShaderModule( vk.device, fragModule, nullptr );
+
+	VK_CreateBuffer( sizeof( PolyVertex ) * POLY_VERTEX_BUFFER_CAPACITY,
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&vk.polyVertexBuffer, &vk.polyVertexBufferMemory );
+	vkMapMemory( vk.device, vk.polyVertexBufferMemory, 0, VK_WHOLE_SIZE, 0, &vk.polyVertexBufferMapped );
+}
+
 // ============================================================================
 // Public entry points
 // ============================================================================
@@ -949,6 +1100,7 @@ void R_Init( void )
 	VK_CreateCommandPoolsAndSync();
 	VK_CreateUiPipeline();
 	VK_CreateWorldPipeline();
+	VK_CreatePolyPipeline();
 
 	vk.glConfig.renderer_string = vk.physicalDeviceProps.deviceName;
 	vk.glConfig.vendor_string = "rd-vulkan";
@@ -1016,6 +1168,14 @@ void VK_Shutdown( qboolean destroyWindow )
 	if ( vk.ghoul2DescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.ghoul2DescriptorPool, nullptr );
 	if ( vk.worldDescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.worldDescriptorPool, nullptr );
 	if ( vk.worldDescriptorSetLayout ) vkDestroyDescriptorSetLayout( vk.device, vk.worldDescriptorSetLayout, nullptr );
+
+	if ( vk.polyPipeline ) vkDestroyPipeline( vk.device, vk.polyPipeline, nullptr );
+	if ( vk.polyPipelineAdditive ) vkDestroyPipeline( vk.device, vk.polyPipelineAdditive, nullptr );
+	if ( vk.polyPipelineOpaque ) vkDestroyPipeline( vk.device, vk.polyPipelineOpaque, nullptr );
+	if ( vk.polyPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.polyPipelineLayout, nullptr );
+	if ( vk.polyVertexBufferMemory ) vkUnmapMemory( vk.device, vk.polyVertexBufferMemory );
+	if ( vk.polyVertexBuffer ) vkDestroyBuffer( vk.device, vk.polyVertexBuffer, nullptr );
+	if ( vk.polyVertexBufferMemory ) vkFreeMemory( vk.device, vk.polyVertexBufferMemory, nullptr );
 
 	if ( vk.depthImageView ) vkDestroyImageView( vk.device, vk.depthImageView, nullptr );
 	if ( vk.depthImage ) vkDestroyImage( vk.device, vk.depthImage, nullptr );
@@ -1109,7 +1269,9 @@ qboolean RE_RegisterModels_LevelLoadEnd( qboolean bDeleteEverythingNotUsedThisLe
 qboolean RE_RegisterImages_LevelLoadEnd( void ) { return qfalse; }
 void RE_SetWorldVisData( const byte *vis ) { (void)vis; }
 void RE_EndRegistration( void ) {}
-void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts ) { (void)hShader; (void)numVerts; (void)verts; }
+// Real implementation in tr_model.cpp, alongside the rest of this
+// renderer's per-frame scene-queue handling (RE_AddRefEntityToScene/
+// RE_ClearScene) - see VK_DrawScenePolys there.
 void RE_AddLightToScene( const vec3_t org, float intensity, float r, float g, float b ) { (void)org; (void)intensity; (void)r; (void)g; (void)b; }
 qboolean RE_GetLighting( const vec3_t org, vec3_t ambientLight, vec3_t directedLight, vec3_t lightDir )
 {

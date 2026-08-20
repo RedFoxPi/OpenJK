@@ -333,10 +333,29 @@ int VK_RegisterSkin( const char *name )
 // Per-frame queue of entities added via RE_AddRefEntityToScene, drawn by
 // VK_DrawGhoul2Entities from RE_RenderScene (tr_world.cpp) and cleared by
 // RE_ClearScene. Only RT_MODEL entities carrying a Ghoul2 model actually
-// draw anything - everything else (sprites, beams, polys, ...) is silently
-// ignored, see README.md.
+// draw anything - every other refEntityType_t (sprites, beams, electricity,
+// oriented quads, ...) is still silently ignored, see README.md. Runtime
+// polys (RE_AddPolyToScene) are a separate queue, not a refEntity_t at all -
+// see s_scenePolys below.
 static std::vector<refEntity_t> s_sceneEntities;
 static const size_t MAX_SCENE_ENTITIES = 256;
+
+// Per-frame queue of polys added via RE_AddPolyToScene (particles, sparks,
+// decals, ...), drawn by VK_DrawScenePolys from RE_RenderScene and cleared
+// by RE_ClearScene. verts is a copy, not a pointer into the caller's own
+// buffer - rd-vanilla's real RE_AddPolyToScene (tr_scene.cpp) also copies
+// immediately for the same reason: callers routinely reuse/free their
+// polyVert_t buffer right after this call returns, well before the scene
+// actually gets drawn.
+struct VulkanScenePoly
+{
+	qhandle_t hShader;
+	std::vector<polyVert_t> verts;
+};
+static std::vector<VulkanScenePoly> s_scenePolys;
+// Same order of magnitude as rd-vanilla's real MAX_POLYS (tr_local.h) - not
+// meant to be a hard engine-parity number, just a generous per-frame cap.
+static const size_t MAX_SCENE_POLYS = 2048;
 
 static const VulkanSkin s_emptySkin;
 
@@ -919,6 +938,7 @@ void VK_ShutdownGhoul2Models( void )
 void RE_ClearScene( void )
 {
 	s_sceneEntities.clear();
+	s_scenePolys.clear();
 }
 
 void RE_AddRefEntityToScene( const refEntity_t *re )
@@ -928,6 +948,122 @@ void RE_AddRefEntityToScene( const refEntity_t *re )
 		return;
 	}
 	s_sceneEntities.push_back( *re );
+}
+
+void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts )
+{
+	// hShader == 0 means "no shader" (RE_RegisterShader's failure return,
+	// same convention RE_StretchPic's image lookup uses) - never a valid
+	// poly. numVerts < 3 can't form a triangle fan at all.
+	if ( !hShader || numVerts < 3 || !verts || s_scenePolys.size() >= MAX_SCENE_POLYS )
+	{
+		return;
+	}
+	VulkanScenePoly poly;
+	poly.hShader = hShader;
+	poly.verts.assign( verts, verts + numVerts );
+	s_scenePolys.push_back( std::move( poly ) );
+}
+
+void VK_DrawScenePolys( const float *mvp )
+{
+	if ( s_scenePolys.empty() || !vk.frameActive )
+	{
+		return;
+	}
+
+	VkCommandBuffer cmd = vk.activeCommandBuffer;
+
+	// mvp is the same for every poly this scene (world-space geometry, no
+	// per-entity model matrix like Ghoul2's) - push once rather than per
+	// draw. Push constants aren't tied to whichever pipeline is bound at
+	// push time, only to the layout used by the eventual draw call, and
+	// every variant below shares vk.polyPipelineLayout.
+	vkCmdPushConstants( cmd, vk.polyPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof( float ) * 16, mvp );
+
+	// Reset once per scene, not once per poly - see POLY_VERTEX_BUFFER_
+	// CAPACITY's comment (tr_local.h): unlike the UI path's per-frame,
+	// many-interleaved-draws cursor, RE_RenderScene draws the whole queue
+	// in one pass here.
+	uint32_t cursor = 0;
+
+	for ( const VulkanScenePoly &poly : s_scenePolys )
+	{
+		// Triangle fan (vertex 0 is the pivot) -> triangle list: (0, i+1, i+2)
+		// for i in [0, numVerts-2), same convention as rd-vanilla's real
+		// RB_SurfacePolychain (tr_surface.cpp) - see poly.vert's comment for
+		// why this renderer expands on the CPU instead of using fan topology.
+		int numTris = (int)poly.verts.size() - 2;
+		int numOutVerts = numTris * 3;
+		if ( numOutVerts <= 0 )
+		{
+			continue;
+		}
+		if ( cursor + (uint32_t)numOutVerts > POLY_VERTEX_BUFFER_CAPACITY )
+		{
+			// out of per-frame scratch space - drop the rest rather than corrupt the buffer
+			break;
+		}
+
+		image_t *img = VK_GetImageByHandle( poly.hShader );
+		if ( !img )
+		{
+			continue;
+		}
+
+		PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + cursor;
+		int outIdx = 0;
+		for ( int i = 0; i < numTris; i++ )
+		{
+			const polyVert_t *fanVerts[3] = { &poly.verts[0], &poly.verts[i + 1], &poly.verts[i + 2] };
+			for ( int v = 0; v < 3; v++ )
+			{
+				const polyVert_t &src = *fanVerts[v];
+				PolyVertex &dst = out[outIdx++];
+				dst.pos[0] = src.xyz[0];
+				dst.pos[1] = src.xyz[1];
+				dst.pos[2] = src.xyz[2];
+				dst.uv[0] = src.st[0];
+				dst.uv[1] = src.st[1];
+				// modulate is byte 0-255 (polyVert_t, rd-common/tr_types.h) -
+				// see PolyVertex's comment (tr_local.h) for why this is the
+				// one place that conversion happens.
+				dst.color[0] = src.modulate[0] / 255.0f;
+				dst.color[1] = src.modulate[1] / 255.0f;
+				dst.color[2] = src.modulate[2] / 255.0f;
+				dst.color[3] = src.modulate[3] / 255.0f;
+			}
+		}
+
+		VkPipeline pipeline = vk.polyPipeline;
+		if ( img->blendMode == BLEND_ADDITIVE )
+		{
+			pipeline = vk.polyPipelineAdditive;
+		}
+		else if ( img->blendMode == BLEND_OPAQUE )
+		{
+			pipeline = vk.polyPipelineOpaque;
+		}
+		if ( pipeline != vk.lastBoundPipeline )
+		{
+			vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline );
+			vk.lastBoundPipeline = pipeline;
+		}
+
+		// Reusing img->descriptorSet (built once at upload time against
+		// vk.uiDescriptorSetLayout/vk.uiSampler - VK_UploadImage, tr_image.cpp)
+		// against vk.polyPipelineLayout works because that layout's one set
+		// layout is vk.uiDescriptorSetLayout too - see vkGlobals_t::
+		// polyPipelineLayout's comment (tr_local.h).
+		vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.polyPipelineLayout,
+			0, 1, &img->descriptorSet, 0, nullptr );
+
+		VkDeviceSize offset = (VkDeviceSize)cursor * sizeof( PolyVertex );
+		vkCmdBindVertexBuffers( cmd, 0, 1, &vk.polyVertexBuffer, &offset );
+		vkCmdDraw( cmd, (uint32_t)numOutVerts, 1, 0, 0 );
+
+		cursor += (uint32_t)numOutVerts;
+	}
 }
 
 void VK_DrawGhoul2Entities( const float *mvp, int currentTime )

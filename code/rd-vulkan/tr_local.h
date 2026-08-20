@@ -50,6 +50,11 @@ extern cvar_t *com_buildScript;
 #define MAX_VK_IMAGES 4096
 #define VK_FRAMES_IN_FLIGHT 2
 #define UI_VERTEX_BUFFER_CAPACITY 4096u // quads per frame
+// Fan-expanded triangle-list vertices per frame across every queued
+// RE_AddPolyToScene poly (see VK_DrawScenePolys, tr_model.cpp) - not a
+// "polys per frame" count like rd-vanilla's MAX_POLYS/MAX_POLYVERTS
+// (tr_local.h in rd-vanilla), a generous scratch-buffer size instead.
+#define POLY_VERTEX_BUFFER_CAPACITY 16384u
 
 // Blend mode a UI draw needs, taken from the first stage of the image's
 // matching .shader script (see tr_shader.cpp). Vulkan bakes blend factors
@@ -114,6 +119,20 @@ struct WorldVertex
 	float pos[3];
 	float uv[2];
 	float lightmapUV[2];
+};
+
+// Runtime polys (RE_AddPolyToScene - particles, sparks, decals; see
+// tr_model.cpp's VK_DrawScenePolys and shaders/poly.vert/poly.frag). World-
+// space position, one UV set, and a per-vertex RGBA colour - matches
+// polyVert_t (rd-common/tr_types.h) directly except colour is float 0..1
+// here rather than that struct's byte 0..255 (see VK_DrawScenePolys for the
+// /255 conversion), the same normalization world.frag's texture sampling
+// already assumes.
+struct PolyVertex
+{
+	float pos[3];
+	float uv[2];
+	float color[4];
 };
 
 // Layout must match world.vert/world.frag's `layout(push_constant) uniform
@@ -203,6 +222,32 @@ typedef struct
 	// renderer shutdown (VK_ShutdownGhoul2Models), matching that lifetime.
 	VkDescriptorPool ghoul2DescriptorPool = VK_NULL_HANDLE;
 
+	// Runtime polys (RE_AddPolyToScene, tr_model.cpp's VK_DrawScenePolys) -
+	// world-space geometry like worldPipeline, but reuses vk.uiDescriptorSetLayout/
+	// vk.uiSampler (one plain texture, no lightmap - same shape the UI path
+	// already needs) rather than a third descriptor set layout, since every
+	// image_t already carries its own descriptorSet built against that exact
+	// layout (see VK_UploadImage, tr_image.cpp) - nothing new to allocate
+	// per poly draw. Three blend-mode variants, same reasoning and the same
+	// three modes as vk.uiPipeline/uiPipelineAdditive/uiPipelineOpaque
+	// (vkBlendMode_t) - Vulkan bakes blend factors into the pipeline, so a
+	// distinct .shader blendFunc needs a distinct VkPipeline. Depth test
+	// against world/Ghoul2 geometry is on (polys should be occluded by a
+	// wall, not drawn through it); depth write is off for all three variants
+	// uniformly, even the opaque one - not real per-shader depth-write
+	// control, just the common case for transient effect geometry.
+	VkPipelineLayout polyPipelineLayout = VK_NULL_HANDLE;
+	VkPipeline polyPipeline = VK_NULL_HANDLE;         // BLEND_ALPHA
+	VkPipeline polyPipelineAdditive = VK_NULL_HANDLE; // BLEND_ADDITIVE
+	VkPipeline polyPipelineOpaque = VK_NULL_HANDLE;   // BLEND_OPAQUE
+	// Host-visible/coherent, persistently mapped, rewritten fresh every
+	// frame (VK_DrawScenePolys resets its write cursor to 0 each call) -
+	// same "per-frame CPU scratch buffer" pattern as vk.uiVertexBuffer, not
+	// a one-time upload like tr_world.cpp's static geometry.
+	VkBuffer polyVertexBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory polyVertexBufferMemory = VK_NULL_HANDLE;
+	void *polyVertexBufferMapped = nullptr;
+
 	// Shared across tr_cmds.cpp's and tr_world.cpp's draw calls (both bind
 	// pipelines into the same per-frame command buffer) so a pipeline bound
 	// by one never gets silently assumed still-bound by the other. Reset to
@@ -270,7 +315,17 @@ void VK_MultiplyMatrix( const float *a, const float *b, float *out );
 // LOD selection, surface on/off overrides, gore).
 void RE_ClearScene( void );
 void RE_AddRefEntityToScene( const refEntity_t *re );
+// Queues a copy of numVerts polyVert_t (a triangle fan, vertex 0 is the
+// pivot - matches rd-vanilla's RB_SurfacePolychain convention) under hShader
+// for drawing this scene. Copies immediately, same reason as rd-vanilla's
+// real RE_AddPolyToScene (tr_scene.cpp): callers routinely reuse/free verts
+// right after this call returns.
+void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts );
 void VK_DrawGhoul2Entities( const float *mvp, int currentTime );
+// Draws every poly queued this scene via RE_AddPolyToScene - see its own
+// comment in tr_model.cpp for the fan-to-triangle-list expansion and
+// per-blend-mode batching.
+void VK_DrawScenePolys( const float *mvp );
 void VK_ShutdownGhoul2Models( void );
 // Loads (or returns the cached index of, if already loaded with the same
 // skinHandle) the .glm at fileName. skinHandle (from VK_RegisterSkin, or 0
@@ -328,6 +383,11 @@ image_t *VK_FindImage( const char *name );
 image_t *VK_CreateSolidImage( const char *name, byte r, byte g, byte b, byte a );
 void VK_UploadImage( image_t *img, const byte *pixels, int width, int height );
 void VK_ShutdownImages( void );
+// hShader == 0 (RE_RegisterShader's failure return) or an out-of-range
+// index both fall back to vk.whiteImage rather than a null dereference -
+// shared by every draw path that resolves a qhandle_t to an image_t*
+// (RE_StretchPic, VK_DrawScenePolys, ...).
+image_t *VK_GetImageByHandle( qhandle_t hShader );
 qhandle_t RE_RegisterShaderNoMip( const char *name );
 qhandle_t RE_RegisterShader( const char *name );
 
