@@ -330,13 +330,14 @@ int VK_RegisterSkin( const char *name )
 	return index;
 }
 
-// Per-frame queue of entities added via RE_AddRefEntityToScene, drawn by
-// VK_DrawGhoul2Entities from RE_RenderScene (tr_world.cpp) and cleared by
-// RE_ClearScene. Only RT_MODEL entities carrying a Ghoul2 model actually
-// draw anything - every other refEntityType_t (sprites, beams, electricity,
-// oriented quads, ...) is still silently ignored, see README.md. Runtime
-// polys (RE_AddPolyToScene) are a separate queue, not a refEntity_t at all -
-// see s_scenePolys below.
+// Per-frame queue of entities added via RE_AddRefEntityToScene, cleared by
+// RE_ClearScene. RT_MODEL entities carrying a Ghoul2 model are drawn by
+// VK_DrawGhoul2Entities; RT_SPRITE/RT_ORIENTED_QUAD are drawn by
+// VK_DrawScenePolys (same function that draws RE_AddPolyToScene polys - see
+// its comment for why). Every other refEntityType_t (beams, electricity,
+// cylinders, lathes, clouds, lines, saber glow) is still silently ignored,
+// see README.md. Runtime polys (RE_AddPolyToScene) are a separate queue,
+// not a refEntity_t at all - see s_scenePolys below.
 static std::vector<refEntity_t> s_sceneEntities;
 static const size_t MAX_SCENE_ENTITIES = 256;
 
@@ -965,26 +966,110 @@ void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts
 	s_scenePolys.push_back( std::move( poly ) );
 }
 
-void VK_DrawScenePolys( const float *mvp )
+// Binds the right vk.polyPipeline* variant for img's blend mode (only if
+// it's not already bound - same "skip redundant binds" convention as
+// RE_StretchPic/VK_DrawGhoul2Entities), binds img's descriptor set, and
+// draws vertexCount non-indexed vertices starting at firstVertex within
+// vk.polyVertexBuffer. Shared by the RE_AddPolyToScene fan-expansion loop
+// and the RT_SPRITE/RT_ORIENTED_QUAD quad-stamp loop below - both just
+// differ in how they fill PolyVertex data, not in how they get drawn.
+static void VK_DrawPolyRange( VkCommandBuffer cmd, image_t *img, uint32_t firstVertex, uint32_t vertexCount )
 {
-	if ( s_scenePolys.empty() || !vk.frameActive )
+	VkPipeline pipeline = vk.polyPipeline;
+	if ( img->blendMode == BLEND_ADDITIVE )
+	{
+		pipeline = vk.polyPipelineAdditive;
+	}
+	else if ( img->blendMode == BLEND_OPAQUE )
+	{
+		pipeline = vk.polyPipelineOpaque;
+	}
+	if ( pipeline != vk.lastBoundPipeline )
+	{
+		vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline );
+		vk.lastBoundPipeline = pipeline;
+	}
+
+	// Reusing img->descriptorSet (built once at upload time against
+	// vk.uiDescriptorSetLayout/vk.uiSampler - VK_UploadImage, tr_image.cpp)
+	// against vk.polyPipelineLayout works because that layout's one set
+	// layout is vk.uiDescriptorSetLayout too - see vkGlobals_t::
+	// polyPipelineLayout's comment (tr_local.h).
+	vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.polyPipelineLayout,
+		0, 1, &img->descriptorSet, 0, nullptr );
+
+	VkDeviceSize offset = (VkDeviceSize)firstVertex * sizeof( PolyVertex );
+	vkCmdBindVertexBuffers( cmd, 0, 1, &vk.polyVertexBuffer, &offset );
+	vkCmdDraw( cmd, vertexCount, 1, 0, 0 );
+}
+
+// Writes one screen-facing/oriented quad (RT_SPRITE, RT_ORIENTED_QUAD) into
+// vk.polyVertexBufferMapped at *cursor as 6 non-indexed vertices, advancing
+// *cursor by 6. Corner positions and winding match rd-vanilla's real
+// RB_AddQuadStampExt (tr_surface.cpp) exactly: corners at
+// origin +-left +-up with triangles (0,1,3) and (3,1,2) - re-expressed here
+// as a plain 6-vertex sequence in that same order since this renderer's
+// poly path has no index buffer (see poly.vert's comment). color is the
+// entity's shaderRGBA, constant across all 4 corners, same as rd-vanilla.
+static void VK_EmitQuadStamp( const float origin[3], const float left[3], const float up[3],
+	const byte color[4], uint32_t *cursor )
+{
+	float corners[4][3];
+	for ( int i = 0; i < 3; i++ )
+	{
+		corners[0][i] = origin[i] + left[i] + up[i];
+		corners[1][i] = origin[i] - left[i] + up[i];
+		corners[2][i] = origin[i] - left[i] - up[i];
+		corners[3][i] = origin[i] + left[i] - up[i];
+	}
+	static const float cornerUv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+	static const int winding[6] = { 0, 1, 3, 3, 1, 2 };
+
+	PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + *cursor;
+	for ( int i = 0; i < 6; i++ )
+	{
+		int c = winding[i];
+		out[i].pos[0] = corners[c][0];
+		out[i].pos[1] = corners[c][1];
+		out[i].pos[2] = corners[c][2];
+		out[i].uv[0] = cornerUv[c][0];
+		out[i].uv[1] = cornerUv[c][1];
+		out[i].color[0] = color[0] / 255.0f;
+		out[i].color[1] = color[1] / 255.0f;
+		out[i].color[2] = color[2] / 255.0f;
+		out[i].color[3] = color[3] / 255.0f;
+	}
+	*cursor += 6;
+}
+
+void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
+{
+	if ( ( s_scenePolys.empty() && s_sceneEntities.empty() ) || !vk.frameActive )
 	{
 		return;
 	}
 
 	VkCommandBuffer cmd = vk.activeCommandBuffer;
 
-	// mvp is the same for every poly this scene (world-space geometry, no
-	// per-entity model matrix like Ghoul2's) - push once rather than per
-	// draw. Push constants aren't tied to whichever pipeline is bound at
-	// push time, only to the layout used by the eventual draw call, and
-	// every variant below shares vk.polyPipelineLayout.
+	// mvp is the same for every poly/sprite this scene (world-space
+	// geometry, no per-entity model matrix like Ghoul2's) - push once
+	// rather than per draw. Push constants aren't tied to whichever
+	// pipeline is bound at push time, only to the layout used by the
+	// eventual draw call, and every variant below shares
+	// vk.polyPipelineLayout.
 	vkCmdPushConstants( cmd, vk.polyPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof( float ) * 16, mvp );
 
-	// Reset once per scene, not once per poly - see POLY_VERTEX_BUFFER_
-	// CAPACITY's comment (tr_local.h): unlike the UI path's per-frame,
-	// many-interleaved-draws cursor, RE_RenderScene draws the whole queue
-	// in one pass here.
+	// Reset once per scene, not once per poly/sprite - see POLY_VERTEX_
+	// BUFFER_CAPACITY's comment (tr_local.h): unlike the UI path's
+	// per-frame, many-interleaved-draws cursor, RE_RenderScene draws the
+	// whole queue in one pass here. Shared by both loops below (rather than
+	// each resetting its own) because both write into the same
+	// vk.polyVertexBuffer during command *recording*, but the GPU only
+	// reads it at *execution* time, after every write below has already
+	// happened - two independently-reset cursors could have the sprite
+	// loop's writes silently clobber data an earlier poly draw call still
+	// needs, the same class of bug documented in README.md's "Live
+	// animation" section for Ghoul2's per-instance skin buffers.
 	uint32_t cursor = 0;
 
 	for ( const VulkanScenePoly &poly : s_scenePolys )
@@ -1035,34 +1120,114 @@ void VK_DrawScenePolys( const float *mvp )
 			}
 		}
 
-		VkPipeline pipeline = vk.polyPipeline;
-		if ( img->blendMode == BLEND_ADDITIVE )
-		{
-			pipeline = vk.polyPipelineAdditive;
-		}
-		else if ( img->blendMode == BLEND_OPAQUE )
-		{
-			pipeline = vk.polyPipelineOpaque;
-		}
-		if ( pipeline != vk.lastBoundPipeline )
-		{
-			vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline );
-			vk.lastBoundPipeline = pipeline;
-		}
-
-		// Reusing img->descriptorSet (built once at upload time against
-		// vk.uiDescriptorSetLayout/vk.uiSampler - VK_UploadImage, tr_image.cpp)
-		// against vk.polyPipelineLayout works because that layout's one set
-		// layout is vk.uiDescriptorSetLayout too - see vkGlobals_t::
-		// polyPipelineLayout's comment (tr_local.h).
-		vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.polyPipelineLayout,
-			0, 1, &img->descriptorSet, 0, nullptr );
-
-		VkDeviceSize offset = (VkDeviceSize)cursor * sizeof( PolyVertex );
-		vkCmdBindVertexBuffers( cmd, 0, 1, &vk.polyVertexBuffer, &offset );
-		vkCmdDraw( cmd, (uint32_t)numOutVerts, 1, 0, 0 );
-
+		VK_DrawPolyRange( cmd, img, cursor, (uint32_t)numOutVerts );
 		cursor += (uint32_t)numOutVerts;
+	}
+
+	// RT_SPRITE (camera-facing billboard) and RT_ORIENTED_QUAD (quad facing
+	// a fixed direction, ent.axis[0]) - both a single quad_stamp using the
+	// entity's own hShader (here: customShader, see R_AddEntitySurfaces'
+	// real dispatch in tr_main.cpp for why it's that field and not hModel),
+	// radius, rotation, and shaderRGBA. Every other refEntityType_t is still
+	// ignored (see s_sceneEntities' comment).
+	//
+	// One-time-ish diagnostic (mirrors VK_DrawGhoul2Entities' own
+	// s_debugEntityLogsRemaining): confirms sprite/quad entities are
+	// actually reaching this function, independent of whether the result is
+	// visually obvious in any one screenshot.
+	static int s_debugSpriteLogsRemaining = 3;
+	int drawnSpriteCount = 0, skippedThirdPersonCount = 0;
+
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_SPRITE && ent.reType != RT_ORIENTED_QUAD )
+		{
+			continue;
+		}
+		// Real R_AddEntitySurfaces (tr_main.cpp) skips these entities
+		// entirely when the current view is third-person-only and not a
+		// portal/mirror ("self blood sprites, talk balloons, etc should not
+		// be drawn in the primary view"). This renderer has no portal/
+		// mirror support (see README.md), so its one and only rendered view
+		// is always that primary, non-portal view - the condition is
+		// unconditionally true here, not situationally skipped.
+		if ( ent.renderfx & RF_THIRD_PERSON )
+		{
+			skippedThirdPersonCount++;
+			continue;
+		}
+		if ( cursor + 6 > POLY_VERTEX_BUFFER_CAPACITY )
+		{
+			break;
+		}
+
+		image_t *img = VK_GetImageByHandle( ent.customShader );
+		if ( !img )
+		{
+			continue;
+		}
+
+		float left[3], up[3];
+		float radius = ent.radius;
+		if ( ent.reType == RT_SPRITE )
+		{
+			// Camera-facing: left/up come from the view's own axes (axis[1]/
+			// axis[2] - see VK_BuildViewMatrix's comment in tr_world.cpp for
+			// why fd->viewaxis uses that same [forward, left, up] layout),
+			// exactly like rd-vanilla's real RB_SurfaceSprite
+			// (tr_surface.cpp) uses backEnd.viewParms.ori.axis[1]/[2].
+			if ( ent.rotation == 0.0f )
+			{
+				VectorScale( fd->viewaxis[1], radius, left );
+				VectorScale( fd->viewaxis[2], radius, up );
+			}
+			else
+			{
+				float ang = (float)M_PI * ent.rotation / 180.0f;
+				float s = sinf( ang ), c = cosf( ang );
+				VectorScale( fd->viewaxis[1], c * radius, left );
+				VectorMA( left, -s * radius, fd->viewaxis[2], left );
+				VectorScale( fd->viewaxis[2], c * radius, up );
+				VectorMA( up, s * radius, fd->viewaxis[1], up );
+			}
+		}
+		else // RT_ORIENTED_QUAD
+		{
+			// Fixed orientation: left/up are perpendiculars of the entity's
+			// own axis[0] (its facing direction), not the camera's - exactly
+			// rd-vanilla's real RB_SurfaceOrientedQuad (tr_surface.cpp),
+			// MakeNormalVectors and all (shared/qcommon/q_math.c - the same
+			// real function, not reimplemented here).
+			MakeNormalVectors( ent.axis[0], left, up );
+			if ( ent.rotation == 0.0f )
+			{
+				VectorScale( left, radius, left );
+				VectorScale( up, radius, up );
+			}
+			else
+			{
+				float ang = (float)M_PI * ent.rotation / 180.0f;
+				float s = sinf( ang ), c = cosf( ang );
+				float tempLeft[3], tempUp[3];
+				VectorScale( left, c * radius, tempLeft );
+				VectorMA( tempLeft, -s * radius, up, tempLeft );
+				VectorScale( up, c * radius, tempUp );
+				VectorMA( tempUp, s * radius, left, up );
+				VectorCopy( tempLeft, left );
+			}
+		}
+
+		uint32_t firstVertex = cursor;
+		VK_EmitQuadStamp( ent.origin, left, up, ent.shaderRGBA, &cursor );
+		VK_DrawPolyRange( cmd, img, firstVertex, 6 );
+		drawnSpriteCount++;
+	}
+
+	if ( s_debugSpriteLogsRemaining > 0 && ( drawnSpriteCount > 0 || skippedThirdPersonCount > 0 ) )
+	{
+		s_debugSpriteLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: sprite/oriented-quad entities: %d drawn, %d skipped (third person)\n",
+			drawnSpriteCount, skippedThirdPersonCount );
 	}
 }
 

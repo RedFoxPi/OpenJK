@@ -322,10 +322,14 @@ void RE_AddRefEntityToScene( const refEntity_t *re );
 // right after this call returns.
 void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts );
 void VK_DrawGhoul2Entities( const float *mvp, int currentTime );
-// Draws every poly queued this scene via RE_AddPolyToScene - see its own
-// comment in tr_model.cpp for the fan-to-triangle-list expansion and
-// per-blend-mode batching.
-void VK_DrawScenePolys( const float *mvp );
+// Draws every poly queued this scene via RE_AddPolyToScene, plus every
+// RT_SPRITE/RT_ORIENTED_QUAD entity queued via RE_AddRefEntityToScene - see
+// its own comment in tr_model.cpp for the fan-to-triangle-list expansion,
+// the quad-stamp math, and why both share one function/vertex-buffer
+// cursor. fd is only used for its viewaxis (camera-facing sprites need the
+// camera's own left/up basis vectors) - mvp is still passed separately
+// since it's already computed by the caller.
+void VK_DrawScenePolys( const float *mvp, const refdef_t *fd );
 void VK_ShutdownGhoul2Models( void );
 // Loads (or returns the cached index of, if already loaded with the same
 // skinHandle) the .glm at fileName. skinHandle (from VK_RegisterSkin, or 0

@@ -827,6 +827,62 @@ game calls" verification rather than a pixel-level "a poly effect actually
 appeared and looked right" one - the latter would need a scene manifest
 entry timed to a specific in-game effect trigger, which doesn't exist yet.
 
+### Sprite and oriented-quad ref entities (tr_model.cpp)
+
+The follow-up to runtime polys: two of the non-`RT_MODEL` `refEntityType_t`
+values `RE_AddRefEntityToScene` accepts now actually draw something instead
+of being silently ignored - `RT_SPRITE` (a quad that always faces the
+camera - muzzle flashes, impact glows, and similar billboarded effects) and
+`RT_ORIENTED_QUAD` (a quad facing a fixed direction, `ent.axis[0]`, instead
+of the camera - decal-like marks). Both are handled inside
+`VK_DrawScenePolys`, not a separate function: a sprite/quad is just a
+quad-shaped `PolyVertex` write into the same scratch vertex buffer runtime
+polys use, drawn through the exact same pipeline/blend-mode selection, so
+there was no reason to duplicate that machinery in a second function - only
+`VK_EmitQuadStamp` (building the 4 corners and writing them as 6 non-indexed
+vertices) and `VK_DrawPolyRange` (bind-pipeline-and-draw for one vertex
+range) are new, and the latter was factored out of the existing poly-fan
+loop too, since it was about to be duplicated a third time.
+
+Corner math is copied, not rederived, from rd-vanilla's real
+`RB_AddQuadStampExt`/`RB_SurfaceSprite`/`RB_SurfaceOrientedQuad`
+(`tr_surface.cpp`): four corners at `origin +-left +-up` (`left`/`up` scaled
+by `ent.radius`, optionally rotated in the quad's own plane by
+`ent.rotation` degrees), triangles `(0,1,3)` and `(3,1,2)`. The one
+real difference between the two types is where `left`/`up` come from:
+`RT_SPRITE` takes them from the *camera's* axes (`refdef_t::viewaxis[1]`/
+`[2]` - the same `[forward, left, up]` layout `VK_BuildViewMatrix` already
+relies on, see its comment in `tr_world.cpp`), so the quad always faces the
+viewer; `RT_ORIENTED_QUAD` takes them from the *entity's* own facing
+(`MakeNormalVectors( ent.axis[0], ... )` - the real shared function from
+`shared/qcommon/q_math.c`, not reimplemented here) so its orientation is
+fixed regardless of camera angle. Color is the entity's `shaderRGBA`,
+constant across all 4 corners, matching rd-vanilla. `RF_THIRD_PERSON`
+entities are skipped unconditionally: rd-vanilla's real
+`R_AddEntitySurfaces` (`tr_main.cpp`) only draws those in a portal/mirror
+view ("self blood sprites, talk balloons, etc should not be drawn in the
+primary view"), and this renderer has no portal/mirror support at all (see
+"What's not implemented yet" below), so its one and only rendered view is
+always that primary view - the real check's condition is unconditionally
+true here rather than something that varies per frame.
+
+A shared vertex-buffer cursor between the poly-fan loop and this one
+(rather than each resetting its own to 0) is deliberate, not an oversight -
+see `VK_DrawScenePolys`'s own comment for why a second reset would silently
+corrupt whichever poly draws were recorded first, the same command-buffer-
+execution-timing bug class documented in "Live animation" above for
+Ghoul2's skin buffers.
+
+**Verified**: clean rebuild, zero warnings. No crash and no Vulkan
+validation errors across all five map-based scenes plus `sp_menu`, no
+visible regression in any screenshot. A one-time-ish debug print (mirroring
+`VK_DrawGhoul2Entities`' own) confirmed it never actually fired across any
+of those captures - same limitation as runtime polys above: none of the
+fixed spawn-time captures happen to catch a moment with an `RT_SPRITE`/
+`RT_ORIENTED_QUAD` entity queued, so this is verified as "compiles, doesn't
+crash, wires up to the real entity queue and the real math" rather than "a
+sprite was seen on screen and looked right."
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -924,6 +980,11 @@ touch this code)
   dedicated pipeline with the same three blend-mode variants (alpha/
   additive/opaque) the UI path has, reusing the UI descriptor-set layout/
   sampler rather than new descriptor infrastructure.
+- `RT_SPRITE` (camera-facing billboard) and `RT_ORIENTED_QUAD`
+  (fixed-direction quad) ref entities - see "Sprite and oriented-quad ref
+  entities" above. Real quad-stamp geometry matching rd-vanilla's corner
+  math and winding exactly, drawn through the same pipeline runtime polys
+  use (no new pipeline needed).
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -975,12 +1036,16 @@ touch this code)
   warping/subdivision (visible seams at box edges), no `RDF_SKYBOXPORTAL`
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
-- Non-Ghoul2 ref entities. `AddRefEntityToScene` is real for Ghoul2
-  (`RT_MODEL`, see "Ghoul2 rendering" above) and runtime polys
-  (`AddPolyToScene`, see "Runtime polys" above) are real too now, but every
-  other `refEntityType_t` (sprites, beams, electricity, oriented quads, ...)
-  is queued and silently ignored at draw time - nothing about those types
-  renders yet.
+- Most non-Ghoul2 ref entity types. `AddRefEntityToScene` is real for
+  Ghoul2 (`RT_MODEL`, see "Ghoul2 rendering" above), runtime polys
+  (`AddPolyToScene`, see "Runtime polys" above), and now `RT_SPRITE`/
+  `RT_ORIENTED_QUAD` (see "Sprite and oriented-quad ref entities" above),
+  but `RT_LINE`, `RT_ELECTRICITY`, `RT_CYLINDER`, `RT_LATHE`, `RT_BEAM`,
+  `RT_SABER_GLOW`, and `RT_CLOUDS` are still queued and silently ignored at
+  draw time - nothing about those types renders yet. (`RT_PORTALSURFACE`
+  isn't a rendering gap: rd-vanilla's real handling of it doesn't draw
+  anything either, it only carries portal placement info - see
+  `R_AddEntitySurfaces`, `tr_main.cpp`.)
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc`, and (for fog shaders specifically, see "3D world
   geometry" above) a top-level `fogparms` line, are read - later stages,
