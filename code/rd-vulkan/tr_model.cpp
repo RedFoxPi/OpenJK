@@ -332,12 +332,12 @@ int VK_RegisterSkin( const char *name )
 
 // Per-frame queue of entities added via RE_AddRefEntityToScene, cleared by
 // RE_ClearScene. RT_MODEL entities carrying a Ghoul2 model are drawn by
-// VK_DrawGhoul2Entities; RT_SPRITE/RT_ORIENTED_QUAD are drawn by
-// VK_DrawScenePolys (same function that draws RE_AddPolyToScene polys - see
-// its comment for why). Every other refEntityType_t (beams, electricity,
-// cylinders, lathes, clouds, lines, saber glow) is still silently ignored,
-// see README.md. Runtime polys (RE_AddPolyToScene) are a separate queue,
-// not a refEntity_t at all - see s_scenePolys below.
+// VK_DrawGhoul2Entities; RT_SPRITE/RT_ORIENTED_QUAD/RT_SABER_GLOW/RT_BEAM
+// are drawn by VK_DrawScenePolys (same function that draws
+// RE_AddPolyToScene polys - see its comment for why). Every other
+// refEntityType_t (electricity, cylinders, lathes, clouds, lines) is still
+// silently ignored, see README.md. Runtime polys (RE_AddPolyToScene) are a
+// separate queue, not a refEntity_t at all - see s_scenePolys below.
 static std::vector<refEntity_t> s_sceneEntities;
 static const size_t MAX_SCENE_ENTITIES = 256;
 
@@ -971,18 +971,29 @@ void RE_AddPolyToScene( qhandle_t hShader, int numVerts, const polyVert_t *verts
 // RE_StretchPic/VK_DrawGhoul2Entities), binds img's descriptor set, and
 // draws vertexCount non-indexed vertices starting at firstVertex within
 // vk.polyVertexBuffer. Shared by the RE_AddPolyToScene fan-expansion loop
-// and the RT_SPRITE/RT_ORIENTED_QUAD quad-stamp loop below - both just
-// differ in how they fill PolyVertex data, not in how they get drawn.
-static void VK_DrawPolyRange( VkCommandBuffer cmd, image_t *img, uint32_t firstVertex, uint32_t vertexCount )
+// and every quad/tube loop below - they only differ in how they fill
+// PolyVertex data, not in how they get drawn. forcedPipeline overrides the
+// img->blendMode lookup entirely when set (VK_NULL_HANDLE, the default,
+// means "look it up normally") - RT_SABER_GLOW and RT_BEAM need this
+// because rd-vanilla's real RB_SurfaceSaberGlow/RB_SurfaceBeam
+// (tr_surface.cpp) both hardcode additive blending via GL_State
+// unconditionally, ignoring whatever the entity's own shader/customShader
+// would have specified.
+static void VK_DrawPolyRange( VkCommandBuffer cmd, image_t *img, uint32_t firstVertex, uint32_t vertexCount,
+	VkPipeline forcedPipeline = VK_NULL_HANDLE )
 {
-	VkPipeline pipeline = vk.polyPipeline;
-	if ( img->blendMode == BLEND_ADDITIVE )
+	VkPipeline pipeline = forcedPipeline;
+	if ( !pipeline )
 	{
-		pipeline = vk.polyPipelineAdditive;
-	}
-	else if ( img->blendMode == BLEND_OPAQUE )
-	{
-		pipeline = vk.polyPipelineOpaque;
+		pipeline = vk.polyPipeline;
+		if ( img->blendMode == BLEND_ADDITIVE )
+		{
+			pipeline = vk.polyPipelineAdditive;
+		}
+		else if ( img->blendMode == BLEND_OPAQUE )
+		{
+			pipeline = vk.polyPipelineOpaque;
+		}
 	}
 	if ( pipeline != vk.lastBoundPipeline )
 	{
@@ -1228,6 +1239,197 @@ void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 		s_debugSpriteLogsRemaining--;
 		ri.Printf( PRINT_ALL, "rd-vulkan: sprite/oriented-quad entities: %d drawn, %d skipped (third person)\n",
 			drawnSpriteCount, skippedThirdPersonCount );
+	}
+
+	// RT_SABER_GLOW - every lightsaber blade's soft glow (the blade core
+	// itself is a separate, already-working RT_MODEL/Ghoul2 or world
+	// surface; this is only the additive halo around it). rd-vanilla's real
+	// RB_SurfaceSaberGlow (tr_surface.cpp) is a short loop of DoSprite calls
+	// (itself just RB_AddQuadStamp with rotation 0, i.e. exactly
+	// VK_EmitQuadStamp with left/up from the *camera's* axes, same as
+	// RT_SPRITE above) marching outward along the blade's own axis[0] from
+	// the tip (ent.saberLength, the same union member as ent.rotation -
+	// see refEntity_t, rd-common/tr_types.h) back to the hilt, growing the
+	// sprite radius slightly each step, plus one final bigger "hilt glow"
+	// sprite at the entity's origin. Both DoSprite and the real code's
+	// GL_Bind/GL_State hardcode tr.whiteImage and additive blending
+	// unconditionally - the entity's own customShader is never resolved or
+	// bound for this reType, so this renderer does the same (vk.whiteImage,
+	// forcedPipeline = vk.polyPipelineAdditive) rather than looking one up
+	// that real vanilla would have ignored anyway.
+	static int s_debugSaberGlowLogsRemaining = 3;
+	int drawnSaberGlowCount = 0;
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_SABER_GLOW )
+		{
+			continue;
+		}
+
+		float radius = ent.radius;
+		float i = ent.saberLength;
+		// Real code's step (radius * 0.65f) only shrinks as far as radius
+		// grows, never reaching zero or flipping sign for any sane
+		// saberLength/radius - but nothing here stops a corrupt or
+		// pathological entity (radius <= 0) from making the step size
+		// non-positive, which would spin i > 0 forever. This cap is a
+		// defensive addition, not part of the real algorithm: real
+		// saberLength/radius values need nowhere near this many segments
+		// (typically a few dozen), so it never triggers in practice.
+		const int kMaxSaberGlowSegments = 256;
+		for ( int seg = 0; seg < kMaxSaberGlowSegments && i > 0.0f; seg++ )
+		{
+			if ( cursor + 6 > POLY_VERTEX_BUFFER_CAPACITY )
+			{
+				break;
+			}
+			float segOrigin[3];
+			VectorMA( ent.origin, i, ent.axis[0], segOrigin );
+			float left[3], up[3];
+			VectorScale( fd->viewaxis[1], radius, left );
+			VectorScale( fd->viewaxis[2], radius, up );
+			uint32_t firstVertex = cursor;
+			VK_EmitQuadStamp( segOrigin, left, up, ent.shaderRGBA, &cursor );
+			VK_DrawPolyRange( cmd, vk.whiteImage, firstVertex, 6, vk.polyPipelineAdditive );
+			i -= radius * 0.65f;
+			radius += 0.017f;
+		}
+
+		if ( cursor + 6 <= POLY_VERTEX_BUFFER_CAPACITY )
+		{
+			// Big hilt sprite - real code re-rolls a small random size each
+			// frame (Q_flrand(0,1)*0.25), a deliberate subtle pulse per its
+			// own comment, not something to make deterministic.
+			float hiltRadius = 5.5f + Q_flrand( 0.0f, 1.0f ) * 0.25f;
+			float left[3], up[3];
+			VectorScale( fd->viewaxis[1], hiltRadius, left );
+			VectorScale( fd->viewaxis[2], hiltRadius, up );
+			uint32_t firstVertex = cursor;
+			VK_EmitQuadStamp( ent.origin, left, up, ent.shaderRGBA, &cursor );
+			VK_DrawPolyRange( cmd, vk.whiteImage, firstVertex, 6, vk.polyPipelineAdditive );
+		}
+		drawnSaberGlowCount++;
+	}
+
+	if ( s_debugSaberGlowLogsRemaining > 0 && drawnSaberGlowCount > 0 )
+	{
+		s_debugSaberGlowLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: RT_SABER_GLOW entities drawn: %d\n", drawnSaberGlowCount );
+	}
+
+	// RT_BEAM - a 6-sided open tube from ent.origin to ent.oldorigin,
+	// flat-colored by ent.skinNum (0/1/2 = red/green/blue, the real
+	// RB_SurfaceBeam switch's exact values copied verbatim) and additively
+	// blended over a hardcoded white texture, same "ignore customShader"
+	// pattern as RT_SABER_GLOW above. NUM_BEAM_SEGS, PerpendicularVector,
+	// and RotatePointAroundVector are all copied from the real
+	// RB_SurfaceBeam (tr_surface.cpp) - the latter two are the real shared
+	// functions (shared/qcommon/q_math.c), not reimplemented here.
+	//
+	// One real quirk preserved verbatim, not "fixed": rd-vanilla's
+	// RB_SurfaceEntity dispatch never applies an entity transform for any
+	// non-RT_MODEL reType (R_RotateForEntity, tr_main.cpp, returns the
+	// plain view/world matrix unchanged for those), and RB_SurfaceBeam's
+	// start_points are never translated by ent.origin (see its own
+	// commented-out `// VectorAdd( start_points[i], origin, ... )`) - so a
+	// real RT_BEAM always renders anchored near world-space (0,0,0),
+	// using only the *direction* from origin to oldorigin, never their
+	// actual position. Surprising, but this renderer's job is to
+	// reproduce rd-vanilla's real behavior, not to guess at a "more
+	// correct" one it doesn't actually have.
+	static int s_debugBeamLogsRemaining = 3;
+	int drawnBeamCount = 0;
+	const int kBeamSegs = 6;
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_BEAM )
+		{
+			continue;
+		}
+
+		float direction[3];
+		VectorSubtract( ent.oldorigin, ent.origin, direction );
+		float normalizedDirection[3];
+		VectorCopy( direction, normalizedDirection );
+		if ( VectorNormalize( normalizedDirection ) == 0.0f )
+		{
+			continue;
+		}
+
+		float perp[3];
+		PerpendicularVector( perp, normalizedDirection );
+		VectorScale( perp, 4.0f, perp );
+
+		float startPoints[kBeamSegs][3], endPoints[kBeamSegs][3];
+		for ( int i = 0; i < kBeamSegs; i++ )
+		{
+			RotatePointAroundVector( startPoints[i], normalizedDirection, perp, ( 360.0f / kBeamSegs ) * i );
+			VectorAdd( startPoints[i], direction, endPoints[i] );
+		}
+
+		// Closed triangle-strip ring, i in [0, kBeamSegs] inclusive (the
+		// extra iteration closes the tube back to segment 0) - matching the
+		// real qglBegin(GL_TRIANGLE_STRIP) loop's vertex order exactly, just
+		// re-expressed as an explicit strip-to-list expansion below since
+		// this renderer's poly path has no strip topology (see poly.vert's
+		// comment). Triangle winding isn't preserved from the strip's
+		// alternating parity because it doesn't need to be: VK_
+		// CreatePolyPipeline disables backface culling entirely for this
+		// pipeline (tr_init.cpp), so both windings render identically.
+		const int numStripVerts = 2 * ( kBeamSegs + 1 );
+		float stripVerts[numStripVerts][3];
+		for ( int i = 0; i <= kBeamSegs; i++ )
+		{
+			VectorCopy( startPoints[i % kBeamSegs], stripVerts[2 * i] );
+			VectorCopy( endPoints[i % kBeamSegs], stripVerts[2 * i + 1] );
+		}
+
+		int numOutVerts = ( numStripVerts - 2 ) * 3;
+		if ( cursor + (uint32_t)numOutVerts > POLY_VERTEX_BUFFER_CAPACITY )
+		{
+			break;
+		}
+
+		byte color[4];
+		switch ( ent.skinNum )
+		{
+			case 1: color[0] = 0;   color[1] = 255; color[2] = 0;   break; // green
+			case 2: color[0] = 128; color[1] = 128; color[2] = 255; break; // blue (0.5, 0.5, 1)
+			case 0:
+			default: color[0] = 255; color[1] = 0; color[2] = 0; break; // red
+		}
+		color[3] = 255;
+
+		PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + cursor;
+		int outIdx = 0;
+		for ( int k = 0; k + 2 < numStripVerts; k++ )
+		{
+			for ( int v = 0; v < 3; v++ )
+			{
+				PolyVertex &dst = out[outIdx++];
+				dst.pos[0] = stripVerts[k + v][0];
+				dst.pos[1] = stripVerts[k + v][1];
+				dst.pos[2] = stripVerts[k + v][2];
+				// UV doesn't matter (flat white texture) - real code never
+				// specified texcoords for this immediate-mode draw either.
+				dst.uv[0] = 0.0f;
+				dst.uv[1] = 0.0f;
+				dst.color[0] = color[0] / 255.0f;
+				dst.color[1] = color[1] / 255.0f;
+				dst.color[2] = color[2] / 255.0f;
+				dst.color[3] = color[3] / 255.0f;
+			}
+		}
+
+		VK_DrawPolyRange( cmd, vk.whiteImage, cursor, (uint32_t)numOutVerts, vk.polyPipelineAdditive );
+		cursor += (uint32_t)numOutVerts;
+		drawnBeamCount++;
+	}
+
+	if ( s_debugBeamLogsRemaining > 0 && drawnBeamCount > 0 )
+	{
+		s_debugBeamLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: RT_BEAM entities drawn: %d\n", drawnBeamCount );
 	}
 }
 

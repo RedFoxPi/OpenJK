@@ -883,6 +883,87 @@ fixed spawn-time captures happen to catch a moment with an `RT_SPRITE`/
 crash, wires up to the real entity queue and the real math" rather than "a
 sprite was seen on screen and looked right."
 
+### Saber glow and beam ref entities (tr_model.cpp)
+
+Two more `refEntityType_t` values, both drawn inside the same
+`VK_DrawScenePolys` (still no reason to split them into their own
+functions - see "Sprite and oriented-quad ref entities" above for why).
+
+`RT_SABER_GLOW` is the soft additive halo around a lightsaber blade (the
+blade core itself is a separate, already-working piece of geometry -
+either a Ghoul2 weapon model or, more likely for the blade specifically,
+something outside this renderer's current scope entirely; this is only the
+glow). Copied from rd-vanilla's real `RB_SurfaceSaberGlow`/`DoSprite`
+(`tr_surface.cpp`): a loop of camera-facing quads (exactly `VK_EmitQuadStamp`
+with the *view's* left/up, i.e. the same math `RT_SPRITE` above already
+uses) marching from the blade tip (`ent.saberLength` - the same union
+member as `ent.rotation`/`ent.endTime`, see `refEntity_t`,
+`rd-common/tr_types.h`) back toward the hilt, with the sprite radius
+growing by a fixed `0.017` each step and the step size itself shrinking as
+that radius grows, plus one larger "hilt glow" sprite at the entity's
+origin whose size re-rolls a small random offset every frame (`Q_flrand`,
+the real shared function - a deliberate subtle pulse per the real code's
+own comment, not something to make deterministic). `RT_BEAM` is a 6-sided
+open tube from `ent.origin` to `ent.oldorigin`, flat-colored by
+`ent.skinNum` (0/1/2 = red/green/blue), built from `PerpendicularVector`
+and `RotatePointAroundVector` (both the real shared functions,
+`shared/qcommon/q_math.c`) exactly like the real `RB_SurfaceBeam`, then
+expanded from a triangle strip into a triangle list on the CPU (matching
+every other geometry source in this renderer - see poly.vert's comment for
+why there's no strip/fan topology anywhere in this pipeline); winding
+parity from the strip isn't preserved through that expansion because the
+poly pipeline has no backface culling to begin with, so it can't matter.
+
+Both hardcode a plain white texture and additive blending unconditionally
+in the real code (`GL_Bind( tr.whiteImage )` /
+`GL_State( GLS_SRCBLEND_ONE | GLS_DSTBLEND_ONE )`), never resolving the
+entity's own `customShader` at all - so this renderer does the same
+(`vk.whiteImage`, a `forcedPipeline` parameter added to the shared
+`VK_DrawPolyRange` helper that skips the normal blend-mode-from-image
+lookup) rather than resolving and binding a shader real vanilla would have
+ignored anyway.
+
+**A real quirk in rd-vanilla, preserved verbatim, not "fixed":**
+`RB_SurfaceBeam`'s `start_points` are never translated by `ent.origin` (see
+its own commented-out `// VectorAdd( start_points[i], origin, ... )`), and
+`R_RotateForEntity` (`tr_main.cpp`) confirms why that isn't a bug elsewhere
+compensating for it: for every non-`RT_MODEL` `reType`, it returns the
+plain view/world matrix unchanged, applying no entity transform at all. So
+a real `RT_BEAM` always renders anchored near world-space `(0,0,0)`, using
+only the *direction* from `origin` to `oldorigin`, never their actual
+position - surprising, but this renderer's job is to reproduce rd-vanilla's
+real behavior, not a "more correct" one it doesn't actually have. (This
+same `R_RotateForEntity` finding also confirms, after the fact, that
+`RT_SPRITE`/`RT_ORIENTED_QUAD`/`RT_SABER_GLOW` writing world-space
+positions directly with no separate per-entity model matrix - which is what
+this renderer already did for all three - was the correct choice, not an
+assumption.)
+
+One genuine defensive addition, not part of the real algorithm: the saber
+glow loop is capped at 256 segments. Real `saberLength`/`radius` values
+need nowhere near that many (typically a few dozen), but nothing in the
+real formula stops a corrupt or pathological entity (`radius <= 0`) from
+making the step size non-positive and looping forever; the cap turns a
+would-be hang into "draws a very long glow and stops," never triggering for
+any real saber.
+
+**Verified**: clean rebuild, zero warnings. No crash and no Vulkan
+validation errors across all five map-based scenes plus `sp_menu`. Debug
+prints (mirroring the sprite/quad ones above) never fired across any
+captured scene - academy1 and vjun1's opening cutscenes (the only scenes
+this harness currently captures) never reach a moment with the player
+holding an ignited saber or any `RT_BEAM` entity in view; manually forcing
+a saber via console commands (`give all` / `weapon 1`) mid-cutscene didn't
+help either, since the player isn't yet controllable and the scripted
+sequence doesn't equip one. So, same honest caveat as the previous two
+sections: this is verified as "compiles, doesn't crash, and the geometry
+math was cross-checked line-by-line against the real formulas (catching and
+fixing one real transcription bug of ours in the process - the saber glow
+loop's decrement was initially written wrong, recomputing `i` from `seg *
+radius` instead of tracking the real code's running subtraction, which
+would have marched the wrong distance along the blade)," not "a glowing
+saber or beam was seen on screen and looked right."
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -985,6 +1066,14 @@ touch this code)
   entities" above. Real quad-stamp geometry matching rd-vanilla's corner
   math and winding exactly, drawn through the same pipeline runtime polys
   use (no new pipeline needed).
+- `RT_SABER_GLOW` (lightsaber blade glow) and `RT_BEAM` (a flat-colored
+  tube between two points) ref entities - see "Saber glow and beam ref
+  entities" above. Real geometry math (including `RT_BEAM`'s real
+  never-translated-by-origin quirk, preserved rather than fixed) drawn
+  through the same pipeline as the other poly/sprite paths, with a
+  `forcedPipeline` override so their real hardcoded-additive-white-texture
+  behavior is reproduced exactly rather than resolving a shader real
+  vanilla ignores.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -1036,15 +1125,16 @@ touch this code)
   warping/subdivision (visible seams at box edges), no `RDF_SKYBOXPORTAL`
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
-- Most non-Ghoul2 ref entity types. `AddRefEntityToScene` is real for
+- A few non-Ghoul2 ref entity types. `AddRefEntityToScene` is real for
   Ghoul2 (`RT_MODEL`, see "Ghoul2 rendering" above), runtime polys
-  (`AddPolyToScene`, see "Runtime polys" above), and now `RT_SPRITE`/
+  (`AddPolyToScene`, see "Runtime polys" above), `RT_SPRITE`/
   `RT_ORIENTED_QUAD` (see "Sprite and oriented-quad ref entities" above),
-  but `RT_LINE`, `RT_ELECTRICITY`, `RT_CYLINDER`, `RT_LATHE`, `RT_BEAM`,
-  `RT_SABER_GLOW`, and `RT_CLOUDS` are still queued and silently ignored at
-  draw time - nothing about those types renders yet. (`RT_PORTALSURFACE`
-  isn't a rendering gap: rd-vanilla's real handling of it doesn't draw
-  anything either, it only carries portal placement info - see
+  and now `RT_SABER_GLOW`/`RT_BEAM` (see "Saber glow and beam ref entities"
+  above), but `RT_LINE`, `RT_ELECTRICITY`, `RT_CYLINDER`, `RT_LATHE`, and
+  `RT_CLOUDS` are still queued and silently ignored at draw time - nothing
+  about those types renders yet. (`RT_PORTALSURFACE` isn't a rendering gap:
+  rd-vanilla's real handling of it doesn't draw anything either, it only
+  carries portal placement info - see
   `R_AddEntitySurfaces`, `tr_main.cpp`.)
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc`, and (for fog shaders specifically, see "3D world
