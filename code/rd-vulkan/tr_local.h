@@ -46,6 +46,12 @@ struct SDL_Window;
 extern cvar_t *r_verbose;
 extern cvar_t *se_language;
 extern cvar_t *com_buildScript;
+// Real rd-vanilla quality slider (tr_init.cpp) - only referenced here for
+// RT_ELECTRICITY's fractal recursion depth (tr_model.cpp), the one thing
+// in this renderer that reads it; see that code's comment for why it's
+// clamped rather than used as raw as rd-vanilla's own "2 - r_lodbias"
+// formula does.
+extern cvar_t *r_lodbias;
 
 #define MAX_VK_IMAGES 4096
 #define VK_FRAMES_IN_FLIGHT 2

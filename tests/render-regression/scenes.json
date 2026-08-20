@@ -1,5 +1,5 @@
 {
-  "//": "Starter scene set for the render-regression harness. Each scene loads a distinct combination of engine/renderer features so that broad code paths get exercised (and can be run under ASan/UBSan for bug-finding, or diffed pixel-for-pixel between two renderer implementations later). 'binary' selects which engine executable+renderer to use: 'sp' = openjk_sp.x86_64 + rdsp-vanilla, 'mp' = openjk.x86_64 + rd-vanilla. Requires the user's own legally-owned game assets; this manifest contains no copyrighted content, only map identifiers.",
+  "//": "Starter scene set for the render-regression harness. Each scene loads a distinct combination of engine/renderer features so that broad code paths get exercised (and can be run under ASan/UBSan for bug-finding, or diffed pixel-for-pixel between two renderer implementations later). 'binary' only selects which engine executable to use - 'sp' = openjk_sp.x86_64, 'mp' = openjk.x86_64; the renderer .so each loads is whatever capture.py's --renderer flag says (rdsp-vanilla/rd-vanilla by default if omitted - see capture.py's own --renderer help for why that's not actually a safe default to rely on). Requires the user's own legally-owned game assets; this manifest contains no copyrighted content, only map identifiers.",
 
   "scenes": [
     {

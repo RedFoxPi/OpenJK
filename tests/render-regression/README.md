@@ -31,11 +31,26 @@ python3 capture.py \
     --bindir  /path/to/install/JediAcademy \
     --basepath /path/to/gamedata \
     --homepath /path/to/gamedata/home \
-    --out /path/to/gamedata/screenshots
+    --out /path/to/gamedata/screenshots \
+    --renderer rd-vulkan
 
 # Just a subset:
-python3 capture.py --bindir ... --basepath ... --homepath ... --out ... --filter sp_academy1
+python3 capture.py --bindir ... --basepath ... --homepath ... --out ... --renderer rd-vulkan --filter sp_academy1
 ```
+
+**Always pass `--renderer`.** `cl_renderer` is `CVAR_ARCHIVE` - once set, it
+persists in `--homepath`'s own saved config across every future run against
+that homepath, and a *fresh* `--homepath` (nothing saved yet) silently falls
+back to the engine's compiled-in default (`rdsp-vanilla` for the `sp`
+binary) - in both cases with no error, regardless of which renderer
+`--bindir` was actually built for. This is exactly the bug that produced a
+run of false-positive "no crash, verified" results during `rd-vulkan`
+development: several checkpoints' capture runs used freshly-created
+homepaths without `--renderer`, so every one of them silently exercised
+`rdsp-vanilla` instead of the renderer actually being tested - not a rare
+edge case, the default behavior with no `--renderer` flag. `--renderer` was
+added specifically to make this impossible to get wrong by omission; there
+is no scenario where skipping it is actually safer than passing it.
 
 To run under ASan/UBSan, point `--bindir` at a build compiled with
 `-fsanitize=address,undefined` and set `ASAN_OPTIONS`/`UBSAN_OPTIONS` in
@@ -99,11 +114,13 @@ frame-0-equivalent snapshot) where simulated time genuinely doesn't matter.
 ## Comparing two renderers (`diff.py`)
 
 Run `capture.py` twice - once per renderer, into separate `--out`
-directories (set `cl_renderer` via `--extra_set` in `scenes.json`, or by
-using two builds with different default renderers) - then compare:
+directories, each with the matching `--renderer` - then compare:
 
 ```sh
 pip install pillow   # only needed for diff.py, not capture.py itself
+
+python3 capture.py --bindir ... --renderer rdsp-vanilla --out screenshots-vanilla ...
+python3 capture.py --bindir ... --renderer rd-vulkan    --out screenshots-vulkan  ...
 
 python3 diff.py --a screenshots-vanilla --b screenshots-vulkan --out diffs
 ```

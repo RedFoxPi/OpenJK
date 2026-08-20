@@ -15,7 +15,12 @@ installer). This script and scenes.json contain no game content.
 Usage:
     python3 capture.py --bindir /path/to/install/JediAcademy \\
         --basepath /path/to/gamedata --homepath /path/to/gamedata/home \\
-        --out /path/to/output/dir
+        --out /path/to/output/dir --renderer rd-vulkan
+
+Pass --renderer (e.g. "rd-vulkan", "rdsp-vanilla", "rd-vanilla") to force
+which renderer .so this run actually exercises. Strongly recommended: it's
+easy to silently test the wrong renderer otherwise, see --renderer's own
+--help text for exactly why.
 
 Exit code is nonzero if any scene failed to launch/screenshot, or if a
 sanitizer (ASan/UBSan) report was found in a scene's log.
@@ -53,7 +58,7 @@ def find_screenshot(homepath: Path, scene_id: str) -> Path | None:
     return None
 
 
-def build_args(scene: dict, basepath: Path, homepath: Path) -> list[str]:
+def build_args(scene: dict, basepath: Path, homepath: Path, renderer: str | None) -> list[str]:
     args = [
         "+set", "fs_basepath", str(basepath),
         "+set", "fs_homepath", str(homepath),
@@ -68,6 +73,17 @@ def build_args(scene: dict, basepath: Path, homepath: Path) -> list[str]:
         "+set", "com_maxfps", "0",
         "+set", "cg_draw2D", "0" if scene.get("map") else "1",
     ]
+    if renderer:
+        # cl_renderer is CVAR_ARCHIVE: once set, it persists in the
+        # homepath's own config and silently survives across runs. Setting
+        # it explicitly here - rather than relying on whatever a homepath
+        # happens to have saved, or the engine's compiled-in default - is
+        # what actually guarantees which renderer this run exercises. A
+        # *fresh* homepath has nothing saved yet and falls back to that
+        # compiled-in default (rdsp-vanilla for the sp binary) regardless
+        # of which renderer --bindir was actually built for - silently
+        # testing the wrong one with no error. See "Known gotcha" below.
+        args += ["+set", "cl_renderer", renderer]
     for k, v in scene.get("extra_set", {}).items():
         args += ["+set", k, str(v)]
     if scene.get("map"):
@@ -79,9 +95,9 @@ def build_args(scene: dict, basepath: Path, homepath: Path) -> list[str]:
 
 
 def run_scene(scene: dict, bindir: Path, basepath: Path, homepath: Path,
-              out_dir: Path, timeout: int, env: dict) -> dict:
+              out_dir: Path, timeout: int, env: dict, renderer: str | None) -> dict:
     exe = bindir / BINARIES[scene["binary"]]["exe"]
-    args = build_args(scene, basepath, homepath)
+    args = build_args(scene, basepath, homepath, renderer)
     log_path = out_dir / f"{scene['id']}.log"
 
     result = {"id": scene["id"], "ok": False, "sanitizer_hits": [], "log": str(log_path)}
@@ -131,6 +147,15 @@ def main():
     ap.add_argument("--scenes", default=Path(__file__).parent / "scenes.json", type=Path)
     ap.add_argument("--filter", default=None, help="Only run scene ids containing this substring")
     ap.add_argument("--timeout", default=60, type=int)
+    ap.add_argument("--renderer", default=None,
+                     help="Renderer .so basename to force via 'cl_renderer' (e.g. 'rd-vulkan', "
+                          "'rdsp-vanilla', 'rd-vanilla'). Strongly recommended: cl_renderer is "
+                          "CVAR_ARCHIVE, so a --homepath that already has one saved from a "
+                          "previous run keeps using it silently, and a *fresh* --homepath falls "
+                          "back to the engine's compiled-in default (rdsp-vanilla for the sp "
+                          "binary) - in both cases with no error, regardless of which renderer "
+                          "--bindir was actually built for. Omitting this only makes sense if "
+                          "you've verified --homepath's saved cl_renderer independently.")
     args = ap.parse_args()
 
     manifest = json.loads(args.scenes.read_text())
@@ -147,7 +172,7 @@ def main():
     for scene in scenes:
         print(f"[{scene['id']}] running ({scene.get('map') or 'menu'})...", flush=True)
         t0 = time.time()
-        r = run_scene(scene, args.bindir, args.basepath, args.homepath, args.out, args.timeout, env)
+        r = run_scene(scene, args.bindir, args.basepath, args.homepath, args.out, args.timeout, env, args.renderer)
         dt = time.time() - t0
         status = "OK" if r["ok"] and not r["sanitizer_hits"] else ("SANITIZER" if r["sanitizer_hits"] else "FAIL")
         print(f"[{scene['id']}] {status} ({dt:.1f}s)")

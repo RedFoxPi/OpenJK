@@ -347,8 +347,10 @@ frames:
   (non-subdivided) skybox box elsewhere in this file.
   **Verified**: no crash on `hoth2` or `vjun1` across several `wait_frames`
   values (`yavin1` still hits the same pre-existing, unrelated ICARUS
-  `Assertion 0 failed` crash on a direct `devmap` documented earlier in this
-  file - not caused by this change, reproduced identically with patches
+  `Assertion 0 failed` crash on a direct `devmap` - see "A capture-harness
+  bug that invalidated a run of 'verified' claims" further below, where
+  this same crash was independently rediscovered and actually root-caused
+  much later; not caused by this change, reproduced identically with patches
   reverted); `vjun1`'s frustum-culled/visible batch split with patches
   enabled (11576/12556, ~92%) closely matches the same map with patches
   skipped (11462/12436, ~92%) across `wait_frames` 30/90/200, so the new
@@ -1008,12 +1010,150 @@ generated" ref entity types - noticed only because writing `RT_LINE`/
 obvious side by side. Fixed by adding the same check both already have
 copy-pasted correctly for `RT_SPRITE`/`RT_ORIENTED_QUAD`.
 
-**Verified**: clean rebuild, zero warnings. No crash and no Vulkan
-validation errors across all five map-based scenes plus `sp_menu`, no
-visible regression in any screenshot. Same honest caveat as every ref
-entity type above: debug prints never fired, so this is verified as
-"compiles, doesn't crash, and the geometry/UV math was cross-checked
-against the real formulas," not "seen on screen and looked right."
+**Verified**: clean rebuild, zero warnings, no crash and no Vulkan
+validation errors on `sp_menu`/`sp_academy1_spawn`/`sp_hoth2_spawn`/
+`sp_vjun1_spawn` (`sp_yavin1_spawn`'s status was unknown at the time this
+was first written - see "A capture-harness bug that invalidated a run of
+'verified' claims" below for why, and for where its real status ended up).
+
+### RT_ELECTRICITY ref entities (tr_model.cpp)
+
+The last non-Ghoul2 `refEntityType_t` implemented so far: procedural
+lightning bolts. By far the most algorithmically involved of this whole
+group - genuinely recursive, not just a fancier quad - so it's split across
+three functions (`VK_DoElectricityBoltSeg`/`VK_ApplyElectricityShape`/
+`VK_EmitElectricityQuad`, `tr_model.cpp`) mirroring rd-vanilla's real
+`DoBoltSeg`/`ApplyShape`/`DoLine2` (`tr_surface.cpp`) one-for-one rather
+than flattened, since the real functions are themselves mutually
+recursive and flattening them would obscure the algorithm's actual shape.
+
+The real algorithm, in order: `RB_SurfaceElectricity` computes the bolt's
+start/end (`ent.origin`/`ent.oldorigin`, with `RF_GROW` optionally
+shortening the visible end point over time - `ent.endTime`/`ent.angles[1]`
+as the grow duration, another case of `refEntity_t`'s union/`angles[]`
+fields being reused per-`reType`, same pattern as `RT_SABER_GLOW`'s
+`saberLength` and `RT_CYLINDER`'s `backlerp` above) and a view-relative
+width axis (the same cross-product construction `RT_LINE` uses); then
+`DoBoltSeg` walks that segment in fixed 16-unit steps, jittering a
+*running* offset (never reset per step) by an amount seeded from the
+entity's own `e->frame` (threaded through the whole recursive call tree by
+pointer, exactly like real code threads `&e->frame` - the one part of this
+algorithm that's per-entity-deterministic rather than using the engine's
+global RNG); each step calls `ApplyShape`, which recursively splits its
+segment into a jittered ternary "fractal" tree (using the *global* RNG,
+`Q_flrand`, for the split points - `CreateShape` inlined rather than kept
+as separate module-level scratch state, since every use happens before any
+recursive call could overwrite it, so a plain local is behaviorally
+identical without needing shared mutable state) down to a real
+recursion-depth cap (`2 - r_lodbias->integer`, i.e. 9 leaf quads at the
+default `r_lodbias 0`), terminating each leaf in one `DoLine2`-equivalent
+quad. `RF_FORKED` bolts can additionally spawn up to 3 child `DoBoltSeg`
+calls (`f_count`, threaded through as `forkBudget` the same way `rngSeed`
+is) biased toward the bolt's real endpoint (`topLevelEnd`, kept separate
+from each recursive call's own local `end` since forking needs the
+*entity's* target, not whichever sub-segment happened to spawn the fork).
+Like `RT_LINE`/`RT_CYLINDER`, this resolves the entity's real
+`customShader` (same `R_AddEntitySurfaces` bucket).
+
+One new registration this needed: `r_lodbias` itself (`tr_init.cpp`) -
+this renderer had never read it before. Real code's `2 - r_lodbias->integer`
+formula isn't clamped, so a very negative `r_lodbias` is a real (if
+self-inflicted) way to make even rd-vanilla generate up to `3^n` leaf
+quads per bolt-walk step; this renderer clamps the effective count to
+`[0,6]` as a defensive addition (same spirit as `RT_SABER_GLOW`'s segment
+cap above) - real quality settings (`r_lodbias` 0-3, only *reducing*
+detail) are nowhere near that range, so the clamp never affects normal use.
+
+**Verified past what every earlier ref-entity type in this document got**,
+because a recursive, RNG-driven algorithm has more ways to go wrong than a
+fixed-shape quad: a synthetic worst-case entity was injected directly
+(temporarily, removed before commit) with every relevant `renderfx` flag
+set at once (`RF_FORKED|RF_TAPERED|RF_GROW`), a 3000-unit bolt, and
+`r_lodbias -3` (well past what the `[0,6]` clamp above exists for) - it
+rendered every frame across a real run with no crash, no hang, and no
+Vulkan validation errors. This is the one ref-entity checkpoint in this
+whole series that got genuine confirmation the code executes correctly
+under real (if synthetic) load, not just "compiles and never got queued by
+any captured scene" - see the next section for why that distinction
+matters more than it should have.
+
+## A capture-harness bug that invalidated a run of "verified" claims
+
+While stress-testing `RT_ELECTRICITY` above, the synthetic entity's debug
+print never appeared in *any* capture, including ones with valid-looking
+screenshots - a strong enough signal to investigate rather than shrug off,
+and it uncovered two compounding bugs, both now fixed:
+
+1. **A stale build artifact.** `cmake --build` for this target actually
+   writes to `build-vulkan/code/rd-vulkan/rd-vulkan_x86_64.so` (matching
+   the source's directory, CMake's default), but a `.so` also existed
+   directly at `build-vulkan/rd-vulkan_x86_64.so` (the build root) from an
+   earlier, one-off manual copy - and every subsequent verification step in
+   this whole ref-entity series copied *that* stale file to the test
+   `gamedata` install instead of the freshly-built one, without noticing,
+   because both paths exist and look equally plausible. Fixed by deleting
+   the stale root copy; going forward, always copy from
+   `build-vulkan/code/rd-vulkan/rd-vulkan_x86_64.so`.
+2. **A capture-harness bug, in `tests/render-regression/capture.py` itself,
+   that made this much worse than a one-off stale binary.** `cl_renderer`
+   is `CVAR_ARCHIVE` - it persists in whichever `--homepath`'s own saved
+   config, across every future run against that homepath - and
+   `capture.py` never set it explicitly. A *fresh* `--homepath` (nothing
+   saved yet, e.g. any brand-new directory) silently falls back to the
+   engine's compiled-in default, `rdsp-vanilla` for the `sp` binary - not
+   `rd-vulkan`, regardless of what `--bindir` was actually built for, and
+   with no error of any kind. Every ref-entity checkpoint's capture runs in
+   this whole series used a freshly-created `--homepath` (a new directory
+   each time), so **every one of those "no crash, no Vulkan validation
+   errors" verifications above was actually run against `rdsp-vanilla`,
+   not `rd-vulkan`, and never touched this renderer's code at all.** Fixed
+   two ways: `capture.py` now takes a `--renderer` flag that sets
+   `cl_renderer` explicitly for every run (see
+   `tests/render-regression/README.md`), and this write-up says so plainly
+   rather than leaving the earlier sections' "Verified" claims looking more
+   solid than they were.
+
+**What this means for the earlier sections' claims, now that they were
+re-run correctly** (correct binary, `--renderer rd-vulkan`, real Xvfb+
+lavapipe headless setup per `code/rd-vulkan/README.md`'s "Testing
+headlessly"): runtime polys, `RT_SPRITE`/`RT_ORIENTED_QUAD`,
+`RT_SABER_GLOW`/`RT_BEAM`, and `RT_LINE`/`RT_CYLINDER` all genuinely do
+build clean and run with no crash and no Vulkan validation errors on
+`sp_menu`/`sp_academy1_spawn`/`sp_hoth2_spawn`/`sp_vjun1_spawn` - the
+"verified" claims in each of those sections above are correct, just
+correct for reasons that were only actually confirmed afterward, not at
+the time each section was originally written. `sp_yavin1_spawn` could not
+be re-verified: see below.
+
+**A second, unrelated pre-existing bug, previously only observed in
+passing and now actually root-caused**: `sp_yavin1_spawn` crashes with
+`rd-vulkan` - `TaskManager.cpp:725: Assertion '0' failed` inside ICARUS
+(`code/icarus/`), the game's cutscene-scripting engine, not this renderer.
+The "Curved surfaces (`MST_PATCH`)" bug entry above already noted this same
+crash in passing (`yavin1` was excluded from that checkpoint's own
+verification for exactly this reason) but never investigated further or
+determined whether it was pre-existing - this is that follow-up. Confirmed
+**not** a regression from any ref-entity checkpoint in this document: it
+reproduces identically as far back as commit `1c4301e` (live
+Ghoul2 animation, the last checkpoint verified in the session before this
+whole ref-entity series began - tested via an isolated `git worktree`
+build of that exact commit), and none of this renderer's ref-entity code
+touches ICARUS or any other game-side state at all - it only reads
+`refEntity_t` data already queued by `RE_AddRefEntityToScene`. The same
+scene runs fine under `rdsp-vanilla`. Given this renderer's known,
+already-documented Ghoul2/animation-timing divergence from vanilla (see
+"Live animation" above - camera cuts and script-completion signals firing
+at different real times than vanilla), the most likely explanation is that
+some G2API return value or animation-completion signal ICARUS depends on
+differs just enough on this scene's specific script to trip a genuinely
+unexpected state - but that's a hypothesis, not a confirmed root cause.
+**Not fixed here** - it's unrelated to every feature in this document, and
+a real investigation (likely needing to trace which specific ICARUS
+command in yavin1's script sequence hits this) is its own separate task.
+Every scene capture and regression claim elsewhere in this document that
+mentions `sp_yavin1_spawn`, `hoth2`, `vjun1`, `academy1` alongside it from
+before this bug was found should be read as "the scenes that didn't crash
+before this was discovered," not as "yavin1 was confirmed fine."
 
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
@@ -1131,6 +1271,13 @@ touch this code)
   `RT_CYLINDER`'s cone/cylinder split and view-distance-adaptive segment
   count match the real code exactly rather than using this renderer's
   usual fixed-subdivision simplification.
+- `RT_ELECTRICITY` (procedural fractal lightning bolts) ref entities - see
+  "RT_ELECTRICITY ref entities" above. The only ref-entity type so far
+  needing genuine recursion (real `DoBoltSeg`/`ApplyShape` copied
+  one-for-one, not flattened) rather than a fixed-shape quad/tube, and the
+  only one stress-tested directly (synthetic worst-case entity, all
+  relevant `renderfx` flags at once) rather than only confirmed to compile
+  and never get queued by a captured scene.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -1187,12 +1334,12 @@ touch this code)
   (`AddPolyToScene`, see "Runtime polys" above), `RT_SPRITE`/
   `RT_ORIENTED_QUAD` (see "Sprite and oriented-quad ref entities" above),
   `RT_SABER_GLOW`/`RT_BEAM` (see "Saber glow and beam ref entities" above),
-  and now `RT_LINE`/`RT_CYLINDER` (see "Line and cylinder ref entities"
-  above), but `RT_ELECTRICITY`, `RT_LATHE`, and `RT_CLOUDS` are still
-  queued and silently ignored at draw time - nothing about those types
-  renders yet. (`RT_PORTALSURFACE` isn't a rendering gap: rd-vanilla's real
-  handling of it doesn't draw anything either, it only carries portal
-  placement info - see
+  `RT_LINE`/`RT_CYLINDER` (see "Line and cylinder ref entities" above), and
+  now `RT_ELECTRICITY` (see "RT_ELECTRICITY ref entities" above), but
+  `RT_LATHE` and `RT_CLOUDS` are still queued and silently ignored at draw
+  time - nothing about those two types renders yet. (`RT_PORTALSURFACE`
+  isn't a rendering gap: rd-vanilla's real handling of it doesn't draw
+  anything either, it only carries portal placement info - see
   `R_AddEntitySurfaces`, `tr_main.cpp`.)
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc`, and (for fog shaders specifically, see "3D world

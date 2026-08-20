@@ -332,12 +332,12 @@ int VK_RegisterSkin( const char *name )
 
 // Per-frame queue of entities added via RE_AddRefEntityToScene, cleared by
 // RE_ClearScene. RT_MODEL entities carrying a Ghoul2 model are drawn by
-// VK_DrawGhoul2Entities; RT_SPRITE/RT_ORIENTED_QUAD/RT_SABER_GLOW/RT_BEAM
-// are drawn by VK_DrawScenePolys (same function that draws
-// RE_AddPolyToScene polys - see its comment for why). Every other
-// refEntityType_t (electricity, cylinders, lathes, clouds, lines) is still
-// silently ignored, see README.md. Runtime polys (RE_AddPolyToScene) are a
-// separate queue, not a refEntity_t at all - see s_scenePolys below.
+// VK_DrawGhoul2Entities; RT_SPRITE/RT_ORIENTED_QUAD/RT_SABER_GLOW/RT_BEAM/
+// RT_LINE/RT_CYLINDER/RT_ELECTRICITY are drawn by VK_DrawScenePolys (same
+// function that draws RE_AddPolyToScene polys - see its comment for why).
+// Only RT_LATHE and RT_CLOUDS are still silently ignored, see README.md.
+// Runtime polys (RE_AddPolyToScene) are a separate queue, not a
+// refEntity_t at all - see s_scenePolys below.
 static std::vector<refEntity_t> s_sceneEntities;
 static const size_t MAX_SCENE_ENTITIES = 256;
 
@@ -1053,6 +1053,227 @@ static void VK_EmitQuadStamp( const float origin[3], const float left[3], const 
 	*cursor += 6;
 }
 
+// RT_ELECTRICITY support (lightning bolts) - see VK_DrawScenePolys' own
+// RT_ELECTRICITY loop for the top-level entry point and README.md's "Lightning
+// (electricity) ref entities" section for the full algorithm explanation.
+// Split into three functions mirroring rd-vanilla's real
+// DoLine2/ApplyShape/DoBoltSeg (tr_surface.cpp) one-for-one, rather than
+// flattened, because the real functions are genuinely mutually recursive
+// (ApplyShape calls itself; DoBoltSeg calls ApplyShape and, when forking,
+// itself) - flattening would obscure the real algorithm's shape rather
+// than simplify it.
+
+// Emits one DoLine2-equivalent quad (2 triangles: (0,1,2),(2,1,3), the same
+// winding DoLine/RT_LINE above use) with two independent widths (sradius at
+// start, eradius at end, since a bolt segment tapers) and two independent
+// texture-coordinate V values - real DoLine2's exact vertex/uv layout,
+// copied rather than reusing VK_EmitQuadStamp (which assumes one shared
+// width and a fixed 0/1 UV square, neither true here). Draws immediately
+// with its own VK_DrawPolyRange call, same one-draw-call-per-emitted-quad
+// style already established for RT_SABER_GLOW above, rather than batching -
+// simplest given how deeply nested and data-dependent this call site is.
+static void VK_EmitElectricityQuad( VkCommandBuffer cmd, image_t *img,
+	const float start[3], const float end[3], const float right[3],
+	float startWidth, float endWidth, float tcStart, float tcEnd,
+	const byte color[4], uint32_t *cursor )
+{
+	if ( *cursor + 6 > POLY_VERTEX_BUFFER_CAPACITY )
+	{
+		// out of per-frame scratch space - drop this and every later quad
+		// rather than corrupt the buffer, same convention as everywhere else.
+		return;
+	}
+
+	float p0[3], p1[3], p2[3], p3[3];
+	VectorMA( start, startWidth, right, p0 );
+	VectorMA( start, -startWidth, right, p1 );
+	VectorMA( end, endWidth, right, p2 );
+	VectorMA( end, -endWidth, right, p3 );
+
+	const float *corners[6] = { p0, p1, p2, p2, p1, p3 };
+	const float cornerUv[6][2] = {
+		{ 0, tcStart }, { 1, tcStart }, { 0, tcEnd },
+		{ 0, tcEnd }, { 1, tcStart }, { 1, tcEnd },
+	};
+
+	PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + *cursor;
+	for ( int i = 0; i < 6; i++ )
+	{
+		out[i].pos[0] = corners[i][0];
+		out[i].pos[1] = corners[i][1];
+		out[i].pos[2] = corners[i][2];
+		out[i].uv[0] = cornerUv[i][0];
+		out[i].uv[1] = cornerUv[i][1];
+		out[i].color[0] = color[0] / 255.0f;
+		out[i].color[1] = color[1] / 255.0f;
+		out[i].color[2] = color[2] / 255.0f;
+		out[i].color[3] = color[3] / 255.0f;
+	}
+
+	VK_DrawPolyRange( cmd, img, *cursor, 6 );
+	*cursor += 6;
+}
+
+// Real ApplyShape (tr_surface.cpp): recursively splits [start,end] into a
+// jittered ternary "fractal" tree - each level picks two random points
+// (CreateShape's sh1/sh2, real Q_flrand values, the global RNG, not
+// e->frame-seeded like DoBoltSeg's jitter below) biased off the ideal
+// straight line and off to either side (rt/up, MakeNormalVectors of the
+// segment's own direction), then recurses into 3 child segments one level
+// shallower, terminating (drawing one quad via VK_EmitElectricityQuad,
+// rd-vanilla's real DoLine2) at count == 0. sradius/eradius are the bolt's
+// width at each end, interpolated 2/3-1/3 into rads1/rads2 for the child
+// segments exactly as the real code does. startPerc/endPerc are texture-V
+// coordinates tracking how far along the *original*, pre-split segment
+// this leaf quad falls, so the texture doesn't restart at every split.
+static void VK_ApplyElectricityShape( VkCommandBuffer cmd, image_t *img,
+	const float start[3], const float end[3], const float right[3],
+	float sradius, float eradius, int count, float startPerc, float endPerc,
+	const byte color[4], uint32_t *cursor )
+{
+	if ( count < 1 )
+	{
+		VK_EmitElectricityQuad( cmd, img, start, end, right, sradius, eradius, startPerc, endPerc, color, cursor );
+		return;
+	}
+
+	// CreateShape, inlined (real tr_surface.cpp keeps sh1/sh2 as module-
+	// static scratch reused across calls; here they're plain locals -
+	// every use happens before any recursive call could overwrite them, so
+	// this is behaviorally identical without needing shared mutable state).
+	float sh1[3], sh2[3];
+	sh1[0] = 0.66f;
+	sh1[1] = 0.08f + Q_flrand( -1.0f, 1.0f ) * 0.02f;
+	sh1[2] = 0.08f + Q_flrand( -1.0f, 1.0f ) * 0.02f;
+	sh2[0] = 0.33f;
+	sh2[1] = -sh1[1] + Q_flrand( -1.0f, 1.0f ) * 0.02f;
+	sh2[2] = -sh1[2] + Q_flrand( -1.0f, 1.0f ) * 0.02f;
+
+	float fwd[3];
+	VectorSubtract( end, start, fwd );
+	float dis = VectorNormalize( fwd ) * 0.7f;
+	float rt[3], up[3];
+	MakeNormalVectors( fwd, rt, up );
+
+	float perc = sh1[0];
+	float point1[3];
+	VectorScale( start, perc, point1 );
+	VectorMA( point1, 1.0f - perc, end, point1 );
+	VectorMA( point1, dis * sh1[1], rt, point1 );
+	VectorMA( point1, dis * sh1[2], up, point1 );
+
+	float rads1 = sradius * 0.666f + eradius * 0.333f;
+	float rads2 = sradius * 0.333f + eradius * 0.666f;
+
+	VK_ApplyElectricityShape( cmd, img, start, point1, right, sradius, rads1, count - 1,
+		startPerc, startPerc * 0.666f + endPerc * 0.333f, color, cursor );
+
+	perc = sh2[0];
+	float point2[3];
+	VectorScale( start, perc, point2 );
+	VectorMA( point2, 1.0f - perc, end, point2 );
+	VectorMA( point2, dis * sh2[1], rt, point2 );
+	VectorMA( point2, dis * sh2[2], up, point2 );
+
+	VK_ApplyElectricityShape( cmd, img, point2, point1, right, rads1, rads2, count - 1,
+		startPerc * 0.333f + endPerc * 0.666f, startPerc * 0.666f + endPerc * 0.333f, color, cursor );
+	VK_ApplyElectricityShape( cmd, img, point2, end, right, rads2, eradius, count - 1,
+		startPerc * 0.333f + endPerc * 0.666f, endPerc, color, cursor );
+}
+
+// Real DoBoltSeg (tr_surface.cpp): walks from start to end in fixed 16-unit
+// steps, each step jittering "off" (a running, ever-accumulating offset -
+// not reset per step) by a random amount seeded from rngSeed (the entity's
+// own e->frame, threaded through by pointer exactly like the real code
+// threads &e->frame - the one part of this whole algorithm that's
+// per-entity-deterministic rather than using the engine's global RNG), then
+// calls VK_ApplyElectricityShape once per step for the segment from the
+// previous step's point to this one. chaosScale is e->angles[0] (RF_FORKED/
+// RF_TAPERED bolts overload angles[0] as a jitter multiplier - see
+// refEntity_t, rd-common/tr_types.h); topLevelEnd is the *entity's* real
+// endpoint (constant across the whole recursive call tree for one entity,
+// unlike the `end` parameter which is only this particular segment's local
+// end) - forking needs it because a fork's random destination is always
+// biased toward the bolt's true target, not toward whatever sub-segment
+// happened to spawn the fork.
+static void VK_DoElectricityBoltSeg( VkCommandBuffer cmd, image_t *img,
+	const float start[3], const float end[3], const float right[3], float radius,
+	const float topLevelEnd[3], int renderfx, float chaosScale,
+	int *rngSeed, int *forkBudget, int lodCount, int recursionDepth,
+	const byte color[4], uint32_t *cursor )
+{
+	float fwd[3];
+	VectorSubtract( end, start, fwd );
+	float dis = VectorNormalize( fwd );
+	if ( dis > 2000.0f )
+	{
+		// "freaky long" - real code's own comment, same clamp.
+		dis = 2000.0f;
+	}
+	float rt[3], up[3];
+	MakeNormalVectors( fwd, rt, up );
+
+	float old[3];
+	VectorCopy( start, old );
+	float oldRadius = radius, newRadius = radius;
+	float off[3] = { 10.0f, 10.0f, 10.0f };
+	float oldPerc = 0.0f;
+
+	// Defensive addition, not part of the real algorithm: real DoBoltSeg's
+	// forking is already self-limiting (forkBudget only ever decreases, 3
+	// per top-level RT_ELECTRICITY entity - see the real f_count), so this
+	// cap on *recursion depth* specifically only matters if forkBudget were
+	// ever raised without also raising this, and guards against a future
+	// edit doing that by accident rather than a real observed problem.
+	const int kMaxForkDepth = 8;
+
+	for ( float i = 16.0f; i <= dis; i += 16.0f )
+	{
+		float perc = ( i + 16.0f > dis ) ? 1.0f : ( i / dis );
+
+		float temp[3];
+		VectorScale( fwd, Q_crandom( rngSeed ) * 3.0f, temp );
+		VectorMA( temp, Q_crandom( rngSeed ) * 7.0f * chaosScale, rt, temp );
+		VectorMA( temp, Q_crandom( rngSeed ) * 7.0f * chaosScale, up, temp );
+		VectorAdd( off, temp, off );
+
+		float cur[3];
+		VectorAdd( start, off, cur );
+		VectorScale( cur, 1.0f - perc, cur );
+		VectorMA( cur, perc, end, cur );
+
+		if ( renderfx & RF_TAPERED )
+		{
+			oldRadius = radius * ( 1.0f - oldPerc * oldPerc );
+			newRadius = radius * ( 1.0f - perc * perc );
+		}
+
+		VK_ApplyElectricityShape( cmd, img, cur, old, right, newRadius, oldRadius,
+			lodCount, 0.0f, 1.0f, color, cursor );
+
+		if ( ( renderfx & RF_FORKED ) && *forkBudget > 0 && recursionDepth < kMaxForkDepth &&
+			Q_random( rngSeed ) > 0.93f && ( 1.0f - perc ) > 0.8f )
+		{
+			( *forkBudget )--;
+
+			float newDest[3];
+			VectorAdd( cur, topLevelEnd, newDest );
+			VectorScale( newDest, 0.5f, newDest );
+			for ( int t = 0; t < 3; t++ )
+			{
+				newDest[t] += Q_crandom( rngSeed ) * 80.0f;
+			}
+
+			VK_DoElectricityBoltSeg( cmd, img, cur, newDest, right, newRadius,
+				topLevelEnd, renderfx, chaosScale, rngSeed, forkBudget, lodCount,
+				recursionDepth + 1, color, cursor );
+		}
+
+		VectorCopy( cur, old );
+		oldPerc = perc;
+	}
+}
+
 void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 {
 	if ( ( s_scenePolys.empty() && s_sceneEntities.empty() ) || !vk.frameActive )
@@ -1676,6 +1897,95 @@ void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 	{
 		s_debugCylinderLogsRemaining--;
 		ri.Printf( PRINT_ALL, "rd-vulkan: RT_CYLINDER entities drawn: %d\n", drawnCylinderCount );
+	}
+
+	// RT_ELECTRICITY - procedural lightning bolts. See VK_DoElectricityBoltSeg/
+	// VK_ApplyElectricityShape/VK_EmitElectricityQuad above for the real
+	// algorithm (copied from rd-vanilla's DoBoltSeg/ApplyShape/DoLine2,
+	// tr_surface.cpp) and README.md's own section for the full explanation.
+	// This top-level entry mirrors the real RB_SurfaceElectricity: compute
+	// start/end (with optional RF_GROW animation shortening the visible
+	// bolt over time), the view-relative "right" width axis (same
+	// cross-product construction as RT_LINE above), reset the fork budget
+	// to 3, and hand off to the recursive walk. Like RT_LINE/RT_CYLINDER,
+	// this resolves the entity's real customShader (same
+	// R_AddEntitySurfaces bucket), not a hardcoded texture.
+	static int s_debugElectricityLogsRemaining = 3;
+	int drawnElectricityCount = 0;
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_ELECTRICITY )
+		{
+			continue;
+		}
+		if ( ent.renderfx & RF_THIRD_PERSON )
+		{
+			continue;
+		}
+
+		image_t *img = VK_GetImageByHandle( ent.customShader );
+		if ( !img )
+		{
+			continue;
+		}
+
+		float start[3];
+		VectorCopy( ent.origin, start );
+
+		float fwd[3];
+		VectorSubtract( ent.oldorigin, start, fwd );
+		float dis = VectorNormalize( fwd );
+
+		float perc = 1.0f;
+		if ( ent.renderfx & RF_GROW )
+		{
+			// Real code divides by e->angles[1] (the bolt's grow duration,
+			// another angles[] field reused as a scalar - see chaosScale's
+			// comment above for the same pattern on angles[0]) with no
+			// zero-guard; real code has this same division-by-zero
+			// exposure (fd->time - e->endTime over 0), so a bolt entity
+			// with angles[1] == 0 is already a malformed one in vanilla,
+			// not a case this renderer needs to defend against specially.
+			perc = 1.0f - ( ent.endTime - fd->time ) / ent.angles[1];
+			if ( perc > 1.0f ) perc = 1.0f;
+			else if ( perc < 0.0f ) perc = 0.0f;
+		}
+
+		float end[3];
+		VectorMA( start, perc * dis, fwd, end );
+
+		float v1[3], v2[3], right[3];
+		VectorSubtract( start, fd->vieworg, v1 );
+		VectorSubtract( end, fd->vieworg, v2 );
+		CrossProduct( v1, v2, right );
+		VectorNormalize( right );
+
+		// r_lodbias isn't clamped in real code's "2 - r_lodbias->integer"
+		// formula (ApplyShape's recursion depth, i.e. 3^lodCount leaf
+		// quads) - a very negative r_lodbias would be a real, if
+		// self-inflicted, way to hang real vanilla too. Clamped here as a
+		// defensive addition (same spirit as RT_SABER_GLOW's segment cap
+		// above): [0,6] still comfortably covers every real quality
+		// setting (r_lodbias is normally 0-3, *reducing* detail) while
+		// capping worst-case leaf count at 3^6 = 729 quads per bolt-walk
+		// step instead of unbounded.
+		int lodCount = 2 - r_lodbias->integer;
+		if ( lodCount < 0 ) lodCount = 0;
+		if ( lodCount > 6 ) lodCount = 6;
+
+		int rngSeed = ent.frame;
+		int forkBudget = 3; // real f_count's per-entity reset value
+
+		VK_DoElectricityBoltSeg( cmd, img, start, end, right, ent.radius,
+			end, ent.renderfx, ent.angles[0], &rngSeed, &forkBudget, lodCount, 0,
+			ent.shaderRGBA, &cursor );
+		drawnElectricityCount++;
+	}
+
+	if ( s_debugElectricityLogsRemaining > 0 && drawnElectricityCount > 0 )
+	{
+		s_debugElectricityLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: RT_ELECTRICITY entities drawn: %d\n", drawnElectricityCount );
 	}
 }
 

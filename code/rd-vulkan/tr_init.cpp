@@ -35,6 +35,7 @@ vkGlobals_t vk;
 cvar_t *r_verbose = nullptr;
 cvar_t *se_language = nullptr;
 cvar_t *com_buildScript = nullptr;
+cvar_t *r_lodbias = nullptr;
 
 extern void R_InitFonts( void );
 extern void R_ShutdownFonts( void );
@@ -1118,6 +1119,9 @@ void R_Init( void )
 	r_verbose = ri.Cvar_Get( "r_verbose", "0", CVAR_CHEAT );
 	se_language = ri.Cvar_Get( "se_language", "english", CVAR_ARCHIVE | CVAR_NORESTART );
 	com_buildScript = ri.Cvar_Get( "com_buildScript", "0", 0 );
+	// Same name/default/flags as rd-vanilla's real registration (tr_init.cpp)
+	// - only RT_ELECTRICITY (tr_model.cpp) reads it in this renderer so far.
+	r_lodbias = ri.Cvar_Get( "r_lodbias", "0", CVAR_ARCHIVE_ND );
 
 	R_ImageLoader_Init();
 	R_InitFonts();
