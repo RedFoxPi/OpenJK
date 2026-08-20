@@ -964,6 +964,57 @@ radius` instead of tracking the real code's running subtraction, which
 would have marched the wrong distance along the blade)," not "a glowing
 saber or beam was seen on screen and looked right."
 
+### Line and cylinder ref entities (tr_model.cpp)
+
+Two more `refEntityType_t` values, same `VK_DrawScenePolys` home as
+everything above. `RT_LINE` is a single flat quad from `ent.origin` to
+`ent.oldorigin` (tracer-like effects) - copied from rd-vanilla's real
+`RB_SurfaceLine`/`DoLine` (`tr_surface.cpp`): its width axis is
+`normalize(cross(origin - vieworg, oldorigin - vieworg))`, not the view's
+own up vector, so the quad always stays edge-on to the camera regardless of
+the line's own orientation, a different (and more specific) camera-relative
+construction than `RT_SPRITE`'s. `RT_CYLINDER` is a tube (or, when one end
+tapers small enough, a cone - the same threshold and cone/cylinder split as
+the real `RB_SurfaceCylinder`'s early-out into `RB_SurfaceCone`) between
+`ent.origin` and `ent.oldorigin`, radius `ent.radius` at the bottom and
+`ent.backlerp` at the top (the real code overloads that field, normally a
+frame-lerp fraction, as the top radius for this one `reType` -
+`RB_SurfaceCylinder`'s own comment flags this too). Segment count is
+view-distance-adaptive in the real code, copied verbatim rather than this
+renderer's usual fixed-subdivision simplification (see "3D world geometry"
+above for that precedent with `MST_PATCH`) - it's cheap per-draw-call math
+here, not an asset-time tessellation choice, so there's no real reason to
+simplify it away.
+
+Unlike `RT_SABER_GLOW`/`RT_BEAM`, both of these resolve and bind the
+entity's real `customShader` (they're in `R_AddEntitySurfaces`' normal
+shader-lookup bucket, `tr_main.cpp`, not the hardcoded-white-additive
+group), so they go through the un-forced `VK_DrawPolyRange` path, same as
+`RT_SPRITE`. `RT_CYLINDER`'s cone and cylinder cases each reconstruct the
+real index buffer's exact vertex references as direct triangle-list
+emission (no index buffer anywhere in this pipeline, per the established
+pattern) - including the real "wrap the last segment's texture coordinate
+back to the first ring" behavior, reproduced by computing each wraparound
+vertex's own UV formula directly rather than literally duplicating a vertex
+the way the real tesselator does, which comes out identical since both
+approaches place the same position with the same UV.
+
+**A real bug in the previous checkpoint, found and fixed while writing
+this one**: `RT_SABER_GLOW` and `RT_BEAM` (added just before this) were
+missing the `RF_THIRD_PERSON` gate that real `R_AddEntitySurfaces`
+(`tr_main.cpp`) applies uniformly to this entire bucket of "simple
+generated" ref entity types - noticed only because writing `RT_LINE`/
+`RT_CYLINDER` right after made the missing check in the two before them
+obvious side by side. Fixed by adding the same check both already have
+copy-pasted correctly for `RT_SPRITE`/`RT_ORIENTED_QUAD`.
+
+**Verified**: clean rebuild, zero warnings. No crash and no Vulkan
+validation errors across all five map-based scenes plus `sp_menu`, no
+visible regression in any screenshot. Same honest caveat as every ref
+entity type above: debug prints never fired, so this is verified as
+"compiles, doesn't crash, and the geometry/UV math was cross-checked
+against the real formulas," not "seen on screen and looked right."
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -1074,6 +1125,12 @@ touch this code)
   `forcedPipeline` override so their real hardcoded-additive-white-texture
   behavior is reproduced exactly rather than resolving a shader real
   vanilla ignores.
+- `RT_LINE` (a camera-edge-on tracer quad) and `RT_CYLINDER` (a tapered
+  tube/cone) ref entities - see "Line and cylinder ref entities" above.
+  Both resolve the entity's real `customShader` like `RT_SPRITE` does;
+  `RT_CYLINDER`'s cone/cylinder split and view-distance-adaptive segment
+  count match the real code exactly rather than using this renderer's
+  usual fixed-subdivision simplification.
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -1125,16 +1182,17 @@ touch this code)
   warping/subdivision (visible seams at box edges), no `RDF_SKYBOXPORTAL`
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
-- A few non-Ghoul2 ref entity types. `AddRefEntityToScene` is real for
+- Two non-Ghoul2 ref entity types. `AddRefEntityToScene` is real for
   Ghoul2 (`RT_MODEL`, see "Ghoul2 rendering" above), runtime polys
   (`AddPolyToScene`, see "Runtime polys" above), `RT_SPRITE`/
   `RT_ORIENTED_QUAD` (see "Sprite and oriented-quad ref entities" above),
-  and now `RT_SABER_GLOW`/`RT_BEAM` (see "Saber glow and beam ref entities"
-  above), but `RT_LINE`, `RT_ELECTRICITY`, `RT_CYLINDER`, `RT_LATHE`, and
-  `RT_CLOUDS` are still queued and silently ignored at draw time - nothing
-  about those types renders yet. (`RT_PORTALSURFACE` isn't a rendering gap:
-  rd-vanilla's real handling of it doesn't draw anything either, it only
-  carries portal placement info - see
+  `RT_SABER_GLOW`/`RT_BEAM` (see "Saber glow and beam ref entities" above),
+  and now `RT_LINE`/`RT_CYLINDER` (see "Line and cylinder ref entities"
+  above), but `RT_ELECTRICITY`, `RT_LATHE`, and `RT_CLOUDS` are still
+  queued and silently ignored at draw time - nothing about those types
+  renders yet. (`RT_PORTALSURFACE` isn't a rendering gap: rd-vanilla's real
+  handling of it doesn't draw anything either, it only carries portal
+  placement info - see
   `R_AddEntitySurfaces`, `tr_main.cpp`.)
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc`, and (for fog shaders specifically, see "3D world

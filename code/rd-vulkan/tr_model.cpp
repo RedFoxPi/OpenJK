@@ -1265,6 +1265,10 @@ void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 		{
 			continue;
 		}
+		if ( ent.renderfx & RF_THIRD_PERSON )
+		{
+			continue;
+		}
 
 		float radius = ent.radius;
 		float i = ent.saberLength;
@@ -1343,6 +1347,10 @@ void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 	for ( const refEntity_t &ent : s_sceneEntities )
 	{
 		if ( ent.reType != RT_BEAM )
+		{
+			continue;
+		}
+		if ( ent.renderfx & RF_THIRD_PERSON )
 		{
 			continue;
 		}
@@ -1430,6 +1438,244 @@ void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 	{
 		s_debugBeamLogsRemaining--;
 		ri.Printf( PRINT_ALL, "rd-vulkan: RT_BEAM entities drawn: %d\n", drawnBeamCount );
+	}
+
+	// RT_LINE - a single flat quad from ent.origin to ent.oldorigin, always
+	// facing the viewer edge-on (its "up"/width axis is perpendicular to
+	// both the view origin and the line itself, not the view's own up
+	// vector - see the cross-product below), used for tracer-like effects.
+	// Unlike RT_SABER_GLOW/RT_BEAM above, this one *does* resolve and bind
+	// the entity's real customShader (it's in R_AddEntitySurfaces' normal
+	// "shader = R_GetShaderByHandle(...)" bucket, tr_main.cpp, not the
+	// hardcoded-white-additive group), so it goes through VK_DrawPolyRange
+	// the same un-forced way RT_SPRITE does. Copied from rd-vanilla's real
+	// RB_SurfaceLine/DoLine (tr_surface.cpp).
+	static int s_debugLineLogsRemaining = 3;
+	int drawnLineCount = 0;
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_LINE )
+		{
+			continue;
+		}
+		if ( ent.renderfx & RF_THIRD_PERSON )
+		{
+			continue;
+		}
+		if ( cursor + 6 > POLY_VERTEX_BUFFER_CAPACITY )
+		{
+			break;
+		}
+
+		image_t *img = VK_GetImageByHandle( ent.customShader );
+		if ( !img )
+		{
+			continue;
+		}
+
+		// "right" (really the line's width axis) = normalize(cross(origin -
+		// vieworg, oldorigin - vieworg)) - real RB_SurfaceLine's exact
+		// construction, not an arbitrary perpendicular: it keeps the quad
+		// edge-on to the viewer regardless of the line's own orientation.
+		float v1[3], v2[3], right[3];
+		VectorSubtract( ent.origin, fd->vieworg, v1 );
+		VectorSubtract( ent.oldorigin, fd->vieworg, v2 );
+		CrossProduct( v1, v2, right );
+		VectorNormalize( right );
+
+		float p0[3], p1[3], p2[3], p3[3];
+		VectorMA( ent.origin, ent.radius, right, p0 );
+		VectorMA( ent.origin, -ent.radius, right, p1 );
+		VectorMA( ent.oldorigin, ent.radius, right, p2 );
+		VectorMA( ent.oldorigin, -ent.radius, right, p3 );
+
+		// Real DoLine's exact vertex/uv order and triangles (0,1,2),(2,1,3).
+		const float *corners[6] = { p0, p1, p2, p2, p1, p3 };
+		const float cornerUv[6][2] = { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 0, 1 }, { 1, 0 }, { 1, 1 } };
+
+		PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + cursor;
+		for ( int i = 0; i < 6; i++ )
+		{
+			out[i].pos[0] = corners[i][0];
+			out[i].pos[1] = corners[i][1];
+			out[i].pos[2] = corners[i][2];
+			out[i].uv[0] = cornerUv[i][0];
+			out[i].uv[1] = cornerUv[i][1];
+			out[i].color[0] = ent.shaderRGBA[0] / 255.0f;
+			out[i].color[1] = ent.shaderRGBA[1] / 255.0f;
+			out[i].color[2] = ent.shaderRGBA[2] / 255.0f;
+			out[i].color[3] = ent.shaderRGBA[3] / 255.0f;
+		}
+
+		VK_DrawPolyRange( cmd, img, cursor, 6 );
+		cursor += 6;
+		drawnLineCount++;
+	}
+
+	if ( s_debugLineLogsRemaining > 0 && drawnLineCount > 0 )
+	{
+		s_debugLineLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: RT_LINE entities drawn: %d\n", drawnLineCount );
+	}
+
+	// RT_CYLINDER - a tapered tube (cone when one end's radius is small
+	// enough, plain cylinder otherwise) between ent.origin (bottom) and
+	// ent.oldorigin (top), radius ent.radius at the bottom and ent.backlerp
+	// at the top (real code overloads backlerp - normally a frame-lerp
+	// fraction - as the top radius for this reType; see refEntity_t,
+	// rd-common/tr_types.h, and RB_SurfaceCylinder's own comment). Like
+	// RT_LINE above, this uses the entity's real customShader (same
+	// R_AddEntitySurfaces bucket), not a hardcoded texture/blend.
+	//
+	// Segment count is view-distance-adaptive in the real code
+	// (RB_SurfaceCylinder/RB_SurfaceCone, tr_surface.cpp) - copied
+	// verbatim rather than this renderer's usual "fixed subdivision"
+	// simplification (see "3D world geometry" in README.md for that
+	// precedent with MST_PATCH) because it's cheap per-draw-call math, not
+	// an asset-time tessellation choice.
+	static int s_debugCylinderLogsRemaining = 3;
+	int drawnCylinderCount = 0;
+	const int kMaxCylinderSegments = 40; // real NUM_CYLINDER_SEGMENTS
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_CYLINDER )
+		{
+			continue;
+		}
+		if ( ent.renderfx & RF_THIRD_PERSON )
+		{
+			continue;
+		}
+
+		image_t *img = VK_GetImageByHandle( ent.customShader );
+		if ( !img )
+		{
+			continue;
+		}
+
+		float midpoint[3];
+		VectorAdd( ent.origin, ent.oldorigin, midpoint );
+		VectorScale( midpoint, 0.5f, midpoint );
+		VectorSubtract( midpoint, fd->vieworg, midpoint );
+		float length = VectorNormalize( midpoint );
+		length *= fd->fov_x / 90.0f;
+
+		int segments = (int)( kMaxCylinderSegments * ( 1.0f - length / 2048.0f ) );
+		if ( segments < 8 ) segments = 8;
+		if ( segments > kMaxCylinderSegments ) segments = kMaxCylinderSegments;
+
+		float vr[3], vu[3];
+		MakeNormalVectors( ent.axis[0], vr, vu );
+		float detail = 360.0f / (float)segments;
+		float texDetail = 1.0f / (float)segments;
+
+		// One end sufficiently tapered -> treat as a cone (half the
+		// triangles, better texture mapping at the point) - same threshold
+		// as the real RB_SurfaceCylinder's early-out into RB_SurfaceCone.
+		bool isCone = !( ent.radius < 0.3f && ent.backlerp < 0.3f ) && ( ent.radius < 0.3f || ent.backlerp < 0.3f );
+
+		int numOutVerts = isCone ? segments * 3 : segments * 6;
+		if ( cursor + (uint32_t)numOutVerts > POLY_VERTEX_BUFFER_CAPACITY )
+		{
+			break;
+		}
+
+		PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + cursor;
+		int outIdx = 0;
+
+		if ( isCone )
+		{
+			float vuScaled[3], base[3], tapered[3];
+			if ( ent.radius < ent.backlerp )
+			{
+				VectorScale( vu, ent.backlerp, vuScaled );
+				VectorCopy( ent.origin, base );
+				VectorCopy( ent.oldorigin, tapered );
+			}
+			else
+			{
+				VectorScale( vu, ent.radius, vuScaled );
+				VectorCopy( ent.origin, tapered );
+				VectorCopy( ent.oldorigin, base );
+			}
+
+			float ring[kMaxCylinderSegments][3];
+			for ( int i = 0; i < segments; i++ )
+			{
+				RotatePointAroundVector( ring[i], ent.axis[0], vuScaled, detail * i );
+				VectorAdd( ring[i], base, ring[i] );
+			}
+
+			// Real indices reference (ring[i], tapered, ring[i+1]) per
+			// segment (ring wraps to ring[0] on the last one) - one
+			// triangle each, the "half as many indices as the cylinder"
+			// the real comment describes.
+			for ( int i = 0; i < segments; i++ )
+			{
+				const float *ringNext = ring[( i + 1 ) % segments];
+				out[outIdx].pos[0] = ring[i][0]; out[outIdx].pos[1] = ring[i][1]; out[outIdx].pos[2] = ring[i][2];
+				out[outIdx].uv[0] = texDetail * i; out[outIdx].uv[1] = 1.0f;
+				outIdx++;
+				out[outIdx].pos[0] = tapered[0]; out[outIdx].pos[1] = tapered[1]; out[outIdx].pos[2] = tapered[2];
+				out[outIdx].uv[0] = texDetail * i + texDetail * 0.5f; out[outIdx].uv[1] = 0.0f;
+				outIdx++;
+				out[outIdx].pos[0] = ringNext[0]; out[outIdx].pos[1] = ringNext[1]; out[outIdx].pos[2] = ringNext[2];
+				out[outIdx].uv[0] = texDetail * ( i + 1 ); out[outIdx].uv[1] = 1.0f;
+				outIdx++;
+			}
+		}
+		else
+		{
+			float vuTop[3], vuBottom[3];
+			VectorScale( vu, ent.backlerp, vuTop );
+			VectorScale( vu, ent.radius, vuBottom );
+
+			float upper[kMaxCylinderSegments][3], lower[kMaxCylinderSegments][3];
+			for ( int i = 0; i < segments; i++ )
+			{
+				RotatePointAroundVector( upper[i], ent.axis[0], vuTop, detail * i );
+				VectorAdd( upper[i], ent.origin, upper[i] );
+				RotatePointAroundVector( lower[i], ent.axis[0], vuBottom, detail * i );
+				VectorAdd( lower[i], ent.oldorigin, lower[i] );
+			}
+
+			// Real indices per segment: (upper[i],lower[i],upper[i+1]) and
+			// (upper[i+1],lower[i],lower[i+1]) - the same ring-quad-to-two-
+			// triangles pattern as RT_BEAM above, just built directly
+			// instead of via a strip.
+			for ( int i = 0; i < segments; i++ )
+			{
+				const float *upperNext = upper[( i + 1 ) % segments];
+				const float *lowerNext = lower[( i + 1 ) % segments];
+				const float *quad[6] = { upper[i], lower[i], upperNext, upperNext, lower[i], lowerNext };
+				float uCoord[6] = { texDetail * i, texDetail * i, texDetail * ( i + 1 ), texDetail * ( i + 1 ), texDetail * i, texDetail * ( i + 1 ) };
+				float vCoord[6] = { 1.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f };
+				for ( int v = 0; v < 6; v++ )
+				{
+					out[outIdx].pos[0] = quad[v][0]; out[outIdx].pos[1] = quad[v][1]; out[outIdx].pos[2] = quad[v][2];
+					out[outIdx].uv[0] = uCoord[v]; out[outIdx].uv[1] = vCoord[v];
+					outIdx++;
+				}
+			}
+		}
+
+		for ( int i = 0; i < numOutVerts; i++ )
+		{
+			out[i].color[0] = ent.shaderRGBA[0] / 255.0f;
+			out[i].color[1] = ent.shaderRGBA[1] / 255.0f;
+			out[i].color[2] = ent.shaderRGBA[2] / 255.0f;
+			out[i].color[3] = ent.shaderRGBA[3] / 255.0f;
+		}
+
+		VK_DrawPolyRange( cmd, img, cursor, (uint32_t)numOutVerts );
+		cursor += (uint32_t)numOutVerts;
+		drawnCylinderCount++;
+	}
+
+	if ( s_debugCylinderLogsRemaining > 0 && drawnCylinderCount > 0 )
+	{
+		s_debugCylinderLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: RT_CYLINDER entities drawn: %d\n", drawnCylinderCount );
 	}
 }
 
