@@ -73,6 +73,29 @@ dark atmospheric lighting/fog, and both the SP and MP renderer code
 copies (`code/rd-vanilla` vs `codemp/rd-vanilla` are separate,
 independently-maintained copies of the same renderer).
 
+**Every map-based scene sets `com_fixedtime` (currently `16`, i.e. a fixed
+16ms/frame simulated timestep) via `extra_set`** - this is what makes
+`wait_frames` mean something comparable across two different renderer
+builds/binaries at all. Without it, `wait_frames` counts *rendered client
+frames*, not elapsed simulated game time: a slower renderer (any software
+rasterizer, or one still early in development) takes longer per frame in
+real wall-clock time, so by the time it's rendered its Nth frame, real-
+time-paced content (NPC animations, scripted camera cuts, ICARUS cutscene
+timing) has advanced far less than it has for a faster renderer at that
+same `wait_frames` value - the two screenshots end up capturing genuinely
+different moments of the scene, not the same moment rendered two ways.
+`com_fixedtime` forces every frame, regardless of how long it actually took
+to render, to advance the simulated clock by exactly that many
+milliseconds - making `wait_frames × com_fixedtime` a precise, renderer-
+speed-independent target instead. This was found and verified empirically,
+not assumed: see `code/rd-vulkan/README.md`'s "Testing headlessly" and
+"Live animation" sections for the investigation (a case where two
+renderers landed on unrelated moments of the same hoth2 cutscene at an
+identical `wait_frames` without this, and matched closely with it) that
+led to adding it here. If you add a scene with a `map`, set it too, unless
+the scene is deliberately testing something time-*independent* (a static
+frame-0-equivalent snapshot) where simulated time genuinely doesn't matter.
+
 ## Comparing two renderers (`diff.py`)
 
 Run `capture.py` twice - once per renderer, into separate `--out`
@@ -95,6 +118,15 @@ enough along that `MATCH` is actually the expected outcome for most scenes -
 right now, with `rd-vulkan`'s `.shader`-script gap (see
 `code/rd-vulkan/README.md`), expect `MAJOR_DIFF` on most non-trivial scenes
 and treat the diff image as a diagnostic, not a pass/fail signal.
+
+**A `MAJOR_DIFF` is only informative if both screenshots are actually of
+the same moment** - see the `com_fixedtime` note above. Scene captures
+taken before `com_fixedtime` was added to `scenes.json` can't be trusted
+to isolate genuine rendering differences from this timing confound; a
+`MAJOR_DIFF` on an old capture pair may partly or entirely be "two
+different points in the same cutscene," not a rendering bug. Re-capture
+with the current `scenes.json` before drawing conclusions from a diff on
+any scene with a `map`.
 
 This is a simple mean-pixel-difference metric, not perceptual/SSIM - good
 enough to catch "obviously broken" (wrong colors, missing geometry, a blank

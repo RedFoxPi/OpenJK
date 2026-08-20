@@ -1046,3 +1046,15 @@ at nearly the same screen position and framing, where without
 of the same script (as they did throughout the earlier hoth2 investigation
 above, before this was discovered). It's `CVAR_CHEAT`-flagged but freely
 settable here since `devmap` auto-enables cheats in SP.
+
+This is no longer just a manual technique for one-off investigations -
+`tests/render-regression/scenes.json` now sets `com_fixedtime` on every
+map-based scene (see that harness's own README for the same explanation
+from the "comparing two captures" side), so any future `capture.py` run
+against this renderer and `rd-vanilla` produces genuinely comparable
+screenshots by default, and `diff.py`'s mean-pixel-difference numbers on
+those scenes reflect real rendering differences rather than an unrelated
+mix of "different rendering" and "different moment of the same script."
+Screenshot pairs captured before this was added to `scenes.json` don't
+have that property and shouldn't be used to draw conclusions about a
+`MAJOR_DIFF`/`MINOR_DIFF` result on any scene with a `map`.
