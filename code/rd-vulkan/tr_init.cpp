@@ -1262,7 +1262,51 @@ qhandle_t RE_RegisterModel( const char *name ) { (void)name; return 1; }
 // models need it to resolve any texture at all, see G2API_InitGhoul2Model
 // below and VulkanSkin's comment in tr_model.cpp.
 qhandle_t RE_RegisterSkin( const char *name ) { return (qhandle_t)VK_RegisterSkin( name ); }
-int RE_GetAnimationCFG( const char *psCFGFilename, char *psDest, int iDestSize ) { (void)psCFGFilename; if (psDest && iDestSize) psDest[0] = 0; return 0; }
+// Real implementation (rd-vanilla's RE_GetAnimationCFG, tr_skin.cpp): reads
+// a *.cfg file (a skeleton's own <name>.cfg, or its animation.cfg fallback)
+// via the filesystem and copies its text into psDest. This was previously a
+// stub that unconditionally reported "file not found" (returned 0 with no
+// filesystem access at all) - which meant NPC_stats.cpp's
+// G_ParseAnimationFile ALWAYS failed to parse every model's animation.cfg,
+// so every animation_t entry in every knownAnimFileSets slot stayed at its
+// zeroed-out init state (numFrames == 0) for the entire life of the process.
+// bg_panimate.cpp's PM_SetAnimFinal checks exactly that
+// (`animations[anim].numFrames==0`) before doing anything else and silently
+// returns if it's true - so this one stub meant NPC_SetAnim's calls into
+// PM_SetAnimFinal were a no-op for every character, every time, with no
+// exceptions - the real root cause of "every character shows the same
+// strange, non-gameplay pose in every screenshot" (see README.md's
+// character-animation investigation section). Not the G2API_GetBoneIndex/
+// per-bone-animation-state bug fixed alongside this one (real, but never
+// actually reached - PM_SetAnimFinal returned here long before getting to
+// the bodyBone/torsBone gates that bug affects), and not the fixedtime
+// cvar-name test-harness bug (real too, but orthogonal - it affects how
+// comparable two *correctly playing* animations are across renderers, not
+// whether animation plays at all). rd-vanilla caches file contents by
+// filename as a documented dev-mode hot-reload convenience, not something
+// correctness depends on - not reproduced here since the caller
+// (G_ParseAnimationFile) already only calls this once per distinct
+// skeletonName per level via its own knownAnimFileSets lookup.
+int RE_GetAnimationCFG( const char *psCFGFilename, char *psDest, int iDestSize )
+{
+	fileHandle_t f;
+	long len = ri.FS_FOpenFileRead( psCFGFilename, &f, qfalse );
+	if ( len <= 0 || !f )
+	{
+		return 0;
+	}
+
+	std::vector<char> buffer( (size_t)len + 1 );
+	ri.FS_Read( buffer.data(), (int)len, f );
+	buffer[(size_t)len] = '\0';
+	ri.FS_FCloseFile( f );
+
+	if ( psDest && iDestSize > 0 )
+	{
+		Q_strncpyz( psDest, buffer.data(), iDestSize );
+	}
+	return (int)strlen( buffer.data() );
+}
 // RE_LoadWorldMap/RE_RenderScene are real implementations in tr_world.cpp,
 // RE_ClearScene/RE_AddRefEntityToScene in tr_model.cpp - not stubs, see
 // README.md for exactly what they draw.
@@ -1610,13 +1654,38 @@ qboolean G2API_GetBoltMatrix( CGhoul2Info_v &ghoul2, const int modelIndex, const
 	return ok ? qtrue : qfalse;
 }
 int G2API_GetGhoul2ModelFlags( CGhoul2Info *ghlInfo ) { (void)ghlInfo; return 0; }
-// game.so's G_StandardHumanoid (g_client.cpp) asserts this is non-null for
-// any Ghoul2 model G2API_InitGhoul2Model reported as successfully loaded
-// (see that function's comment) - it doesn't treat "no skeleton name" as a
-// normal case. Returning the standard player skeleton path is a reasonable
-// stand-in since it's what the overwhelming majority of player/NPC models
-// actually use, and no real skeleton data backs this stub either way.
-char *G2API_GetGLAName( CGhoul2Info *ghlInfo ) { (void)ghlInfo; static char name[] = "models/players/_humanoid/_humanoid.glm"; return name; }
+// Real implementation now (VK_GetGhoul2GLAName, tr_model.cpp) - this used to
+// be a stub hardcoded to always report "models/players/_humanoid/_humanoid"
+// (with a stray ".glm" that wasn't even in the real *.gla naming convention)
+// regardless of ghlInfo, which meant every model - including genuinely
+// non-humanoid ones (droids, creatures with their own skeleton) - had its
+// animation.cfg resolved against the wrong skeleton name in
+// NPC_stats.cpp's G_LoadAnimFileSet/g_client.cpp/g_main.cpp. This didn't
+// visibly break academy1-style all-humanoid scenes (see README.md's
+// character-animation investigation - RE_GetAnimationCFG being a hard
+// always-fails stub was the actual reason *no* animation.cfg loaded there,
+// masking this bug entirely) but would have broken animation.cfg lookup for
+// any non-humanoid Ghoul2 model once that real blocker was fixed.
+//
+// Falls back to the standard humanoid skeleton path (matching this stub's
+// old always-humanoid answer) rather than nullptr when mModel doesn't
+// resolve to a live model+skeleton - ghlInfo->mModel legitimately stays 0
+// for models whose particular skin combination this renderer's simpler skin
+// system fails to resolve any surfaces for (a separate, pre-existing gap -
+// see VK_LoadGhoul2Model's "has no drawable surfaces" case), and
+// g_client.cpp's G_StandardHumanoid asserts this is always non-null with no
+// null-safe fallback of its own - unlike NPC_stats.cpp's G_LoadAnimFileSet,
+// which already treats a null GLAName as an expected "take a guess" case.
+char *G2API_GetGLAName( CGhoul2Info *ghlInfo )
+{
+	static char fallback[] = "models/players/_humanoid/_humanoid";
+	if ( !ghlInfo )
+	{
+		return fallback;
+	}
+	const char *name = VK_GetGhoul2GLAName( ghlInfo->mModel );
+	return name ? const_cast<char *>( name ) : fallback;
+}
 int G2API_GetParentSurface( CGhoul2Info *ghlInfo, const int index ) { (void)ghlInfo; (void)index; return -1; }
 qboolean G2API_GetRagBonePos( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t pos, vec3_t entAngles, vec3_t entPos, vec3_t entScale ) { (void)ghoul2; (void)boneName; (void)entAngles; (void)entPos; (void)entScale; VectorClear( pos ); return qfalse; }
 int G2API_GetSurfaceIndex( CGhoul2Info *ghlInfo, const char *surfaceName ) { (void)ghlInfo; (void)surfaceName; return -1; }

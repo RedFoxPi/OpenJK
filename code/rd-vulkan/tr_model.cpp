@@ -596,6 +596,21 @@ int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName )
 	return -1;
 }
 
+const char *VK_GetGhoul2GLAName( int modelCacheIndex )
+{
+	if ( modelCacheIndex <= 0 || (size_t)modelCacheIndex >= s_ghoul2Models.size() )
+	{
+		return nullptr;
+	}
+	int skeletonIndex = s_ghoul2Models[modelCacheIndex].skeletonIndex;
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return nullptr;
+	}
+	const mdxaHeader_t *hdr = (const mdxaHeader_t *)s_skeletons[skeletonIndex].fileData.data();
+	return hdr->name;
+}
+
 bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t *out )
 {
 	if ( modelCacheIndex <= 0 || (size_t)modelCacheIndex >= s_ghoul2Models.size() || !out )

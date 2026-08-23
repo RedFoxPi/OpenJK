@@ -690,6 +690,17 @@ The follow-up to the above: `G2API_SetBoneAnim` and friends now really
 work, so a model instance plays the animation the game actually asked for,
 advancing over real time, instead of a permanently frozen frame 0.
 
+**Caveat added much later, see "Character animation investigation: three
+real bugs, and a wrong conclusion corrected" below**: everything in this
+section describes the frame-advance machinery working correctly in
+isolation, which it does - but for a long time afterward, none of it was
+ever actually being exercised during a real playthrough, because a separate
+bug (`RE_GetAnimationCFG` unconditionally reporting every `animation.cfg` as
+missing) meant the game's own `NPC_SetAnim`/`PM_SetAnimFinal` call chain
+that would invoke `G2API_SetBoneAnim` always silently no-opped before ever
+reaching it. Every character kept showing the same non-gameplay pose the
+whole time this checkpoint's own verification believed it had fixed that.
+
 Scope, precisely - **one whole-skeleton animation track per model
 instance**, not the real engine's independently-blended per-bone-subtree
 tracks. rd-vanilla's real game code calls `G2API_SetBoneAnim` separately
@@ -770,7 +781,7 @@ playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
 **Correction, found much later (see "Character animation investigation:
-two real bugs, one test-harness and one functional" below): the specific
+three real bugs, and a wrong conclusion corrected" below): the specific
 `wait 100`/`wait 400` observations above can't be trusted.** `com_fixedtime`
 (used to control for
 render-speed timing skew here) is not this cvar's real registered name -
@@ -1235,8 +1246,25 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
-## Character animation investigation: two real bugs, one test-harness and
-one functional
+## Character animation investigation: three real bugs, and a wrong
+conclusion corrected
+
+**Bottom line up front, since the investigation below initially got this
+wrong: every NPC in every scene stood in the same non-gameplay pose because
+animation was never being applied to *any* character, *ever* - not a
+test-harness timing artifact.** The actual cause was `RE_GetAnimationCFG`
+(below) unconditionally reporting "file not found" for every `animation.cfg`
+in the game, which made every character's per-anim frame data permanently
+zeroed out, which made `PM_SetAnimFinal` (`bg_panimate.cpp`) silently no-op
+on literally every `NPC_SetAnim` call it ever received. This was caught
+because a user directly disputed an earlier, wrong conclusion in this same
+section (see "What this does and doesn't mean", further down, for that
+history) by pointing out a specific, correct, falsifiable observation: the
+same strange pose appeared on *every* character in *every* screenshot, which
+a pure test-harness timing artifact cannot produce (that would show
+different-but-still-plausible poses at different wrong moments, not one
+constant impossible one) but a "no animation ever applies" bug produces
+exactly.
 
 A direct, side-by-side `rd-vanilla` vs. this renderer comparison at
 matched simulated time (following up on the "Live animation" checkpoint's
@@ -1316,19 +1344,84 @@ points in the same script - not a rendering or animation bug. Fixed in
 and in every `com_fixedtime` reference across this file and
 `tests/render-regression/README.md`.
 
-**What this does and doesn't mean for character animation quality**:
-with `fixedtime` actually working, a fresh `sp_academy1_spawn` diff still
-isn't a pixel `MATCH` (`MAJOR_DIFF`, ~23% mean difference) - but visually
-inspecting the diff image shows the *same* camera cut, the *same* rough
-NPC layout and poses, with the difference concentrated in lighting/texture
-edges (the already-documented `.shader`-script gap, not different
-geometry or poses). That's a fundamentally different, far less alarming
-picture than "the two renderers are showing different scenes entirely."
-This doesn't mean animation is pixel-perfect - the single-track,
-no-blend, no-sub-frame-interpolation simplifications documented in "Live
-animation" above are all still real and still there - but the *severity*
-originally observed was substantially a test-methodology artifact, not
-proof of a severe animation bug beyond what was already known and scoped.
+**What this does and doesn't mean for character animation quality (original,
+wrong conclusion, kept here for the record)**: with `fixedtime` actually
+working, a fresh `sp_academy1_spawn` diff still isn't a pixel `MATCH`
+(`MAJOR_DIFF`, ~23% mean difference) - but visually inspecting the diff image
+showed the *same* camera cut and *plausible-looking* NPC layout, so this
+write-up originally concluded the severity of the character-animation
+problem was "substantially a test-methodology artifact." **That conclusion
+was wrong, and a user correctly called it out**: every character's pose
+looked plausible in isolation but was actually *the same fixed pose*, not
+gameplay animation - visible only by comparing multiple screenshots of
+different scenes/moments side by side and noticing the pose never changes,
+which a single before/after diff of one scene doesn't surface. Chasing that
+down properly (rather than re-asserting the `fixedtime` explanation) found
+the real cause:
+
+**Bug 3 (functional, in this renderer, the actual root cause):
+`RE_GetAnimationCFG` always reported the file as not found.** Every
+character's per-animation frame data (`firstFrame`/`numFrames`/`loopFrames`/
+`frameLerp` for each of `MAX_ANIMATIONS` named animations, e.g. `BOTH_STAND1`,
+`BOTH_RUN1`, ...) comes from parsing a model's `animation.cfg` -
+`NPC_stats.cpp`'s `G_ParseAnimationFile` reads it via `gi.RE_GetAnimationCFG`,
+a renderer entry point (real implementation: `rd-vanilla`'s `tr_skin.cpp`,
+which opens the file via `ri.FS_FOpenFileRead`/`FS_Read` and returns its
+text). This renderer's version was `{ return 0; }` unconditionally, with no
+filesystem access at all - so `G_ParseAnimationFile` always took its
+"couldn't read the file" early-out, leaving every `animation_t` entry in
+every `level.knownAnimFileSets` slot at its zeroed init state
+(`numFrames == 0`). `bg_panimate.cpp`'s `PM_SetAnimFinal` - the function
+every `NPC_SetAnim` call in the game funnels through - checks exactly that
+(`if (animations[anim].numFrames==0) { ...; return; }`) essentially first
+thing, before it ever gets to the per-region `bodyBone`/`torsBone` logic Bug
+1 above fixed. So this one stub meant **every** `NPC_SetAnim` call for
+**every** character, for the entire life of the process, silently did
+nothing - confirmed empirically by temporarily instrumenting that exact
+early-return in a debug build of the game module (`jagamex86_64.so`) and
+seeing it fire on 100% of `PM_SetAnimFinal` calls in an academy1 run, never
+once falling through to the code that actually plays an animation. Fixed by
+implementing `RE_GetAnimationCFG` for real (`tr_init.cpp`): reads the file
+via `ri.FS_FOpenFileRead`/`FS_Read`/`FS_FCloseFile` (the same `ri` entry
+points already used elsewhere in this renderer) and copies its text into the
+caller's buffer, matching rd-vanilla's contract exactly. (rd-vanilla also
+caches file contents by filename as a documented dev-mode hot-reload
+convenience - not reproduced here, since `G_ParseAnimationFile` already only
+calls this once per distinct skeleton name per level via its own
+`knownAnimFileSets` lookup, so the cache is a performance nicety rather than
+something correctness depends on.)
+
+Fixing this exposed a second, smaller pre-existing gap in the same
+subsystem: `G2API_GetGLAName` (used by `G_LoadAnimFileSet` and others to
+find *which* `animation.cfg` to parse for a given model) was hardcoded to
+always report `"models/players/_humanoid/_humanoid.glm"` regardless of the
+actual model - harmless by accident for academy1-style all-humanoid scenes
+(every character happens to want that exact skeleton name anyway) but wrong
+for any non-humanoid Ghoul2 model (droids, creatures with their own
+skeleton), and immaterial either way while `RE_GetAnimationCFG` was
+guaranteed to fail regardless of which filename it was asked for. Fixed
+alongside Bug 3: `G2API_GetGLAName` now resolves the real `.gla` name via a
+new `VK_GetGhoul2GLAName` (reads `mdxaHeader_t::name` straight out of the
+already-resident skeleton file data, `tr_model.cpp`), falling back to the
+standard humanoid path only when a model's particular skin combination
+failed to resolve any drawable surfaces at all (`ghlInfo->mModel == 0`) -
+`g_client.cpp`'s `G_StandardHumanoid` asserts this call never returns null,
+so a bare `nullptr` on that pre-existing, separate skin-resolution gap
+would have turned a already-known cosmetic issue into a hard crash instead
+of leaving it exactly as visible (or not) as it was before.
+
+**What this actually means for character animation quality**: with all
+three bugs fixed, `sp_academy1_spawn` now shows NPCs in varied, distinct
+poses matching the general character of rd-vanilla's same cutscene moment
+(a sparring/training scene - some standing, some walking, some down) instead
+of one identical frozen pose repeated on every model. It is still not a
+pixel `MATCH` against rd-vanilla - the single-track, no-blend,
+no-sub-frame-interpolation simplifications documented in "Live animation"
+above are all still real and still there, and the specific choreographed
+beats of a scripted combat sequence won't line up frame-for-frame with
+vanilla's real multi-track blended timing - but animation is now actually
+*playing*, which it was not doing at all before this fix, on any character,
+in any scene, ever.
 
 **One thing this investigation explicitly ruled out**: `sp_yavin1_spawn`'s
 pre-existing ICARUS crash (documented above) was hypothesized to be
@@ -1652,8 +1745,8 @@ verified after the fact, but the wrong key (`com_fixedtime`) is what ended
 up permanently baked into `tests/render-regression/scenes.json`'s
 automation - and went undetected for a long time, because `+set` silently
 creates a new, harmless-looking, entirely unread cvar for any unrecognized
-name rather than erroring. See "Character animation investigation: two
-real bugs, one test-harness and one functional" further below for the full
+name rather than erroring. See "Character animation investigation: three
+real bugs, and a wrong conclusion corrected" further below for the full
 account of how this was finally caught, what it actually changed once
 fixed, and why the specific hoth2/academy1 screenshots this section used
 to cite as "verified" matches are no longer cited here - they can't be

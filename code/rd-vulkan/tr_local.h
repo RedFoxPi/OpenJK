@@ -358,6 +358,19 @@ int VK_RegisterSkin( const char *name );
 // (leaving *out untouched) on any invalid index.
 int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName );
 bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t *out );
+// The .gla's own recorded name (mdxaHeader_t::name, e.g.
+// "models/players/_humanoid/_humanoid" - no extension), read straight out
+// of VulkanSkeleton::fileData (kept resident for exactly this kind of
+// on-demand header access - see that field's comment). Backs
+// G2API_GetGLAName below; real callers (NPC_stats.cpp's G_LoadAnimFileSet,
+// g_client.cpp, g_main.cpp) use this to find a model's animation.cfg by
+// skeleton name, so a wrong or hardcoded-always-"_humanoid" answer here
+// silently breaks animation.cfg lookup for every non-humanoid model
+// (droids, creatures) even once real per-model resolution is otherwise
+// working - see G2API_GetGLAName's own comment (tr_init.cpp). Returns
+// nullptr for an invalid modelCacheIndex, same convention as
+// VK_FindGhoul2Bone's -1.
+const char *VK_GetGhoul2GLAName( int modelCacheIndex );
 // Computes every bone's object-space pose matrix for one instance right
 // now (see VK_ComputeGhoul2Pose's own comment in tr_model.cpp for the real,
 // verified-against-rd-vanilla math, the per-bone hierarchy-inheritance
