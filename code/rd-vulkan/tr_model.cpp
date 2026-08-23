@@ -754,31 +754,66 @@ static int VK_GetGhoul2BonePoolIndex( const mdxaHeader_t *header, int frame, int
 	return ( index->iIndex[2] << 16 ) + ( index->iIndex[1] << 8 ) + index->iIndex[0];
 }
 
-// Computes every bone's object-space pose matrix for one animation frame of
-// one skeleton - the input to both mesh skinning (VK_SkinGhoul2Model, added
-// in a follow-up commit) and (eventually) a real, animated
-// G2API_GetBoltMatrix. No blending between two frames/animations, no
-// per-bone angle overrides, no ragdoll, no smoothing - see README.md for
-// the deliberate scope cut versus rd-vanilla's real, much larger
-// CBoneCache/G2_TransformBone (tr_ghoul2.cpp).
-//
-// Deliberately NOT using mdxaSkel_t::BasePoseMat/BasePoseMatInv anywhere in
-// this path, even though that looks suspicious at first glance for
-// something computing an object-space pose - confirmed against
-// rd-vanilla's real mesh-skinning code (R_AddGHOULSurfaces, tr_ghoul2.cpp):
-// it applies CBoneCache::EvalRender()'s result - exactly this function's
-// per-bone hierarchy composition, with no BasePoseMatInv step - directly to
-// mdxmVertex_t::vertCoords. BasePoseMat/BasePoseMatInv are only used
-// elsewhere for bolt queries against a fixed reference pose and an
-// optional, cvar-gated "unsquash" renormalization pass - not the ordinary
-// animated-mesh-skinning path this function feeds.
+// Everything VK_ComputeGhoul2BoneRecursive needs to know to compose one
+// bone's *local* delta matrix for this draw - the output of running
+// rd-vanilla's real G2_TimingModel (see VK_Ghoul2TimingModel below) plus,
+// when a blend is in progress, the frozen old-animation pose to cross-fade
+// from. Two-frame sub-frame interpolation (currentFrame/newFrame/backlerp)
+// and animation-to-animation blending (blendFrame/blendLerpFrame/
+// blendWeight) are both real, verified-against-rd-vanilla features now, not
+// scope cuts - see VK_ResolveGhoul2BonePose's comment for how this is
+// filled in, and VK_ComputeGhoul2BoneRecursive for exactly how these fields
+// combine (mirrors G2_TransformBone's tbone[0..5] arithmetic, tr_ghoul2.cpp).
+struct VulkanGhoul2BonePose
+{
+	int currentFrame = 0;
+	int newFrame = 0;
+	float backlerp = 0.0f; // weight for newFrame; (1-backlerp) for currentFrame
+	bool hasBlend = false;
+	int blendFrame = 0;      // floor of the old animation's captured position
+	int blendLerpFrame = 0;  // the old animation's captured "next" frame
+	float blendFrameLerp = 0.0f; // fractional part of the captured position
+	float blendWeight = 0.0f;    // 0 = fully old pose, 1 = fully new pose
+};
+
 // Defined further below, alongside the rest of the live per-bone animation
 // state it reads (VulkanGhoul2AnimState/s_ghoul2AnimState) - forward
 // declared here since VK_ComputeGhoul2Pose needs it and this function
 // (bone-matrix composition) predates that state in file order.
-static int VK_ResolveGhoul2BoneFrame( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime );
+static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime );
 
-static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdxaHeader_t *header, const std::vector<int> &boneFrame,
+// Uncompresses one bone's pool entry for one frame - just
+// VK_GetGhoul2BonePoolIndex + MC_UnCompressQuat, factored out since the
+// blend/lerp math below needs up to four of these per bone instead of one.
+static void VK_UncompressGhoul2Bone( const mdxaHeader_t *header, int numFrames, int frame, int bone, mdxaBone_t &out )
+{
+	if ( frame < 0 || frame >= numFrames )
+	{
+		frame = 0;
+	}
+	const mdxaCompQuatBone_t *pool = (const mdxaCompQuatBone_t *)( (const byte *)header + header->ofsCompBonePool );
+	int poolIndex = VK_GetGhoul2BonePoolIndex( header, frame, bone );
+	MC_UnCompressQuat( out.matrix, pool[poolIndex].Comp );
+}
+
+// out = (1-bWeight)*a + bWeight*b, component-wise over the whole 3x4
+// matrix - exactly rd-vanilla's real per-component "backlerp*X +
+// frontlerp*Y" loops (G2_TransformBone), not a quaternion slerp; the real
+// engine does the same simplification, so this isn't a corner cut relative
+// to it.
+static void VK_LerpGhoul2BoneMatrix( mdxaBone_t &out, const mdxaBone_t &a, const mdxaBone_t &b, float bWeight )
+{
+	float aWeight = 1.0f - bWeight;
+	const float *fa = &a.matrix[0][0];
+	const float *fb = &b.matrix[0][0];
+	float *fo = &out.matrix[0][0];
+	for ( int i = 0; i < 12; i++ )
+	{
+		fo[i] = aWeight * fa[i] + bWeight * fb[i];
+	}
+}
+
+static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdxaHeader_t *header, const std::vector<VulkanGhoul2BonePose> &bonePose,
 	int boneIndex, std::vector<mdxaBone_t> &outBones, std::vector<bool> &computed )
 {
 	if ( computed[boneIndex] )
@@ -786,10 +821,47 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 		return;
 	}
 
+	const VulkanGhoul2BonePose &pose = bonePose[boneIndex];
+	int numFrames = skel.numFrames;
+
+	// New animation's pose right now - a straight uncompress if this frame
+	// falls exactly on a whole frame (backlerp == 0, e.g. a paused anim or
+	// one that just started), otherwise interpolated between currentFrame
+	// and newFrame by backlerp - mirrors G2_TransformBone's `if
+	// (!TB.backlerp)` fast path versus its general two-frame lerp branch.
+	mdxaBone_t newPose;
+	if ( pose.backlerp == 0.0f )
+	{
+		VK_UncompressGhoul2Bone( header, numFrames, pose.currentFrame, boneIndex, newPose );
+	}
+	else
+	{
+		mdxaBone_t a, b;
+		VK_UncompressGhoul2Bone( header, numFrames, pose.newFrame, boneIndex, a );
+		VK_UncompressGhoul2Bone( header, numFrames, pose.currentFrame, boneIndex, b );
+		VK_LerpGhoul2BoneMatrix( newPose, b, a, pose.backlerp );
+	}
+
 	mdxaBone_t delta;
-	const mdxaCompQuatBone_t *pool = (const mdxaCompQuatBone_t *)( (const byte *)header + header->ofsCompBonePool );
-	int poolIndex = VK_GetGhoul2BonePoolIndex( header, boneFrame[boneIndex], boneIndex );
-	MC_UnCompressQuat( delta.matrix, pool[poolIndex].Comp );
+	if ( pose.hasBlend )
+	{
+		// The previous animation's pose, frozen at the exact continuous
+		// frame position it was at when this new animation started -
+		// captured once (VK_SetGhoul2BoneAnim) and never re-evaluated
+		// over time, matching rd-vanilla's real G2_Set_Bone_Anim_Index/
+		// G2_TransformBone: interpolating blendFrame/blendLerpFrame by
+		// blendFrameLerp here reproduces that snapshot every draw, not a
+		// live second animation.
+		mdxaBone_t oldA, oldB, oldPose;
+		VK_UncompressGhoul2Bone( header, numFrames, pose.blendFrame, boneIndex, oldA );
+		VK_UncompressGhoul2Bone( header, numFrames, pose.blendLerpFrame, boneIndex, oldB );
+		VK_LerpGhoul2BoneMatrix( oldPose, oldA, oldB, pose.blendFrameLerp );
+		VK_LerpGhoul2BoneMatrix( delta, oldPose, newPose, pose.blendWeight );
+	}
+	else
+	{
+		delta = newPose;
+	}
 
 	int parent = skel.bones[boneIndex].parent;
 	if ( parent < 0 )
@@ -798,7 +870,7 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 	}
 	else
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, boneFrame, parent, outBones, computed );
+		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, parent, outBones, computed );
 		VK_Multiply3x4Matrix( &outBones[boneIndex], &outBones[parent], &delta );
 	}
 	computed[boneIndex] = true;
@@ -823,25 +895,20 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int cu
 	std::vector<bool> computed( numBones, false );
 
 	// Each bone picks up whichever track actually controls it (itself or
-	// the nearest ancestor with one set - see VK_ResolveGhoul2BoneFrame's
+	// the nearest ancestor with one set - see VK_ResolveGhoul2BonePose's
 	// comment) *before* the hierarchy composition pass below, so a child
 	// bone's parent is composed using the parent's own (possibly
-	// different) resolved frame, not the child's - exactly the real
-	// engine's per-region behavior, not a single shared frame applied
-	// uniformly to every bone like this function did before.
-	std::vector<int> boneFrame( numBones );
+	// different) resolved pose, not the child's - exactly the real
+	// engine's per-region behavior, not a single flattened frame applied
+	// uniformly to every bone.
+	std::vector<VulkanGhoul2BonePose> bonePose( numBones );
 	for ( int i = 0; i < numBones; i++ )
 	{
-		int frame = VK_ResolveGhoul2BoneFrame( skel, ghlInfo, i, currentTime );
-		if ( frame < 0 || frame >= skel.numFrames )
-		{
-			frame = 0;
-		}
-		boneFrame[i] = frame;
+		bonePose[i] = VK_ResolveGhoul2BonePose( skel, ghlInfo, i, currentTime );
 	}
 	for ( int i = 0; i < numBones; i++ )
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, boneFrame, i, outBones, computed );
+		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, i, outBones, computed );
 	}
 }
 
@@ -885,6 +952,21 @@ struct VulkanGhoul2AnimState
 	int pauseTime = 0; // 0 = not paused
 	float animSpeed = 0.0f;
 	int flags = 0;
+	// Blend-from state (BONE_ANIM_BLEND, game/ghoul2_shared.h 0x0080) -
+	// captured once, in VK_SetGhoul2BoneAnim, at the exact moment a new
+	// animation is set on top of an already-animating bone with a nonzero
+	// blendTime. blendFrame/blendLerpFrame are NOT re-evaluated as time
+	// passes - they're a frozen snapshot of where the *previous* animation
+	// was, matching rd-vanilla's real G2_Set_Bone_Anim_Index/
+	// G2_TransformBone exactly (see VK_SetGhoul2BoneAnim's comment for the
+	// capture arithmetic, and VK_ComputeGhoul2BoneRecursive for how the
+	// snapshot is cross-faded against the live new animation).
+	// blendDurationMs == 0 means "no active blend for this SetBoneAnim
+	// call" - blendStartTime is meaningless in that case.
+	float blendFrame = 0.0f;
+	int blendLerpFrame = 0;
+	int blendStartTime = 0;
+	int blendDurationMs = 0;
 };
 // Outer key: CGhoul2Info identity - the exact pointer game code calls
 // G2API_SetBoneAnim with (e.g. &gent->ghoul2[gent->playerModel] in
@@ -899,59 +981,293 @@ struct VulkanGhoul2AnimState
 // resolved.
 static std::unordered_map<const CGhoul2Info *, std::unordered_map<int, VulkanGhoul2AnimState>> s_ghoul2AnimState;
 
-// BONE_ANIM_OVERRIDE_LOOP's real value (game/ghoul2_shared.h) - not
-// included from here (a game-side header this renderer doesn't otherwise
-// depend on) since this is the only flag bit this simplified
-// implementation actually interprets.
+// Real flag bit values (game/ghoul2_shared.h) - not included from here (a
+// game-side header this renderer doesn't otherwise depend on).
+// OVERRIDE_FREEZE already includes the OVERRIDE bit (0x48 = 0x40 + 0x08);
+// bg_panimate.cpp only ever sets LOOP or FREEZE (never plain OVERRIDE
+// alone or a negative/reverse animSpeed - its own comment says as much),
+// so those are the only two "ran off the end" behaviors this needs to
+// resolve, though VK_Ghoul2TimingModel still ports the reverse-playback
+// branches faithfully rather than assuming they're unreachable.
 static const int VK_BONE_ANIM_OVERRIDE_LOOP = 0x0010;
+static const int VK_BONE_ANIM_OVERRIDE_FREEZE = 0x0048;
+static const int VK_BONE_ANIM_BLEND = 0x0080;
 
-// The G2_TimingModel formula (rd-vanilla/tr_ghoul2.cpp), copied verbatim
-// except for the parts this renderer doesn't implement (blending between
-// two animations, sub-frame lerp, reverse/negative animSpeed playback -
-// all real, visible-quality features left out, see README.md): frame
-// advances at animSpeed frames per 50ms of elapsed time. Confirmed against
-// the real caller convention (bg_panimate.cpp: `animSpeed = 50.0f /
-// curAnim.frameLerp * timeScaleMod`, i.e. the caller pre-scales animSpeed
-// so this formula's "/ 50" always means real elapsed milliseconds divided
-// by the clip's real per-frame duration, not a made-up constant).
-static float VK_ComputeGhoul2AnimFrame( const VulkanGhoul2AnimState &state, int currentTime )
+// Exact port of rd-vanilla's real G2_TimingModel (tr_ghoul2.cpp): given a
+// bone's animation state and the current time, decides which two whole
+// frames to interpolate between (currentFrame/newFrame) and by how much
+// (backlerp - the weight on newFrame; 1-backlerp on currentFrame, matching
+// VK_ComputeGhoul2BoneRecursive's convention). Ported branch-for-branch,
+// including the reverse-playback (animSpeed<0) and zero-length
+// (startFrame==endFrame) cases real callers don't currently exercise, and
+// the exact same "currentFrame+backlerp is always the continuous,
+// wrapped/clamped frame position" invariant real code relies on elsewhere
+// (G2_Get_Bone_Anim_Index) - VK_Ghoul2CurrentFramePosition below depends on
+// that invariant to capture a blend-from snapshot. Frame indices are
+// clamped into [0, numFrames) at the end rather than asserting, matching
+// this codebase's practice of defensive clamps over release-mode crashes -
+// real inputs never actually violate the real function's bounds asserts,
+// so this is a safety net, not a behavior change.
+static void VK_Ghoul2TimingModel( const VulkanGhoul2AnimState &state, int currentTime, int numFrames, int &currentFrame, int &newFrame, float &backlerp )
 {
-	int effectiveTime = state.pauseTime ? state.pauseTime : currentTime;
-	float time = (float)( effectiveTime - state.startTime ) / 50.0f;
+	float animSpeed = state.animSpeed;
+	float time = (float)( ( state.pauseTime ? state.pauseTime : currentTime ) - state.startTime ) / 50.0f;
 	if ( time < 0.0f )
 	{
 		time = 0.0f;
 	}
-	float frame = (float)state.startFrame + time * state.animSpeed;
+	float newFrame_g = (float)state.startFrame + ( time * animSpeed );
 
 	int animSize = state.endFrame - state.startFrame;
-	if ( animSize > 0 && state.animSpeed > 0.0f && frame > (float)state.endFrame )
+	float endFrame = (float)state.endFrame;
+	currentFrame = state.startFrame;
+	newFrame = state.startFrame;
+	backlerp = 0.0f;
+
+	if ( animSize )
 	{
-		if ( state.flags & VK_BONE_ANIM_OVERRIDE_LOOP )
+		bool ranOff = ( animSpeed > 0.0f && newFrame_g > endFrame - 1.0f ) ||
+			( animSpeed < 0.0f && newFrame_g < endFrame + 1.0f );
+		if ( ranOff )
 		{
-			frame = (float)state.startFrame + fmodf( frame - (float)state.startFrame, (float)animSize );
+			if ( state.flags & VK_BONE_ANIM_OVERRIDE_LOOP )
+			{
+				if ( animSpeed < 0.0f )
+				{
+					if ( newFrame_g < endFrame + 1.0f && newFrame_g >= endFrame )
+					{
+						backlerp = ( endFrame + 1.0f ) - newFrame_g;
+						currentFrame = (int)endFrame;
+						newFrame = state.startFrame;
+					}
+					else
+					{
+						if ( newFrame_g <= endFrame + 1.0f )
+						{
+							newFrame_g = endFrame + fmodf( newFrame_g - endFrame, (float)animSize ) - (float)animSize;
+						}
+						backlerp = ceilf( newFrame_g ) - newFrame_g;
+						currentFrame = (int)ceilf( newFrame_g );
+						newFrame = ( currentFrame <= endFrame + 1.0f ) ? state.startFrame : currentFrame - 1;
+					}
+				}
+				else
+				{
+					if ( newFrame_g > endFrame - 1.0f && newFrame_g < endFrame )
+					{
+						backlerp = newFrame_g - (int)newFrame_g;
+						currentFrame = (int)newFrame_g;
+						newFrame = state.startFrame;
+					}
+					else
+					{
+						if ( newFrame_g >= endFrame )
+						{
+							newFrame_g = endFrame + fmodf( newFrame_g - endFrame, (float)animSize ) - (float)animSize;
+						}
+						backlerp = newFrame_g - (int)newFrame_g;
+						currentFrame = (int)newFrame_g;
+						newFrame = ( newFrame_g >= endFrame - 1.0f ) ? state.startFrame : currentFrame + 1;
+					}
+				}
+			}
+			else if ( ( state.flags & VK_BONE_ANIM_OVERRIDE_FREEZE ) == VK_BONE_ANIM_OVERRIDE_FREEZE )
+			{
+				currentFrame = ( animSpeed > 0.0f ) ? state.endFrame - 1 : state.endFrame + 1;
+				newFrame = currentFrame;
+				backlerp = 0.0f;
+			}
+			// else: a plain BONE_ANIM_OVERRIDE with neither LOOP nor FREEZE
+			// - real code clears the anim's flags entirely here ("turn it
+			// off"). Not reproduced (no real caller hits this - see this
+			// function's own comment) - falls through keeping the
+			// startFrame/no-lerp defaults set above.
 		}
 		else
 		{
-			frame = (float)state.endFrame;
+			if ( animSpeed > 0.0f )
+			{
+				currentFrame = (int)newFrame_g;
+				backlerp = newFrame_g - currentFrame;
+				newFrame = currentFrame + 1;
+				if ( newFrame >= (int)endFrame )
+				{
+					newFrame = ( state.flags & VK_BONE_ANIM_OVERRIDE_LOOP ) ? state.startFrame : state.endFrame - 1;
+				}
+			}
+			else
+			{
+				backlerp = ceilf( newFrame_g ) - newFrame_g;
+				currentFrame = (int)ceilf( newFrame_g );
+				if ( currentFrame > state.startFrame )
+				{
+					currentFrame = state.startFrame;
+					newFrame = currentFrame;
+					backlerp = 0.0f;
+				}
+				else
+				{
+					newFrame = currentFrame - 1;
+					if ( (float)newFrame < endFrame + 1.0f )
+					{
+						newFrame = ( state.flags & VK_BONE_ANIM_OVERRIDE_LOOP ) ? state.startFrame : state.endFrame + 1;
+					}
+				}
+			}
 		}
 	}
-	return frame;
+	else
+	{
+		currentFrame = ( animSpeed < 0.0f ) ? state.endFrame + 1 : state.endFrame - 1;
+		if ( currentFrame < 0 )
+		{
+			currentFrame = 0;
+		}
+		newFrame = currentFrame;
+		backlerp = 0.0f;
+	}
+
+	if ( numFrames > 0 )
+	{
+		if ( currentFrame < 0 || currentFrame >= numFrames ) currentFrame = 0;
+		if ( newFrame < 0 || newFrame >= numFrames ) newFrame = 0;
+	}
 }
 
-void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startFrame, int endFrame, int flags, float animSpeed, int startTime )
+// The continuous (fractional) frame position VK_Ghoul2TimingModel's
+// currentFrame/backlerp describe - real callers (G2_Get_Bone_Anim_Index)
+// report this as GetBoneAnim's currentFrame output, and also use it
+// internally to snapshot a blend-from position in G2_Set_Bone_Anim_Index -
+// see VK_SetGhoul2BoneAnim's comment.
+static float VK_Ghoul2CurrentFramePosition( const VulkanGhoul2AnimState &state, int currentTime, int numFrames )
+{
+	int currentFrame, newFrame;
+	float backlerp;
+	VK_Ghoul2TimingModel( state, currentTime, numFrames, currentFrame, newFrame, backlerp );
+	return (float)currentFrame + backlerp;
+}
+
+// numFrames for whatever skeleton ghlInfo->mModel currently resolves to -
+// needed by VK_SetGhoul2BoneAnim purely to keep VK_Ghoul2TimingModel's
+// frame-index clamp meaningful when capturing a blend snapshot; 0 (an
+// otherwise-invalid frame count) is a safe "don't clamp" sentinel for a not
+// -yet-resolvable model, matching VK_Ghoul2TimingModel's own `numFrames > 0`
+// guard.
+static int VK_GetGhoul2NumFrames( const CGhoul2Info *ghlInfo )
+{
+	if ( !ghlInfo || ghlInfo->mModel <= 0 || (size_t)ghlInfo->mModel >= s_ghoul2Models.size() )
+	{
+		return 0;
+	}
+	int skeletonIndex = s_ghoul2Models[ghlInfo->mModel].skeletonIndex;
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return 0;
+	}
+	return s_skeletons[skeletonIndex].numFrames;
+}
+
+// setFrame/blendTime are real parameters now (previously discarded by
+// tr_init.cpp's G2API_SetBoneAnim/SetBoneAnimIndex - see those functions'
+// comments), not new API surface: G2API_SetBoneAnimIndex has always taken
+// them, this renderer just ignored them.
+//
+// setFrame (-1 = "start fresh at startFrame") lets a caller keep an
+// animation's current position across a SetBoneAnim call that doesn't
+// actually change anything but the flags/blendTime - bg_panimate.cpp does
+// this on every PM_SetAnimFinal call that re-affirms an anim already
+// playing, passing its own already-queried currentFrame back in so the
+// anim doesn't visibly restart from frame 0. Ported via the same algebra
+// as rd-vanilla's real G2_Set_Bone_Anim_Index: solve startTime such that
+// VK_Ghoul2TimingModel would report exactly setFrame right now.
+//
+// blendTime (only meaningful with BONE_ANIM_BLEND set in flags) captures
+// the *previous* state's continuous frame position - via
+// VK_Ghoul2CurrentFramePosition, i.e. running the timing model on the
+// about-to-be-overwritten state - as a frozen (blendFrame, blendLerpFrame)
+// snapshot pair, exactly like real G2_Set_Bone_Anim_Index: blendLerpFrame
+// is the snapshot's "next" frame (or the same frame twice for reverse
+// playback), wrapped/clamped against the *old* state's own endFrame/loop
+// flag. If there was no previous state on this bone (nothing to blend
+// from), blending is silently dropped - matches real code's "hmm, we
+// weren't animating on this bone" branch.
+void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startFrame, int endFrame, int flags, float animSpeed, int startTime, float setFrame, int blendTime )
 {
 	if ( !ghlInfo )
 	{
 		return;
 	}
-	VulkanGhoul2AnimState &state = s_ghoul2AnimState[ghlInfo][boneIndex];
+	auto &boneMap = s_ghoul2AnimState[ghlInfo];
+	auto existing = boneMap.find( boneIndex );
+	int numFrames = VK_GetGhoul2NumFrames( ghlInfo );
+
+	float blendFrame = 0.0f;
+	int blendLerpFrame = 0;
+	int blendDurationMs = 0;
+	int blendStartTime = startTime;
+	if ( ( flags & VK_BONE_ANIM_BLEND ) && blendTime > 0 )
+	{
+		if ( existing != boneMap.end() )
+		{
+			const VulkanGhoul2AnimState &old = existing->second;
+			if ( old.blendDurationMs > 0 && old.blendStartTime == startTime )
+			{
+				// Replacing a blend that was itself set up this same
+				// instant (hasn't actually started yet) - just extend its
+				// duration, keep the snapshot it already captured.
+				blendFrame = old.blendFrame;
+				blendLerpFrame = old.blendLerpFrame;
+				blendStartTime = old.blendStartTime;
+				blendDurationMs = blendTime;
+			}
+			else
+			{
+				float currentFrame = VK_Ghoul2CurrentFramePosition( old, startTime, numFrames );
+				if ( old.animSpeed < 0.0f )
+				{
+					blendFrame = floorf( currentFrame );
+					blendLerpFrame = (int)floorf( currentFrame );
+				}
+				else
+				{
+					blendFrame = currentFrame;
+					blendLerpFrame = (int)currentFrame + 1;
+					if ( blendFrame >= (float)old.endFrame )
+					{
+						blendFrame = ( old.flags & VK_BONE_ANIM_OVERRIDE_LOOP ) ? (float)old.startFrame : (float)old.endFrame - 1.0f;
+					}
+					if ( blendLerpFrame >= old.endFrame )
+					{
+						blendLerpFrame = ( old.flags & VK_BONE_ANIM_OVERRIDE_LOOP ) ? old.startFrame : old.endFrame - 1;
+					}
+				}
+				blendDurationMs = blendTime;
+				blendStartTime = startTime;
+			}
+		}
+		// else: nothing to blend from - blendDurationMs stays 0, dropping
+		// the blend for this call, same as real code.
+	}
+
+	VulkanGhoul2AnimState &state = boneMap[boneIndex];
 	state.startFrame = startFrame;
 	state.endFrame = endFrame;
-	state.startTime = startTime;
-	state.pauseTime = 0;
 	state.animSpeed = animSpeed;
+	state.pauseTime = 0;
 	state.flags = flags;
+	state.blendFrame = blendFrame;
+	state.blendLerpFrame = blendLerpFrame;
+	state.blendStartTime = blendStartTime;
+	state.blendDurationMs = blendDurationMs;
+
+	if ( setFrame != -1.0f && animSpeed != 0.0f )
+	{
+		state.startTime = (int)( (float)startTime - ( ( ( setFrame - (float)startFrame ) * 50.0f ) / animSpeed ) );
+	}
+	else
+	{
+		state.startTime = startTime;
+	}
 }
 
 bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int currentTime, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed )
@@ -971,7 +1287,7 @@ bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int curren
 	if ( endFrame ) *endFrame = state.endFrame;
 	if ( flags ) *flags = state.flags;
 	if ( animSpeed ) *animSpeed = state.animSpeed;
-	if ( currentFrame ) *currentFrame = VK_ComputeGhoul2AnimFrame( state, currentTime );
+	if ( currentFrame ) *currentFrame = VK_Ghoul2CurrentFramePosition( state, currentTime, VK_GetGhoul2NumFrames( ghlInfo ) );
 	return true;
 }
 
@@ -1012,21 +1328,23 @@ bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex )
 	return instIt->second.erase( boneIndex ) > 0;
 }
 
-// The frame to skin one specific bone with right now, resolved by walking
-// from boneIndex up its parent chain (starting at itself) until a bone is
-// found with its own explicit track set on this instance - the real
-// engine's own bone-tree resolution rule (a track set on e.g. "lower_lumbar"
-// only controls that bone and its descendants; everything else keeps
-// whatever *its* nearest ancestor track says, typically a whole-body track
-// set on a bone near the skeleton root). Falls back to frame 0 (this
-// renderer's prior "never animated" default) if no bone from boneIndex up
-// to the root has any track at all - see README.md's frame-0 caveat.
-static int VK_ResolveGhoul2BoneFrame( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime )
+// The full pose (sub-frame-interpolated, and mid-blend if applicable) to
+// skin one specific bone with right now, resolved by walking from
+// boneIndex up its parent chain (starting at itself) until a bone is found
+// with its own explicit track set on this instance - the real engine's own
+// bone-tree resolution rule (a track set on e.g. "lower_lumbar" only
+// controls that bone and its descendants; everything else keeps whatever
+// *its* nearest ancestor track says, typically a whole-body track set on a
+// bone near the skeleton root). Falls back to a static frame-0 pose (this
+// renderer's original "never animated" default) if no bone from boneIndex
+// up to the root has any track at all - see README.md's frame-0 caveat.
+static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime )
 {
+	VulkanGhoul2BonePose pose;
 	auto instIt = s_ghoul2AnimState.find( ghlInfo );
 	if ( instIt == s_ghoul2AnimState.end() )
 	{
-		return 0;
+		return pose;
 	}
 	int walk = boneIndex;
 	while ( walk >= 0 )
@@ -1034,11 +1352,31 @@ static int VK_ResolveGhoul2BoneFrame( const VulkanSkeleton &skel, const CGhoul2I
 		auto boneIt = instIt->second.find( walk );
 		if ( boneIt != instIt->second.end() )
 		{
-			return (int)VK_ComputeGhoul2AnimFrame( boneIt->second, currentTime );
+			const VulkanGhoul2AnimState &state = boneIt->second;
+			VK_Ghoul2TimingModel( state, currentTime, skel.numFrames, pose.currentFrame, pose.newFrame, pose.backlerp );
+
+			// A blend is only actually applied for the window of time it
+			// covers - once elapsed time reaches blendDurationMs the
+			// snapshot is retired and the bone plays the new animation
+			// outright, matching real G2_TransformBone's
+			// `blendTime>=0.0f && blendTime<boneList[...].blendTime` gate.
+			if ( state.blendDurationMs > 0 )
+			{
+				int elapsed = currentTime - state.blendStartTime;
+				if ( elapsed >= 0 && elapsed < state.blendDurationMs )
+				{
+					pose.hasBlend = true;
+					pose.blendFrame = (int)state.blendFrame;
+					pose.blendLerpFrame = state.blendLerpFrame;
+					pose.blendFrameLerp = state.blendFrame - (float)pose.blendFrame;
+					pose.blendWeight = (float)elapsed / (float)state.blendDurationMs;
+				}
+			}
+			return pose;
 		}
 		walk = skel.bones[walk].parent;
 	}
-	return 0;
+	return pose;
 }
 
 // Recomputes one model instance's vertex buffer for a given pose - linear

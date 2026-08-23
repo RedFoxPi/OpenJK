@@ -736,6 +736,15 @@ frames (frames step discretely), and reverse/negative-speed playback -
 three more real, visible-quality features of rd-vanilla's
 `G2_TimingModel` (`tr_ghoul2.cpp`) this doesn't reproduce.
 
+**Update, much later: the per-bone-track scope cut above is now real, and
+blending + sub-frame interpolation are now implemented too** - see
+"Full `G2_TimingModel` port: blending and sub-frame interpolation" further
+below. What's left unimplemented from this section's original list is just
+reverse/negative-speed playback (ported faithfully anyway, in case a future
+caller ever uses it, but no real caller currently does) and bone-angle
+overrides/ragdoll/IK (a separate, still-real scope cut - see
+`G2API_SetBoneAngles*`'s stubs).
+
 The frame-advance formula is copied from that same function, not
 rederived, and cross-checked against its real caller: `G2_TimingModel`
 computes `frame = startFrame + ((currentTime - startTime) / 50.0) *
@@ -815,6 +824,112 @@ fix, README section below) - just not necessarily illustrated by the exact
 fix itself (the actual subject of this checkpoint) is unaffected by any of
 this - it's pure Vulkan command-buffer/memory-timing correctness, verified
 independently of simulated-game-time control.
+
+### Full `G2_TimingModel` port: blending and sub-frame interpolation (tr_model.cpp)
+
+Follow-up to the character-animation investigation above (see "four real
+bugs, and a wrong conclusion corrected" below): once real animation.cfg
+parsing and the composite-skin fix made every character actually animate,
+visibly, as the right model, a user asked for this renderer's animation to
+be "an adequate replacement" for rd-vanilla's - not an approximation of it.
+The remaining gap after those bug fixes wasn't a bug, it was a real,
+previously-disclosed scope cut: this renderer computed exactly one whole
+frame per bone-track with no interpolation between frames and no
+cross-fading between an old animation and a new one, while rd-vanilla's
+real `G2_TimingModel`/`G2_TransformBone` (`tr_ghoul2.cpp`) do both. Closing
+that gap meant porting that real code, not reinventing an approximation of
+it.
+
+**`VK_Ghoul2TimingModel`** (`tr_model.cpp`) is a branch-for-branch port of
+rd-vanilla's real `G2_TimingModel`: given a bone's animation state
+(startFrame/endFrame/startTime/animSpeed/flags/pauseTime) and the current
+time, it decides which two whole frames to interpolate between
+(`currentFrame`/`newFrame`) and by how much (`backlerp` - the weight on
+`newFrame`; `1-backlerp` on `currentFrame`). Ported *all* of the real
+function's branches, including forward/reverse playback and the
+loop-wraparound/freeze-at-the-end cases for each, not just the common
+forward-with-loop-or-freeze path bg_panimate.cpp actually exercises today -
+reverse (negative `animSpeed`) playback has no real caller in this game
+right now, but the point of a port is fidelity to the source, not fidelity
+to today's call sites. `VK_Ghoul2CurrentFramePosition` wraps it into the
+single continuous (fractional) frame-position value real code reports from
+`GetBoneAnim` and uses internally to snapshot a blend (see below) -
+verified to satisfy the same invariant real code relies on
+(`currentFrame + backlerp` is always the wrapped/clamped continuous
+position, whatever branch produced it).
+
+**Sub-frame interpolation**: `VK_ComputeGhoul2BoneRecursive` now uncompresses
+up to two adjacent frames' bone quaternions and linearly interpolates the
+resulting 3x4 matrices component-wise by `backlerp` when it's nonzero
+(`VK_LerpGhoul2BoneMatrix`) - the exact same simplification real
+`G2_TransformBone` makes (a matrix lerp, not a true quaternion slerp; the
+real engine doesn't do the more "correct" thing here either, so this isn't
+a corner cut relative to it). Previously every bone snapped discretely from
+one whole frame to the next; now it's continuous, matching real playback
+smoothness frame-for-frame at the same simulated time.
+
+**Animation-to-animation blending** (`BONE_ANIM_BLEND`, `game/
+ghoul2_shared.h` `0x0080`) is real now too, not dropped. `bg_panimate.cpp`
+sets this flag (with a 350ms default `blendTime`) on essentially every
+`PM_SetAnimFinal` call that starts a genuinely new animation on a bone - not
+a rare edge case, ordinary gameplay - so leaving it unimplemented meant
+every animation change was a hard cut rather than the real engine's
+cross-fade. `VK_SetGhoul2BoneAnim` now captures a *frozen* snapshot of
+wherever the *previous* animation on that bone was (via
+`VK_Ghoul2CurrentFramePosition` on the about-to-be-overwritten state,
+run through the same frame-wrap/loop-flag clamping real
+`G2_Set_Bone_Anim_Index` applies) at the exact moment a new blended
+animation begins - `blendFrame`/`blendLerpFrame`/`blendStartTime`/
+`blendDurationMs` on `VulkanGhoul2AnimState`. `VK_ResolveGhoul2BonePose`
+checks whether that blend window (`blendStartTime` to `blendStartTime +
+blendDurationMs`) is still open for the current draw and, if so,
+cross-fades the frozen old pose against the live new one with a linearly
+increasing weight - matching real `G2_TransformBone`'s
+`blendTime>=0.0f && blendTime<boneList[...].blendTime` gate and its
+`blendLerp*new + (1-blendLerp)*old` arithmetic exactly, including the real
+function's own (verified-against-source, not "fixed") old-pose
+interpolation convention where the captured position's fractional part
+weights the *floor* frame rather than the *next* one - a real, faithfully
+reproduced quirk, not a bug introduced here. If there was nothing previously
+animating on a bone to blend from, blending is silently dropped for that
+call, matching real code's own fallback.
+
+**`setFrame` continuity** (`G2API_SetBoneAnim`/`SetBoneAnimIndex`'s
+previously-ignored `setFrame` parameter) is real now as well:
+`bg_panimate.cpp` passes a re-affirmed animation's already-queried current
+frame back in on every call that doesn't actually change anything but
+flags/blend state, specifically so the animation doesn't visibly restart
+from frame 0 - `VK_SetGhoul2BoneAnim` now solves `startTime` for exactly
+that continuity via the same algebra rd-vanilla's real
+`G2_Set_Bone_Anim_Index` uses.
+
+**Verified**: rebuilt and re-ran the full SP scene suite
+(menu/academy1/hoth2/yavin1/vjun1) - no crashes, no new warnings, `ghoul2:
+18/18 scene entities drew 18 sub-model(s)` unchanged from the composite-skin
+fix above. Confirmed both new mechanisms are actually exercised in a real
+academy1 playthrough (temporarily instrumented `VK_ComputeGhoul2Pose` to
+count bones with an active blend or nonzero `backlerp` per draw, then
+removed it before committing): blending is active on every bone
+immediately after an animation change and fades out over the real
+350ms window, and sub-frame `backlerp` is nonzero on essentially every
+draw once no blend is in progress, exactly as expected for a 16ms
+simulated timestep against animations with a real per-frame duration well
+above that.
+
+**What this does and doesn't change about the `diff.py` comparison numbers**:
+a single static screenshot's mean-pixel-difference figure barely moved
+(~17.1% before and after this work, on `sp_academy1_spawn`) - and that's
+expected, not a sign the work didn't matter. Both of these features are
+fundamentally about *how a pose is reached from millisecond to millisecond*
+(temporal smoothness, and tracking rd-vanilla's continuous frame position
+instead of snapping to the nearest whole frame), which a single freeze-frame
+comparison is structurally unable to fully credit - most of it only shows up
+across a sequence of frames (video), or at the specific instant a blend is
+caught mid-transition. What a single-scene diff *can't* measure isn't the
+same as "no improvement": this renderer's per-instant frame position now
+tracks rd-vanilla's real, continuous one far more closely than a
+discrete-frame-only implementation ever could, for exactly the reason
+`G2_TimingModel` exists in the first place.
 
 ### Runtime polys (tr_model.cpp)
 
@@ -1470,18 +1585,24 @@ scene - some standing, some walking, some down) instead of one identical
 frozen pose repeated on a fraction of the models. The `diff.py` mean
 pixel-difference figure for `sp_academy1_spawn` dropped from ~23.5% (Bug
 3 fixed, Bug 4 not yet found) to ~17.1% (both fixed) against the matched-
-`fixedtime` vanilla capture. It is still not a pixel `MATCH`, and individual
-poses still don't line up frame-for-frame with vanilla's - the single-track,
-no-blend, no-sub-frame-interpolation simplifications documented in "Live
-animation" above are all still real and still there, so a scripted combat
-sequence's exact choreographed beats (which frame of which animation a
-given character is on at a given millisecond) won't match rd-vanilla's real
-multi-track blended timing model bone-for-bone without reproducing that
-model in full - a substantially larger undertaking than either bug fixed
-here. What changed is qualitative, not just quantitative: every character is
-now the right model, visible, and actually animating in a plausible,
-varied, roughly-correctly-timed way, which was not true at all before this
-investigation.
+`fixedtime` vanilla capture. It is still not a pixel `MATCH`, and at the
+time this paragraph was written, individual poses still didn't line up
+frame-for-frame with vanilla's - the single-track, no-blend,
+no-sub-frame-interpolation simplifications documented in "Live animation"
+above were all still real and still there.
+
+**Update, immediately following: the per-bone-track separation, blending,
+and sub-frame interpolation gaps referenced above are now closed** - see
+"Full `G2_TimingModel` port: blending and sub-frame interpolation" further
+below, done specifically because a user pointed out that "adequate
+replacement" quality means matching rd-vanilla's animation *system*, not
+settling for a visibly cruder approximation of it. What's left is
+reproducing rd-vanilla's real bone-angle-override/ragdoll/IK layer (a
+separate, still-real scope cut, and one no test scene in this suite
+currently exercises) and closing the remaining, much smaller diff gap that
+comes from cumulative ICARUS/camera-cut timing drift and the
+already-documented `.shader`-script rendering gap - not from the animation
+math itself anymore.
 
 **One thing this investigation explicitly ruled out**: `sp_yavin1_spawn`'s
 pre-existing ICARUS crash (documented above) was hypothesized to be
@@ -1572,17 +1693,20 @@ touch this code)
   box using the sky shader's own name as its basename, always camera-
   centered; drawn depth-test/write-disabled before world geometry.
 - Ghoul2 (character/weapon model) rendering (`tr_model.cpp`) - real `.glm`
-  mesh parsing, `.skin` texture resolution (single-file case only),
+  mesh parsing, `.skin` texture resolution (both the common single-file
+  case and the three-part `head|torso|lower` composite macro syntax),
   bind-pose bone bolts, per-frame entity dispatch through the same
   pipeline/vertex-format world geometry uses, and (see "Skeletal animation"/
-  "Live animation" above) real per-bone mesh skinning driven by a real,
-  live, time-driven animation state per model instance
-  (`G2API_SetBoneAnim`/`GetBoneAnim`/etc genuinely work now) - one
-  whole-skeleton animation track per instance, not the real engine's
-  independently-blended per-bone-subtree tracks, and no animation
-  blending/crossfade or sub-frame interpolation, but real bone math and
-  weighted skinning driving an actually-moving model, not a static pose.
-  Still missing: LOD selection, per-surface on/off overrides, gore.
+  "Live animation"/"Full `G2_TimingModel` port" above) real per-bone mesh
+  skinning driven by a real, live, time-driven animation state per model
+  instance (`G2API_SetBoneAnim`/`GetBoneAnim`/etc genuinely work now) -
+  independently-tracked per-bone-subtree animation (legs/torso can play
+  different animations at once, resolved via the real bone-hierarchy walk),
+  real cross-fade blending between an old and new animation over a real
+  `blendTime`, and real sub-frame interpolation between adjacent whole
+  frames - not a cruder single-whole-skeleton-track approximation. Still
+  missing: bone-angle overrides/ragdoll/IK, LOD selection, per-surface
+  on/off overrides, gore.
 - Runtime polys (`RE_AddPolyToScene`, `tr_model.cpp`) - see "Runtime polys"
   above. Real per-scene queueing, CPU fan-to-triangle-list expansion, and a
   dedicated pipeline with the same three blend-mode variants (alpha/
@@ -1623,19 +1747,23 @@ touch this code)
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
-- Ghoul2 skeletal animation is live now (see "Live animation" above:
-  `G2API_SetBoneAnim`/`GetBoneAnim`/etc really work, time-driven, not
-  stubs) but only as **one whole-skeleton animation track per model
-  instance** - not the real engine's independently-blended per-bone-subtree
-  tracks (legs/torso/face playing different animations at once), and with
-  no blending/crossfade between two animations, no sub-frame interpolation
-  (frames step discretely), and no reverse/negative-speed playback. `
+- Ghoul2 skeletal animation is live now (see "Live animation"/"Full
+  `G2_TimingModel` port" above: `G2API_SetBoneAnim`/`GetBoneAnim`/etc
+  really work, time-driven, not stubs), with independently-tracked
+  per-bone-subtree animation (legs/torso/etc. playing different animations
+  at once, resolved via the real bone-hierarchy walk - not a single
+  whole-skeleton track), real cross-fade blending between an old and new
+  animation over a real `blendTime`, and real sub-frame interpolation
+  between adjacent whole frames. Reverse/negative-speed playback is ported
+  faithfully in `VK_Ghoul2TimingModel` but untested against a real scene,
+  since no real caller in this game currently uses it. `
   SetAnimIndex`/`GetAnimIndex` (selecting *which* `.gla`/animation-file a
   model uses, a different concept from which frame within one - relevant
   for NPCs with a per-level animation-file override, e.g.
   `_humanoid_academy1.gla`) are still stubs; every model always uses
   whichever single `.gla` `VK_LoadGhoul2Skeleton` first resolved for it.
-  Also still missing: LOD selection, per-surface on/off overrides
+  Also still missing: bone-angle overrides (`SetBoneAngles*`), ragdoll, IK,
+  LOD selection, per-surface on/off overrides
   (`SetSurfaceOnOff`), gore, tags, ragdoll, model-to-model attachment
   (`AttachG2Model`/`AttachEnt`), and surface bolts (a bolt naming a
   *surface* rather than a bone - only bone bolts are implemented, see

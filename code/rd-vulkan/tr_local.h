@@ -390,7 +390,13 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int cu
 // already have one, now that G2API_GetBoneIndex actually returns real
 // indices instead of always -1 - see its own comment for why that
 // mattered far beyond just animation).
-void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startFrame, int endFrame, int flags, float animSpeed, int startTime );
+// setFrame (-1 = start fresh at startFrame) and blendTime (only meaningful
+// with the real BONE_ANIM_BLEND flag bit set in flags) are real parameters
+// now, not ignored - see this function's own comment (tr_model.cpp) for the
+// exact rd-vanilla-matching arithmetic (continuity across a re-affirmed
+// anim, and cross-fading from whatever was previously playing on this bone
+// over blendTime milliseconds).
+void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startFrame, int endFrame, int flags, float animSpeed, int startTime, float setFrame, int blendTime );
 bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int currentTime, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed );
 bool VK_PauseGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int currentTime );
 bool VK_IsGhoul2BoneAnimPaused( const CGhoul2Info *ghlInfo, int boneIndex );

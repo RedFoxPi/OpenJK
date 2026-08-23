@@ -1822,8 +1822,14 @@ qboolean G2API_SetAnimIndex( CGhoul2Info *ghlInfo, const int index ) { (void)ghl
 // track per instance (not per-bone-subtree), no blending between two
 // animations, no arbitrary mid-anim setFrame seek (always starts from
 // startFrame at time t).
-qboolean G2API_SetBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { (void)setFrame; (void)blendTime; VK_SetGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ), startFrame, endFrame, flags, animSpeed, t ); return qtrue; }
-qboolean G2API_SetBoneAnimIndex( CGhoul2Info *ghlInfo, const int index, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { (void)setFrame; (void)blendTime; VK_SetGhoul2BoneAnim( ghlInfo, index, startFrame, endFrame, flags, animSpeed, t ); return qtrue; }
+// setFrame/blendTime are real now (previously discarded) - see
+// VK_SetGhoul2BoneAnim's comment (tr_model.cpp) for exactly what they do.
+// bg_panimate.cpp passes both on every PM_SetAnimFinal call (setFrame to
+// keep a re-affirmed animation from visibly restarting, blendTime -
+// 350ms by default - to cross-fade into a genuinely new one) so this
+// mattered for ordinary gameplay, not just an edge case.
+qboolean G2API_SetBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { VK_SetGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ), startFrame, endFrame, flags, animSpeed, t, setFrame, blendTime ); return qtrue; }
+qboolean G2API_SetBoneAnimIndex( CGhoul2Info *ghlInfo, const int index, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { VK_SetGhoul2BoneAnim( ghlInfo, index, startFrame, endFrame, flags, animSpeed, t, setFrame, blendTime ); return qtrue; }
 qboolean G2API_SetBoneAngles( CGhoul2Info *ghlInfo, const char *boneName, const vec3_t angles, const int flags, const Eorientations up, const Eorientations left, const Eorientations forward, qhandle_t *modelList, int blendTime, int t ) { (void)ghlInfo; (void)boneName; (void)angles; (void)flags; (void)up; (void)left; (void)forward; (void)modelList; (void)blendTime; (void)t; return qfalse; }
 qboolean G2API_SetBoneAnglesIndex( CGhoul2Info *ghlInfo, const int index, const vec3_t angles, const int flags, const Eorientations yaw, const Eorientations pitch, const Eorientations roll, qhandle_t *modelList, int blendTime, int t ) { (void)ghlInfo; (void)index; (void)angles; (void)flags; (void)yaw; (void)pitch; (void)roll; (void)modelList; (void)blendTime; (void)t; return qfalse; }
 qboolean G2API_SetBoneAnglesMatrix( CGhoul2Info *ghlInfo, const char *boneName, const mdxaBone_t &matrix, const int flags, qhandle_t *modelList, int blendTime, int t ) { (void)ghlInfo; (void)boneName; (void)matrix; (void)flags; (void)modelList; (void)blendTime; (void)t; return qfalse; }
