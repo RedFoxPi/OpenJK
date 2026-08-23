@@ -1471,21 +1471,51 @@ qboolean G2API_GetAnimFileName( CGhoul2Info *ghlInfo, char **filename ) { (void)
 char *G2API_GetAnimFileNameIndex( qhandle_t modelIndex ) { (void)modelIndex; return nullptr; }
 char *G2API_GetAnimFileInternalNameIndex( qhandle_t modelIndex ) { (void)modelIndex; return nullptr; }
 int G2API_GetAnimIndex( CGhoul2Info *ghlInfo ) { (void)ghlInfo; return 0; }
+// Resolves a By-name G2API call's boneName to the same real skeleton bone
+// index an equivalent ...Index call would already have (ghlInfo->mModel is
+// the model cache index VK_FindGhoul2Bone expects - the same field
+// VK_DrawGhoul2Entities, tr_model.cpp, reads as g2Instance.mModel). This is
+// the one place in this whole file that dereferences ghlInfo - safe because
+// every real caller passes the address of a live CGhoul2Info the game
+// itself owns (e.g. &ent->ghoul2[ent->playerModel]), never a dangling or
+// null one after the qtrue/qfalse null checks below. -1 (VK_FindGhoul2Bone's
+// "not found" return) is a perfectly ordinary key into
+// s_ghoul2AnimState's per-bone map, not a special case that needs handling
+// here - see that map's own comment (tr_model.cpp).
+static int VK_ResolveGhoul2AnimBone( CGhoul2Info *ghlInfo, const char *boneName )
+{
+	if ( !ghlInfo || !boneName )
+	{
+		return -1;
+	}
+	return VK_FindGhoul2Bone( ghlInfo->mModel, boneName );
+}
 // GetAnimRange reports the *stored* startFrame/endFrame verbatim (not the
 // current playback position - that's GetBoneAnim's currentFrame), so this
 // can reuse GetBoneAnim's lookup and just discard the frame/flags/speed
-// outputs it doesn't need. boneName is ignored - see VK_SetGhoul2BoneAnim's
-// comment (tr_model.cpp) for this renderer's whole-skeleton simplification.
-qboolean G2API_GetAnimRange( CGhoul2Info *ghlInfo, const char *boneName, int *startFrame, int *endFrame ) { (void)boneName; return VK_GetGhoul2BoneAnim( ghlInfo, 0, nullptr, startFrame, endFrame, nullptr, nullptr ) ? qtrue : qfalse; }
-qboolean G2API_GetAnimRangeIndex( CGhoul2Info *ghlInfo, const int boneIndex, int *startFrame, int *endFrame ) { (void)boneIndex; return VK_GetGhoul2BoneAnim( ghlInfo, 0, nullptr, startFrame, endFrame, nullptr, nullptr ) ? qtrue : qfalse; }
-// boneName/boneIndex ignored - see VK_SetGhoul2BoneAnim's comment
-// (tr_model.cpp) for this renderer's whole-skeleton simplification: every
-// SetBoneAnim call (regardless of which bone/index it targeted) updates
-// one shared per-instance track, so both the name and index variants of
-// Get/SetBoneAnim read/write that same track.
-qboolean G2API_GetBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int t, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed, int *modelList ) { (void)boneName; (void)modelList; return VK_GetGhoul2BoneAnim( ghlInfo, t, currentFrame, startFrame, endFrame, flags, animSpeed ) ? qtrue : qfalse; }
-qboolean G2API_GetBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, const int t, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed, int *modelList ) { (void)boneIndex; (void)modelList; return VK_GetGhoul2BoneAnim( ghlInfo, t, currentFrame, startFrame, endFrame, flags, animSpeed ) ? qtrue : qfalse; }
-int G2API_GetBoneIndex( CGhoul2Info *ghlInfo, const char *boneName, qboolean bAddIfNotFound ) { (void)ghlInfo; (void)boneName; (void)bAddIfNotFound; return -1; }
+// outputs it doesn't need.
+qboolean G2API_GetAnimRange( CGhoul2Info *ghlInfo, const char *boneName, int *startFrame, int *endFrame ) { return VK_GetGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ), 0, nullptr, startFrame, endFrame, nullptr, nullptr ) ? qtrue : qfalse; }
+qboolean G2API_GetAnimRangeIndex( CGhoul2Info *ghlInfo, const int boneIndex, int *startFrame, int *endFrame ) { return VK_GetGhoul2BoneAnim( ghlInfo, boneIndex, 0, nullptr, startFrame, endFrame, nullptr, nullptr ) ? qtrue : qfalse; }
+// Real per-bone-region tracking now (see s_ghoul2AnimState's comment,
+// tr_model.cpp, for the bug this fixes): the By-name and ...Index variants
+// of Get/SetBoneAnim are just two ways to name the same underlying bone
+// index, resolved once here rather than each duplicating the lookup.
+qboolean G2API_GetBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int t, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed, int *modelList ) { (void)modelList; return VK_GetGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ), t, currentFrame, startFrame, endFrame, flags, animSpeed ) ? qtrue : qfalse; }
+qboolean G2API_GetBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, const int t, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed, int *modelList ) { (void)modelList; return VK_GetGhoul2BoneAnim( ghlInfo, boneIndex, t, currentFrame, startFrame, endFrame, flags, animSpeed ) ? qtrue : qfalse; }
+// Used throughout game code (60+ call sites - g_client.cpp's
+// rootBone/lowerLumbarBone/motionBone, g_turret.cpp, g_emplaced.cpp,
+// g_combat.cpp, ...) to cache a bone index once and reuse it - a real,
+// previously always-wrong stub (unconditionally returned -1 regardless of
+// input) that this renderer never noticed because Get/SetBoneAnim used to
+// ignore whatever index they were given anyway. Now that they don't (see
+// s_ghoul2AnimState's comment, tr_model.cpp), a caller that cached this
+// stub's -1 forever would still collide every distinct bone into the same
+// key - this fix is what actually makes the per-bone tracking above mean
+// anything for real game callers, not just for direct ...Index calls that
+// happen to pass a real index already. bAddIfNotFound is ignored: unlike
+// the real engine's internal "active bone list" cache, every skeleton bone
+// is already available via VK_FindGhoul2Bone with no separate add step.
+int G2API_GetBoneIndex( CGhoul2Info *ghlInfo, const char *boneName, qboolean bAddIfNotFound ) { (void)bAddIfNotFound; return VK_ResolveGhoul2AnimBone( ghlInfo, boneName ); }
 // Byte-for-byte-in-spirit copy of rd-vanilla's real Multiply_3x4Matrix
 // (tr_ghoul2.cpp) for mdxaBone_t's row-major 3x4 affine representation -
 // NOT the same convention as VK_MultiplyMatrix (tr_world.cpp)'s column-major
@@ -1699,13 +1729,13 @@ int G2API_InitGhoul2Model( CGhoul2Info_v &ghoul2, const char *fileName, int mode
 	ghoul2[slot].mModel = (qhandle_t)VK_LoadGhoul2Model( fileName, 0 );
 	return slot;
 }
-qboolean G2API_IsPaused( CGhoul2Info *ghlInfo, const char *boneName ) { (void)boneName; return VK_IsGhoul2BoneAnimPaused( ghlInfo ) ? qtrue : qfalse; }
+qboolean G2API_IsPaused( CGhoul2Info *ghlInfo, const char *boneName ) { return VK_IsGhoul2BoneAnimPaused( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ) ) ? qtrue : qfalse; }
 void G2API_ListBones( CGhoul2Info *ghlInfo, int frame ) { (void)ghlInfo; (void)frame; }
 void G2API_ListSurfaces( CGhoul2Info *ghlInfo ) { (void)ghlInfo; }
 void G2API_LoadGhoul2Models( CGhoul2Info_v &ghoul2, char *buffer ) { (void)ghoul2; (void)buffer; }
 void G2API_LoadSaveCodeDestructGhoul2Info( CGhoul2Info_v &ghoul2 ) { (void)ghoul2; }
-qboolean G2API_PauseBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int t ) { (void)boneName; return VK_PauseGhoul2BoneAnim( ghlInfo, t ) ? qtrue : qfalse; }
-qboolean G2API_PauseBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, const int t ) { (void)boneIndex; return VK_PauseGhoul2BoneAnim( ghlInfo, t ) ? qtrue : qfalse; }
+qboolean G2API_PauseBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int t ) { return VK_PauseGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ), t ) ? qtrue : qfalse; }
+qboolean G2API_PauseBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, const int t ) { return VK_PauseGhoul2BoneAnim( ghlInfo, boneIndex, t ) ? qtrue : qfalse; }
 qhandle_t G2API_PrecacheGhoul2Model( const char *fileName ) { (void)fileName; return 0; }
 qboolean G2API_RagEffectorGoal( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t pos ) { (void)ghoul2; (void)boneName; (void)pos; return qfalse; }
 qboolean G2API_RagEffectorKick( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t velocity ) { (void)ghoul2; (void)boneName; (void)velocity; return qfalse; }
@@ -1723,8 +1753,8 @@ qboolean G2API_SetAnimIndex( CGhoul2Info *ghlInfo, const int index ) { (void)ghl
 // track per instance (not per-bone-subtree), no blending between two
 // animations, no arbitrary mid-anim setFrame seek (always starts from
 // startFrame at time t).
-qboolean G2API_SetBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { (void)boneName; (void)setFrame; (void)blendTime; VK_SetGhoul2BoneAnim( ghlInfo, startFrame, endFrame, flags, animSpeed, t ); return qtrue; }
-qboolean G2API_SetBoneAnimIndex( CGhoul2Info *ghlInfo, const int index, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { (void)index; (void)setFrame; (void)blendTime; VK_SetGhoul2BoneAnim( ghlInfo, startFrame, endFrame, flags, animSpeed, t ); return qtrue; }
+qboolean G2API_SetBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { (void)setFrame; (void)blendTime; VK_SetGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ), startFrame, endFrame, flags, animSpeed, t ); return qtrue; }
+qboolean G2API_SetBoneAnimIndex( CGhoul2Info *ghlInfo, const int index, const int startFrame, const int endFrame, const int flags, const float animSpeed, const int t, const float setFrame, const int blendTime ) { (void)setFrame; (void)blendTime; VK_SetGhoul2BoneAnim( ghlInfo, index, startFrame, endFrame, flags, animSpeed, t ); return qtrue; }
 qboolean G2API_SetBoneAngles( CGhoul2Info *ghlInfo, const char *boneName, const vec3_t angles, const int flags, const Eorientations up, const Eorientations left, const Eorientations forward, qhandle_t *modelList, int blendTime, int t ) { (void)ghlInfo; (void)boneName; (void)angles; (void)flags; (void)up; (void)left; (void)forward; (void)modelList; (void)blendTime; (void)t; return qfalse; }
 qboolean G2API_SetBoneAnglesIndex( CGhoul2Info *ghlInfo, const int index, const vec3_t angles, const int flags, const Eorientations yaw, const Eorientations pitch, const Eorientations roll, qhandle_t *modelList, int blendTime, int t ) { (void)ghlInfo; (void)index; (void)angles; (void)flags; (void)yaw; (void)pitch; (void)roll; (void)modelList; (void)blendTime; (void)t; return qfalse; }
 qboolean G2API_SetBoneAnglesMatrix( CGhoul2Info *ghlInfo, const char *boneName, const mdxaBone_t &matrix, const int flags, qhandle_t *modelList, int blendTime, int t ) { (void)ghlInfo; (void)boneName; (void)matrix; (void)flags; (void)modelList; (void)blendTime; (void)t; return qfalse; }
@@ -1757,8 +1787,8 @@ qboolean G2API_SetSkin( CGhoul2Info *ghlInfo, qhandle_t customSkin, qhandle_t re
 }
 qboolean G2API_SetSurfaceOnOff( CGhoul2Info *ghlInfo, const char *surfaceName, const int flags ) { (void)ghlInfo; (void)surfaceName; (void)flags; return qfalse; }
 void G2API_SetTime( int currentTime, int clock ) { (void)currentTime; (void)clock; }
-qboolean G2API_StopBoneAnim( CGhoul2Info *ghlInfo, const char *boneName ) { (void)boneName; return VK_StopGhoul2BoneAnim( ghlInfo ) ? qtrue : qfalse; }
-qboolean G2API_StopBoneAnimIndex( CGhoul2Info *ghlInfo, const int index ) { (void)index; return VK_StopGhoul2BoneAnim( ghlInfo ) ? qtrue : qfalse; }
+qboolean G2API_StopBoneAnim( CGhoul2Info *ghlInfo, const char *boneName ) { return VK_StopGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ) ) ? qtrue : qfalse; }
+qboolean G2API_StopBoneAnimIndex( CGhoul2Info *ghlInfo, const int index ) { return VK_StopGhoul2BoneAnim( ghlInfo, index ) ? qtrue : qfalse; }
 qboolean G2API_StopBoneAngles( CGhoul2Info *ghlInfo, const char *boneName ) { (void)ghlInfo; (void)boneName; return qfalse; }
 qboolean G2API_StopBoneAnglesIndex( CGhoul2Info *ghlInfo, const int index ) { (void)ghlInfo; (void)index; return qfalse; }
 

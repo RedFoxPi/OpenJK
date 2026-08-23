@@ -769,6 +769,24 @@ itself), only genuinely live, per-instance, mathematically real animation
 playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
+**Correction, found much later (see "Character animation investigation:
+two real bugs, one test-harness and one functional" below): the specific
+`wait 100`/`wait 400` observations above can't be trusted.** `com_fixedtime`
+(used to control for
+render-speed timing skew here) is not this cvar's real registered name -
+`fixedtime` is - and it's not possible to determine after the fact whether
+the console commands actually run for this checkpoint used the correct
+name or not. What's still true regardless: the underlying *mechanism*
+described (this renderer's single-track animation reaching its own "done"
+signal at a different real time than vanilla's real per-region blended one,
+which cascades into ICARUS camera-cut timing) is real and confirmed by
+reading the actual G2API call pattern (see the per-bone-animation-state
+fix, README section below) - just not necessarily illustrated by the exact
+`wait_frames` values and screenshots cited here. The per-slot skin-buffer
+fix itself (the actual subject of this checkpoint) is unaffected by any of
+this - it's pure Vulkan command-buffer/memory-timing correctness, verified
+independently of simulated-game-time control.
+
 ### Runtime polys (tr_model.cpp)
 
 `RE_AddPolyToScene` was a stub until now - every call from game code (blaster
@@ -1217,6 +1235,109 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
+## Character animation investigation: two real bugs, one test-harness and
+one functional
+
+A direct, side-by-side `rd-vanilla` vs. this renderer comparison at
+matched simulated time (following up on the "Live animation" checkpoint's
+own camera-cut-timing caveat above) turned up something worth its own
+write-up: at `sp_academy1_spawn`'s scripted `wait_frames` value, this
+renderer showed the intro cutscene's camera at a completely different
+cut - the player character in side profile against two courtyard pillars -
+while `rd-vanilla` at the identical `wait_frames` still showed the
+cutscene's very first front-facing portrait shot. Not a subtle drift; a
+different scene entirely. This looked exactly like it should be the "Live
+animation" checkpoint's documented ICARUS-timing-divergence mechanism
+(this renderer's single-track animation reaching its own "done" signal at
+a different real time than vanilla's real per-region blended one) finally
+showing up somewhere severe enough to actually chase down.
+
+**Bug 1 (functional, in this renderer): `G2API_GetBoneIndex` always
+returned -1.** Reading rd-vanilla's real `bg_panimate.cpp` confirmed the
+"Live animation" checkpoint's mechanism was real: the game calls
+`G2API_SetBoneAnimIndex`/`GetBoneAnimIndex` *separately* for `bodyBone`
+(legs) and `torsBone` (upper body) - e.g. `bodyAnimating`/`torsAnimating`
+are genuinely independent per-region completion checks - and this
+renderer's `VK_SetGhoul2BoneAnim`/`GetBoneAnim` collapsed every call,
+regardless of target, into one shared whole-skeleton track, so a query for
+one region could silently return a *different* region's timing entirely.
+But `bodyBone`/`torsBone` themselves come from `gi.G2API_GetBoneIndex(...,
+boneName, ...)` (`g_client.cpp` and ~60 other call sites across
+`g_combat.cpp`, `g_turret.cpp`, `g_emplaced.cpp`, `g_mover.cpp`, ...), and
+this renderer's implementation was `{ return -1; }` unconditionally,
+regardless of input - a stub nobody had noticed because the bone-collision
+bug above meant every caller's index was already being ignored anyway.
+Fixed both together, since fixing one without the other would have
+accomplished nothing: `G2API_GetBoneIndex` now resolves a bone name to its
+real skeleton index via the existing `VK_FindGhoul2Bone` lookup (already
+used for bolts), `s_ghoul2AnimState` is now keyed by `(CGhoul2Info*,
+boneIndex)` instead of just `CGhoul2Info*`, and `VK_ComputeGhoul2Pose`
+resolves each bone's frame by walking up its parent chain to the nearest
+bone with its own explicit track (itself or an ancestor) - the real
+engine's own bone-tree inheritance rule (a `torsBone` override only
+affects that bone and its descendants; everything else keeps whichever
+ancestor's track actually covers it), not the previous single frame
+applied uniformly to the whole skeleton. This is a real, confirmed
+correctness fix, verified by reading the actual call pattern it fixes -
+**but empirically it changed nothing for academy1's specific divergence**:
+instrumenting `VK_SetGhoul2BoneAnim` directly confirmed *zero* calls to it
+happen anywhere in that scene's captured window (the player's held idle
+pose there apparently never re-triggers `NPC_SetAnim`/`PM_SetAnimFinal`),
+so a per-bone-tracking bug literally couldn't have been the culprit for
+*this* symptom. It's still real, valuable infrastructure for any scene
+that does exercise multi-region animation (combat gestures, torso
+aim-independent-of-legs, etc.) - see below for the diff that isolated its
+actual (lack of) effect on the scenes this renderer's test suite covers.
+
+**Bug 2 (test harness, much bigger in practice): the `fixedtime` cvar
+was never actually being set.** Chasing why the per-bone fix changed
+nothing led to checking whether `fixedtime` itself was even doing its job,
+and it wasn't: `com_fixedtime` (the name used throughout this file,
+`tests/render-regression/scenes.json`, and every ad-hoc console command
+run during this whole investigation) is the cvar's **C++ variable name**,
+not its **registered name** - `qcommon/common.cpp`'s own
+`Cvar_Get("fixedtime", "0", CVAR_CHEAT)` call registers it as `"fixedtime"`
+with no `com_` prefix at all. `+set com_fixedtime 16` doesn't error or
+warn - `+set` silently creates a brand new, entirely unrelated,
+never-read cvar with that literal name - so every capture in this entire
+project that used `com_fixedtime` (which, per a repository-wide search
+while fixing this, is *all of them*) ran with genuinely uncontrolled,
+render-speed-dependent `wait_frames` timing the whole time, exactly the
+failure mode `fixedtime` exists to prevent. Re-running the academy1
+comparison with the *correct* `+set fixedtime 16` changed the result
+completely: at the same `wait_frames` this renderer was diverging at,
+`rd-vanilla` now also lands on the wide balcony cutscene shot, with
+similar NPC counts/positions/poses - not the front-facing portrait it
+showed under the broken cvar. The dramatic, "completely different scene"
+divergence that kicked off this whole investigation was, in large part, an
+artifact of comparing two renderers at genuinely different, uncontrolled
+points in the same script - not a rendering or animation bug. Fixed in
+`tests/render-regression/scenes.json` (`extra_set` now says `"fixedtime"`)
+and in every `com_fixedtime` reference across this file and
+`tests/render-regression/README.md`.
+
+**What this does and doesn't mean for character animation quality**:
+with `fixedtime` actually working, a fresh `sp_academy1_spawn` diff still
+isn't a pixel `MATCH` (`MAJOR_DIFF`, ~23% mean difference) - but visually
+inspecting the diff image shows the *same* camera cut, the *same* rough
+NPC layout and poses, with the difference concentrated in lighting/texture
+edges (the already-documented `.shader`-script gap, not different
+geometry or poses). That's a fundamentally different, far less alarming
+picture than "the two renderers are showing different scenes entirely."
+This doesn't mean animation is pixel-perfect - the single-track,
+no-blend, no-sub-frame-interpolation simplifications documented in "Live
+animation" above are all still real and still there - but the *severity*
+originally observed was substantially a test-methodology artifact, not
+proof of a severe animation bug beyond what was already known and scoped.
+
+**One thing this investigation explicitly ruled out**: `sp_yavin1_spawn`'s
+pre-existing ICARUS crash (documented above) was hypothesized to be
+possibly related to a wrong G2API animation-completion signal - it isn't,
+or at least not *this* one. Re-tested after the `G2API_GetBoneIndex`/
+per-bone fix above with the real `fixedtime` cvar: identical crash, same
+assertion, same line. That hypothesis is now closed; the real cause is
+still unknown and still out of scope for this write-up.
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -1514,29 +1635,44 @@ camera investigations above). Two renderers with different per-frame cost
 reach different points along a real-time-paced ICARUS script by the time
 each has rendered its Nth frame, making any comparison at a fixed
 `wait_frames` an apples-to-oranges snapshot unless the scene happens to be
-static. **Fix: `+set com_fixedtime <ms>`** (`qcommon/common.cpp`'s
+static. **Fix: `+set fixedtime <ms>`** (`qcommon/common.cpp`'s
 `Com_ModifyMsec`) forces *every* frame - regardless of how long it actually
 took to render - to advance the simulated clock by exactly that many
-milliseconds, making `wait_frames * com_fixedtime` a precise, renderer-
-speed-independent amount of game time. Verified on hoth2: with
-`com_fixedtime 16` set, `rd-vanilla` and this renderer given the *same*
-`wait 750` (≈12s of simulated time) land at matching points in the intro
-cutscene - vanilla's screenshot shows the NPC's raised datapad in frame
-against the ship, and this renderer's shows the same datapad-shaped object
-at nearly the same screen position and framing, where without
-`com_fixedtime` the two would show entirely different, incomparable moments
-of the same script (as they did throughout the earlier hoth2 investigation
-above, before this was discovered). It's `CVAR_CHEAT`-flagged but freely
+milliseconds, making `wait_frames * fixedtime` a precise, renderer-
+speed-independent amount of game time. It's `CVAR_CHEAT`-flagged but freely
 settable here since `devmap` auto-enables cheats in SP.
 
+**The cvar's real name is `fixedtime`, not `com_fixedtime`** - its C++
+variable is named `com_fixedtime`, but the string actually registered with
+`Cvar_Get` (`qcommon/common.cpp`) is `"fixedtime"`, and `+set`/config-file
+cvar references go by that registered name, not the variable name. Whether
+the original investigation into this technique typed the correct
+`+set fixedtime <ms>` directly at the console isn't something that can be
+verified after the fact, but the wrong key (`com_fixedtime`) is what ended
+up permanently baked into `tests/render-regression/scenes.json`'s
+automation - and went undetected for a long time, because `+set` silently
+creates a new, harmless-looking, entirely unread cvar for any unrecognized
+name rather than erroring. See "Character animation investigation: two
+real bugs, one test-harness and one functional" further below for the full
+account of how this was finally caught, what it actually changed once
+fixed, and why the specific hoth2/academy1 screenshots this section used
+to cite as "verified" matches are no longer cited here - they can't be
+vouched for without knowing
+whether that particular investigation's own commands used the correct name
+or not, and re-deriving that with certainty isn't possible after the fact.
+
 This is no longer just a manual technique for one-off investigations -
-`tests/render-regression/scenes.json` now sets `com_fixedtime` on every
-map-based scene (see that harness's own README for the same explanation
-from the "comparing two captures" side), so any future `capture.py` run
-against this renderer and `rd-vanilla` produces genuinely comparable
-screenshots by default, and `diff.py`'s mean-pixel-difference numbers on
-those scenes reflect real rendering differences rather than an unrelated
-mix of "different rendering" and "different moment of the same script."
-Screenshot pairs captured before this was added to `scenes.json` don't
-have that property and shouldn't be used to draw conclusions about a
-`MAJOR_DIFF`/`MINOR_DIFF` result on any scene with a `map`.
+`tests/render-regression/scenes.json` sets `fixedtime` on every map-based
+scene (see that harness's own README for the same explanation from the
+"comparing two captures" side, and its own note on this same cvar-name
+mistake), so any future `capture.py` run against this renderer and
+`rd-vanilla` produces genuinely comparable screenshots by default, and
+`diff.py`'s mean-pixel-difference numbers on those scenes reflect real
+rendering differences rather than an unrelated mix of "different
+rendering" and "different moment of the same script." Screenshot pairs
+captured before `fixedtime` was set *under its correct name* don't have
+that property and shouldn't be used to draw conclusions about a
+`MAJOR_DIFF`/`MINOR_DIFF` result on any scene with a `map` - which, given
+the mistake above, includes essentially every capture taken via
+`scenes.json` before the fix described below, not just captures from
+before `com_fixedtime` was added to it at all.

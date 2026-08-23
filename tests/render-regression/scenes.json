@@ -14,7 +14,7 @@
       "binary": "sp",
       "map": "academy1",
       "wait_frames": 300,
-      "extra_set": {"com_fixedtime": 16},
+      "extra_set": {"fixedtime": 16},
       "notes": "Indoor/outdoor academy courtyard (opening tutorial level). Static architectural geometry, a skeletal (Ghoul2) NPC model, sky portal, basic lighting."
     },
     {
@@ -22,7 +22,7 @@
       "binary": "sp",
       "map": "hoth2",
       "wait_frames": 300,
-      "extra_set": {"com_fixedtime": 16},
+      "extra_set": {"fixedtime": 16},
       "notes": "Snow/ice exterior level. Different lighting/fog profile and outdoor terrain geometry from academy1."
     },
     {
@@ -30,7 +30,7 @@
       "binary": "sp",
       "map": "yavin1",
       "wait_frames": 300,
-      "extra_set": {"com_fixedtime": 16},
+      "extra_set": {"fixedtime": 16},
       "notes": "Jungle/temple exterior. Vegetation (alpha-tested foliage), large outdoor sky, likely water."
     },
     {
@@ -38,7 +38,7 @@
       "binary": "sp",
       "map": "vjun1",
       "wait_frames": 300,
-      "extra_set": {"com_fixedtime": 16},
+      "extra_set": {"fixedtime": 16},
       "notes": "Dark atmospheric Imperial facility. Exercises dynamic/colored lighting, fog, and any rain/atmospheric particle effects distinct from the daylight outdoor levels."
     },
     {
@@ -46,7 +46,7 @@
       "binary": "mp",
       "map": "ctf1",
       "wait_frames": 300,
-      "extra_set": {"com_fixedtime": 16},
+      "extra_set": {"fixedtime": 16},
       "notes": "MP renderer coverage (codemp/rd-vanilla is a separate code copy from code/rd-vanilla/SP - needs its own exercising). CTF map, open outdoor + structure geometry."
     },
     {
@@ -54,7 +54,7 @@
       "binary": "mp",
       "map": "duel1",
       "wait_frames": 300,
-      "extra_set": {"com_fixedtime": 16},
+      "extra_set": {"fixedtime": 16},
       "notes": "MP renderer, second/different map for broader MP-side geometry and shader coverage."
     }
   ]

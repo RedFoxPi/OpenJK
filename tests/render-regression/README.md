@@ -88,7 +88,7 @@ dark atmospheric lighting/fog, and both the SP and MP renderer code
 copies (`code/rd-vanilla` vs `codemp/rd-vanilla` are separate,
 independently-maintained copies of the same renderer).
 
-**Every map-based scene sets `com_fixedtime` (currently `16`, i.e. a fixed
+**Every map-based scene sets `fixedtime` (currently `16`, i.e. a fixed
 16ms/frame simulated timestep) via `extra_set`** - this is what makes
 `wait_frames` mean something comparable across two different renderer
 builds/binaries at all. Without it, `wait_frames` counts *rendered client
@@ -99,9 +99,9 @@ time-paced content (NPC animations, scripted camera cuts, ICARUS cutscene
 timing) has advanced far less than it has for a faster renderer at that
 same `wait_frames` value - the two screenshots end up capturing genuinely
 different moments of the scene, not the same moment rendered two ways.
-`com_fixedtime` forces every frame, regardless of how long it actually took
+`fixedtime` forces every frame, regardless of how long it actually took
 to render, to advance the simulated clock by exactly that many
-milliseconds - making `wait_frames × com_fixedtime` a precise, renderer-
+milliseconds - making `wait_frames × fixedtime` a precise, renderer-
 speed-independent target instead. This was found and verified empirically,
 not assumed: see `code/rd-vulkan/README.md`'s "Testing headlessly" and
 "Live animation" sections for the investigation (a case where two
@@ -110,6 +110,23 @@ identical `wait_frames` without this, and matched closely with it) that
 led to adding it here. If you add a scene with a `map`, set it too, unless
 the scene is deliberately testing something time-*independent* (a static
 frame-0-equivalent snapshot) where simulated time genuinely doesn't matter.
+
+**The cvar's real name is `fixedtime`, not `com_fixedtime`** (its C++
+variable is `com_fixedtime` in `qcommon/common.cpp`, but the string
+actually passed to `Cvar_Get` - what `+set`/`extra_set` must use - is
+`"fixedtime"`). `scenes.json` used the wrong key (`com_fixedtime`) from
+the point this section was first added until it was caught during a later
+animation-comparison investigation - `+set com_fixedtime 16` silently
+creates a brand new, unrelated, never-read cvar (`+set` auto-vivifies
+unknown cvars) rather than erroring, so every capture taken with the wrong
+key ran at genuinely uncontrolled `wait_frames`-counts-real-frames timing
+the whole time, with nothing in the tool's output to suggest otherwise.
+See `code/rd-vulkan/README.md`'s "A capture-harness bug that invalidated a
+run of 'verified' claims" section (the *second* one - the earlier
+harness-bug section covers a different, `cl_renderer`-related mistake) for
+the full account and what it changed once actually fixed. If you're
+scripting captures directly rather than through `scenes.json`, double-check
+you're typing `+set fixedtime <ms>`, not `+set com_fixedtime <ms>`.
 
 ## Comparing two renderers (`diff.py`)
 
@@ -137,9 +154,10 @@ right now, with `rd-vulkan`'s `.shader`-script gap (see
 and treat the diff image as a diagnostic, not a pass/fail signal.
 
 **A `MAJOR_DIFF` is only informative if both screenshots are actually of
-the same moment** - see the `com_fixedtime` note above. Scene captures
-taken before `com_fixedtime` was added to `scenes.json` can't be trusted
-to isolate genuine rendering differences from this timing confound; a
+the same moment** - see the `fixedtime` note above. Scene captures
+taken before `fixedtime` was added *and correctly named* in `scenes.json`
+can't be trusted to isolate genuine rendering differences from this timing
+confound; a
 `MAJOR_DIFF` on an old capture pair may partly or entirely be "two
 different points in the same cutscene," not a rendering bug. Re-capture
 with the current `scenes.json` before drawing conclusions from a diff on

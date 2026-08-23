@@ -666,7 +666,13 @@ static int VK_GetGhoul2BonePoolIndex( const mdxaHeader_t *header, int frame, int
 // elsewhere for bolt queries against a fixed reference pose and an
 // optional, cvar-gated "unsquash" renormalization pass - not the ordinary
 // animated-mesh-skinning path this function feeds.
-static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdxaHeader_t *header, int frame,
+// Defined further below, alongside the rest of the live per-bone animation
+// state it reads (VulkanGhoul2AnimState/s_ghoul2AnimState) - forward
+// declared here since VK_ComputeGhoul2Pose needs it and this function
+// (bone-matrix composition) predates that state in file order.
+static int VK_ResolveGhoul2BoneFrame( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime );
+
+static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdxaHeader_t *header, const std::vector<int> &boneFrame,
 	int boneIndex, std::vector<mdxaBone_t> &outBones, std::vector<bool> &computed )
 {
 	if ( computed[boneIndex] )
@@ -676,7 +682,7 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 
 	mdxaBone_t delta;
 	const mdxaCompQuatBone_t *pool = (const mdxaCompQuatBone_t *)( (const byte *)header + header->ofsCompBonePool );
-	int poolIndex = VK_GetGhoul2BonePoolIndex( header, frame, boneIndex );
+	int poolIndex = VK_GetGhoul2BonePoolIndex( header, boneFrame[boneIndex], boneIndex );
 	MC_UnCompressQuat( delta.matrix, pool[poolIndex].Comp );
 
 	int parent = skel.bones[boneIndex].parent;
@@ -686,13 +692,13 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 	}
 	else
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, frame, parent, outBones, computed );
+		VK_ComputeGhoul2BoneRecursive( skel, header, boneFrame, parent, outBones, computed );
 		VK_Multiply3x4Matrix( &outBones[boneIndex], &outBones[parent], &delta );
 	}
 	computed[boneIndex] = true;
 }
 
-void VK_ComputeGhoul2Pose( int skeletonIndex, int frame, std::vector<mdxaBone_t> &outBones )
+void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones )
 {
 	outBones.clear();
 	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
@@ -704,36 +710,67 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, int frame, std::vector<mdxaBone_t>
 	{
 		return;
 	}
-	if ( frame < 0 || frame >= skel.numFrames )
-	{
-		frame = 0;
-	}
 
 	const mdxaHeader_t *header = (const mdxaHeader_t *)skel.fileData.data();
 	int numBones = (int)skel.bones.size();
 	outBones.resize( numBones );
 	std::vector<bool> computed( numBones, false );
+
+	// Each bone picks up whichever track actually controls it (itself or
+	// the nearest ancestor with one set - see VK_ResolveGhoul2BoneFrame's
+	// comment) *before* the hierarchy composition pass below, so a child
+	// bone's parent is composed using the parent's own (possibly
+	// different) resolved frame, not the child's - exactly the real
+	// engine's per-region behavior, not a single shared frame applied
+	// uniformly to every bone like this function did before.
+	std::vector<int> boneFrame( numBones );
 	for ( int i = 0; i < numBones; i++ )
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, frame, i, outBones, computed );
+		int frame = VK_ResolveGhoul2BoneFrame( skel, ghlInfo, i, currentTime );
+		if ( frame < 0 || frame >= skel.numFrames )
+		{
+			frame = 0;
+		}
+		boneFrame[i] = frame;
+	}
+	for ( int i = 0; i < numBones; i++ )
+	{
+		VK_ComputeGhoul2BoneRecursive( skel, header, boneFrame, i, outBones, computed );
 	}
 }
 
-// Live animation state per Ghoul2 model instance, driven by
-// G2API_SetBoneAnim (tr_init.cpp's thin wrapper calls into
-// VK_SetGhoul2BoneAnim below) - a deliberate simplification of the real
-// engine's design: one whole-skeleton animation track per CGhoul2Info
-// instance, not independently-blended per-bone-subtree tracks (the real
-// game calls SetBoneAnim separately for e.g. "lower_lumbar"/"upper_lumbar"/
-// "thoracic" to blend legs/torso/arms independently - see bg_panimate.cpp).
-// Here the *last* SetBoneAnim call for a given instance simply wins for the
-// whole skeleton, regardless of which bone name it targeted - a visibly
-// cruder result than real independent limb blending, but a real, live,
-// correctly time-driven animation instead of a permanently frozen single
-// static frame. No animation blending/crossfade between two clips, and no
-// sub-frame interpolation between two adjacent whole frames either (both
-// real, visible-quality features of rd-vanilla's G2_TimingModel this
-// intentionally doesn't reproduce - see README.md).
+// Live animation state per Ghoul2 model instance *and bone*, driven by
+// G2API_SetBoneAnim (tr_init.cpp's thin wrappers call into
+// VK_SetGhoul2BoneAnim below). This used to be one shared whole-skeleton
+// track per CGhoul2Info instance regardless of which bone a SetBoneAnim
+// call targeted - a real, confirmed-by-direct-comparison-against-vanilla
+// bug, not just a visual simplification: the real game calls SetBoneAnim
+// separately per body region (bg_panimate.cpp calls it for `bodyBone`
+// (legs, generally near the skeleton root) and `torsBone` (upper body,
+// e.g. "lower_lumbar") independently, and *queries* GetBoneAnim
+// separately per region too, e.g. `bodyAnimating`/`torsAnimating`
+// checking each region's own completion) - collapsing them into one
+// shared slot meant the second SetBoneAnim call silently overwrote the
+// first, so a later GetBoneAnim query for the *first* region's bone
+// returned the *second* region's timing entirely. Since game/ICARUS logic
+// (e.g. "wait until this animation finishes") branches on exactly that
+// query, a wrong answer doesn't just look cruder, it desyncs downstream
+// script timing - confirmed as the actual cause of camera cuts landing at
+// completely different points between this renderer and vanilla at the
+// same simulated time (see README.md's "Character animation: per-bone
+// state" section for the side-by-side comparison that led here).
+//
+// Still a real, deliberate simplification versus the true engine, kept
+// for the same reasons as before: no cross-fade/blend *between* two
+// animations sharing overlapping bones, and no sub-frame interpolation
+// between two adjacent whole frames (both real, visible-quality features
+// of rd-vanilla's G2_TimingModel this doesn't reproduce - see README.md).
+// What changed is that the *bone-region* separation itself - which track
+// controls which part of the skeleton - is now real, not simulated by a
+// single flattened track, via a hierarchy walk in VK_ComputeGhoul2Pose:
+// each bone uses the nearest track set on itself or an ancestor, matching
+// the real engine's own bone-tree-based resolution (mentioned, but not
+// implemented, in this renderer's earlier "Live animation" checkpoint).
 struct VulkanGhoul2AnimState
 {
 	int startFrame = 0;
@@ -743,13 +780,18 @@ struct VulkanGhoul2AnimState
 	float animSpeed = 0.0f;
 	int flags = 0;
 };
-// Keyed by CGhoul2Info identity - the exact pointer game code calls
+// Outer key: CGhoul2Info identity - the exact pointer game code calls
 // G2API_SetBoneAnim with (e.g. &gent->ghoul2[gent->playerModel] in
 // bg_panimate.cpp). refEntity_t::ghoul2 (tr_types.h) is a pointer to the
 // game-owned CGhoul2Info_v, not a per-frame copy, so &(*ent.ghoul2)[slot]
 // in VK_DrawGhoul2Entities below is the same address on every frame for
-// the same in-game entity/sub-model.
-static std::unordered_map<const CGhoul2Info *, VulkanGhoul2AnimState> s_ghoul2AnimState;
+// the same in-game entity/sub-model. Inner key: the real skeleton bone
+// index this track was set on (see VK_ResolveGhoul2AnimBone's comment,
+// tr_init.cpp, for how By-name G2API calls resolve to this same space) -
+// -1 is an ordinary map key here, not a special "whole skeleton" bucket,
+// used only when a caller's bone name/index genuinely couldn't be
+// resolved.
+static std::unordered_map<const CGhoul2Info *, std::unordered_map<int, VulkanGhoul2AnimState>> s_ghoul2AnimState;
 
 // BONE_ANIM_OVERRIDE_LOOP's real value (game/ghoul2_shared.h) - not
 // included from here (a game-side header this renderer doesn't otherwise
@@ -791,13 +833,13 @@ static float VK_ComputeGhoul2AnimFrame( const VulkanGhoul2AnimState &state, int 
 	return frame;
 }
 
-void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int startFrame, int endFrame, int flags, float animSpeed, int startTime )
+void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startFrame, int endFrame, int flags, float animSpeed, int startTime )
 {
 	if ( !ghlInfo )
 	{
 		return;
 	}
-	VulkanGhoul2AnimState &state = s_ghoul2AnimState[ghlInfo];
+	VulkanGhoul2AnimState &state = s_ghoul2AnimState[ghlInfo][boneIndex];
 	state.startFrame = startFrame;
 	state.endFrame = endFrame;
 	state.startTime = startTime;
@@ -806,14 +848,19 @@ void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int startFrame, int endFr
 	state.flags = flags;
 }
 
-bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int currentTime, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed )
+bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int currentTime, float *currentFrame, int *startFrame, int *endFrame, int *flags, float *animSpeed )
 {
-	auto it = s_ghoul2AnimState.find( ghlInfo );
-	if ( it == s_ghoul2AnimState.end() )
+	auto instIt = s_ghoul2AnimState.find( ghlInfo );
+	if ( instIt == s_ghoul2AnimState.end() )
 	{
 		return false;
 	}
-	const VulkanGhoul2AnimState &state = it->second;
+	auto boneIt = instIt->second.find( boneIndex );
+	if ( boneIt == instIt->second.end() )
+	{
+		return false;
+	}
+	const VulkanGhoul2AnimState &state = boneIt->second;
 	if ( startFrame ) *startFrame = state.startFrame;
 	if ( endFrame ) *endFrame = state.endFrame;
 	if ( flags ) *flags = state.flags;
@@ -822,41 +869,70 @@ bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int currentTime, float *c
 	return true;
 }
 
-bool VK_PauseGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int currentTime )
+bool VK_PauseGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int currentTime )
 {
-	auto it = s_ghoul2AnimState.find( ghlInfo );
-	if ( it == s_ghoul2AnimState.end() )
+	auto instIt = s_ghoul2AnimState.find( ghlInfo );
+	if ( instIt == s_ghoul2AnimState.end() )
 	{
 		return false;
 	}
-	it->second.pauseTime = currentTime;
+	auto boneIt = instIt->second.find( boneIndex );
+	if ( boneIt == instIt->second.end() )
+	{
+		return false;
+	}
+	boneIt->second.pauseTime = currentTime;
 	return true;
 }
 
-bool VK_IsGhoul2BoneAnimPaused( const CGhoul2Info *ghlInfo )
+bool VK_IsGhoul2BoneAnimPaused( const CGhoul2Info *ghlInfo, int boneIndex )
 {
-	auto it = s_ghoul2AnimState.find( ghlInfo );
-	return it != s_ghoul2AnimState.end() && it->second.pauseTime != 0;
+	auto instIt = s_ghoul2AnimState.find( ghlInfo );
+	if ( instIt == s_ghoul2AnimState.end() )
+	{
+		return false;
+	}
+	auto boneIt = instIt->second.find( boneIndex );
+	return boneIt != instIt->second.end() && boneIt->second.pauseTime != 0;
 }
 
-bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo )
+bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex )
 {
-	return s_ghoul2AnimState.erase( ghlInfo ) > 0;
+	auto instIt = s_ghoul2AnimState.find( ghlInfo );
+	if ( instIt == s_ghoul2AnimState.end() )
+	{
+		return false;
+	}
+	return instIt->second.erase( boneIndex ) > 0;
 }
 
-// The frame to skin a model instance to right now - VK_ComputeGhoul2Pose's
-// frame argument. No recorded animation state (SetBoneAnim was never
-// called for this instance) falls back to frame 0, the prior static
-// behavior - see README.md's frame-0 caveat for what that does and doesn't
-// mean.
-int VK_GetGhoul2PoseFrame( const CGhoul2Info *ghlInfo, int currentTime )
+// The frame to skin one specific bone with right now, resolved by walking
+// from boneIndex up its parent chain (starting at itself) until a bone is
+// found with its own explicit track set on this instance - the real
+// engine's own bone-tree resolution rule (a track set on e.g. "lower_lumbar"
+// only controls that bone and its descendants; everything else keeps
+// whatever *its* nearest ancestor track says, typically a whole-body track
+// set on a bone near the skeleton root). Falls back to frame 0 (this
+// renderer's prior "never animated" default) if no bone from boneIndex up
+// to the root has any track at all - see README.md's frame-0 caveat.
+static int VK_ResolveGhoul2BoneFrame( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime )
 {
-	auto it = s_ghoul2AnimState.find( ghlInfo );
-	if ( it == s_ghoul2AnimState.end() )
+	auto instIt = s_ghoul2AnimState.find( ghlInfo );
+	if ( instIt == s_ghoul2AnimState.end() )
 	{
 		return 0;
 	}
-	return (int)VK_ComputeGhoul2AnimFrame( it->second, currentTime );
+	int walk = boneIndex;
+	while ( walk >= 0 )
+	{
+		auto boneIt = instIt->second.find( walk );
+		if ( boneIt != instIt->second.end() )
+		{
+			return (int)VK_ComputeGhoul2AnimFrame( boneIt->second, currentTime );
+		}
+		walk = skel.bones[walk].parent;
+	}
+	return 0;
 }
 
 // Recomputes one model instance's vertex buffer for a given pose - linear
@@ -2354,16 +2430,17 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 				continue;
 			}
 
-			// Live, per-instance animation frame (see VK_GetGhoul2PoseFrame's
-			// comment) - &g2Instance is the same CGhoul2Info identity real
-			// game code calls G2API_SetBoneAnim with, so this is genuinely
-			// that instance's own current frame, not shared with any other
-			// entity that happens to use the same cached model.
-			int targetFrame = VK_GetGhoul2PoseFrame( &g2Instance, currentTime );
+			// Live, per-instance, per-bone-region animation pose (see
+			// VK_ComputeGhoul2Pose's comment) - &g2Instance is the same
+			// CGhoul2Info identity real game code calls G2API_SetBoneAnim
+			// with, so every bone resolves to genuinely that instance's own
+			// current track for whichever body region controls it, not
+			// shared with any other entity using the same cached model, and
+			// not flattened onto one whole-skeleton frame either.
 			uint32_t skinSlot = model.nextSkinSlot;
 			model.nextSkinSlot = ( model.nextSkinSlot + 1 ) % GHOUL2_SKIN_SLOTS_PER_MODEL;
 			std::vector<mdxaBone_t> pose;
-			VK_ComputeGhoul2Pose( model.skeletonIndex, targetFrame, pose );
+			VK_ComputeGhoul2Pose( model.skeletonIndex, &g2Instance, currentTime, pose );
 			VK_SkinGhoul2Model( model, pose, skinSlot );
 
 			// Full push constant struct (mvp + camPos + fogColor), both
