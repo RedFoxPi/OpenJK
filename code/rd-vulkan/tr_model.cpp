@@ -253,12 +253,11 @@ static std::unordered_map<std::string, int> s_ghoul2ModelsByKey;
 // surface textures come entirely from an external .skin file (a simple
 // "surfacename,shaderpath" text format, one pair per line) applied at
 // runtime, exactly like rd-vanilla's real skin system (see rd-vanilla's
-// tr_skin.cpp for the format this parser matches - CommaParse/comment
-// handling/three-part "|" head|torso|lower macro skins are NOT implemented
-// here, just the common single-file case). Without this, VK_LoadGhoul2Model
-// would resolve zero images for any humanoid model and skip every surface -
-// this was confirmed against real game data (kyle/model.glm has 82 surfaces,
-// all with shader=="") before this was added.
+// tr_skin.cpp for the format this parser matches). Without this,
+// VK_LoadGhoul2Model would resolve zero images for any humanoid model and
+// skip every surface - this was confirmed against real game data
+// (kyle/model.glm has 82 surfaces, all with shader=="") before this was
+// added.
 struct VulkanSkin
 {
 	std::unordered_map<std::string, std::string> surfaceShaders; // lowercased surface name -> shader path
@@ -269,27 +268,29 @@ struct VulkanSkin
 static std::vector<VulkanSkin> s_skins;
 static std::unordered_map<std::string, int> s_skinsByName;
 
-int VK_RegisterSkin( const char *name )
+// Parses one real .skin file's "surfacename,shaderpath" lines into skin,
+// merging rather than replacing (a three-part composite skin - see
+// VK_RegisterSkin - calls this once per part, into the same VulkanSkin, just
+// like rd-vanilla's real RE_RegisterIndividualSkin keeps writing into the
+// same tr.skins[hSkin] across all three calls). Mirrors that function's
+// "_off" convention too: a line whose surface name ends in "_off" either
+// means "this is a redundant off-marker, already covered by the real
+// surface being skipped elsewhere" (shader literally "*off" - skip the line
+// entirely) or means "the surface normally named without _off should use
+// this shader" (any other shader - strip the suffix before storing). Returns
+// false only on a real read failure (file not found) - a per-line parse
+// issue is silently skipped, same as rd-vanilla's tokenizer would do for a
+// malformed line.
+static bool VK_ParseSkinFile( const char *fileName, VulkanSkin &skin )
 {
-	if ( !name || !name[0] )
-	{
-		return 0;
-	}
-	auto cached = s_skinsByName.find( name );
-	if ( cached != s_skinsByName.end() )
-	{
-		return cached->second;
-	}
-
 	void *buffer = nullptr;
-	long len = ri.FS_ReadFile( name, &buffer );
+	long len = ri.FS_ReadFile( fileName, &buffer );
 	if ( !buffer || len <= 0 )
 	{
-		ri.Printf( PRINT_WARNING, "rd-vulkan: VK_RegisterSkin: %s not found\n", name );
-		return 0;
+		ri.Printf( PRINT_WARNING, "rd-vulkan: VK_RegisterSkin: %s not found\n", fileName );
+		return false;
 	}
 
-	VulkanSkin skin;
 	const char *text = (const char *)buffer;
 	const char *lineStart = text;
 	for ( const char *p = text; ; p++ )
@@ -309,6 +310,18 @@ int VK_RegisterSkin( const char *name )
 				while ( !shaderName.empty() && (unsigned char)shaderName.back() <= ' ' ) shaderName.pop_back();
 				for ( char &c : surfName ) c = (char)tolower( (unsigned char)c );
 
+				if ( surfName.size() > 4 && surfName.compare( surfName.size() - 4, 4, "_off" ) == 0 )
+				{
+					if ( shaderName == "*off" )
+					{
+						surfName.clear(); // redundant off-marker, skip below
+					}
+					else
+					{
+						surfName.resize( surfName.size() - 4 );
+					}
+				}
+
 				if ( !surfName.empty() && !shaderName.empty() && surfName.compare( 0, 4, "tag_" ) != 0 )
 				{
 					skin.surfaceShaders[surfName] = shaderName;
@@ -319,6 +332,84 @@ int VK_RegisterSkin( const char *name )
 		}
 	}
 	ri.FS_FreeFile( buffer );
+	return true;
+}
+
+// Splits a three-part composite skin macro ("models/players/jedi_tf/
+// |head_a1|torso_a1|lower_a1") into its three real .skin file paths -
+// exact port of rd-vanilla's real RE_SplitSkins (tr_skin.cpp), which this
+// engine's NPC-customization system (randomized/selectable head+torso+
+// lower-body skin combinations, e.g. the generic "jedi_tf"/"jedi_hm"/...
+// models used for filler NPCs) relies on. Returns false (leaving the out
+// params untouched) if name has no '|' or is missing one of the two
+// required separators.
+static bool VK_SplitCompositeSkinName( const std::string &name, std::string &head, std::string &torso, std::string &lower )
+{
+	size_t bar1 = name.find( '|' );
+	if ( bar1 == std::string::npos )
+	{
+		return false;
+	}
+	size_t bar2 = name.find( '|', bar1 + 1 );
+	if ( bar2 == std::string::npos )
+	{
+		return false;
+	}
+	size_t bar3 = name.find( '|', bar2 + 1 );
+	if ( bar3 == std::string::npos )
+	{
+		return false;
+	}
+	std::string base = name.substr( 0, bar1 );
+	head = base + name.substr( bar1 + 1, bar2 - bar1 - 1 ) + ".skin";
+	torso = base + name.substr( bar2 + 1, bar3 - bar2 - 1 ) + ".skin";
+	lower = base + name.substr( bar3 + 1 ) + ".skin";
+	return true;
+}
+
+int VK_RegisterSkin( const char *name )
+{
+	if ( !name || !name[0] )
+	{
+		return 0;
+	}
+	auto cached = s_skinsByName.find( name );
+	if ( cached != s_skinsByName.end() )
+	{
+		return cached->second;
+	}
+
+	VulkanSkin skin;
+	std::string head, torso, lower;
+	bool ok;
+	if ( VK_SplitCompositeSkinName( name, head, torso, lower ) )
+	{
+		// Same de-duplication as RE_RegisterSkin: a part shared verbatim
+		// with an already-parsed one (very common - jedi_tf's generic
+		// customizations often reuse the same file for two of the three
+		// slots) is only read once, but that's a pure optimization here -
+		// re-parsing it again into the same map would be harmless, just
+		// redundant, since later identical-content writes overwrite
+		// identically. Kept anyway for a direct match against the real
+		// function's structure and log output.
+		ok = VK_ParseSkinFile( head.c_str(), skin );
+		if ( ok && torso != head )
+		{
+			ok = VK_ParseSkinFile( torso.c_str(), skin );
+		}
+		if ( ok && lower != head && lower != torso )
+		{
+			ok = VK_ParseSkinFile( lower.c_str(), skin );
+		}
+	}
+	else
+	{
+		ok = VK_ParseSkinFile( name, skin );
+	}
+	if ( !ok )
+	{
+		return 0;
+	}
 
 	if ( s_skins.empty() )
 	{

@@ -437,9 +437,27 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
   real contents. Without parsing it, every humanoid model resolved zero
   images and skipped every surface. `VK_RegisterSkin` (`tr_model.cpp`)
   parses the common single-file case (comma-separated lines, `tag_` lines
-  skipped); the three-part `head|torso|lower` macro skin syntax is **not**
-  implemented. `RE_RegisterSkin` now calls it for real (previously a stub
-  returning a fake handle `1`). The model cache key is
+  skipped) and the three-part `head|torso|lower` composite macro syntax
+  (`VK_SplitCompositeSkinName`/`VK_ParseSkinFile`, an exact port of
+  rd-vanilla's real `RE_SplitSkins`/`RE_RegisterIndividualSkin`, including
+  the `"_off"`-suffixed-surface-name convention). **This was originally left
+  unimplemented, on the assumption it was a rare/cosmetic feature - it
+  isn't**: academy1's generic filler-student NPCs (`jedi_tf`/`jedi_hm`/
+  `jedi_hf`/`jedi_kdm`/`jedi_zf`/`jedi_rm`, randomized head+torso+lower-body
+  combinations) all use this syntax, and with it unimplemented,
+  `VK_RegisterSkin` tried to `ri.FS_ReadFile` the literal macro string as a
+  filename, which of course never exists - every one of those NPCs resolved
+  *zero* drawable surfaces (`VK_LoadGhoul2Model`'s "has no drawable
+  surfaces" case) and was entirely invisible, not merely mis-posed. Found
+  while chasing a user's report that character poses still looked "far from
+  exact resemblance" to vanilla even after the animation.cfg fix above -
+  academy1's `ghoul2: 9/18 scene entities drew` log line was the tell (half
+  the NPCs weren't drawing *anything*); fixing this brought it to `18/18`
+  and the crowd/formation now visibly matches vanilla's same cutscene
+  moment, not just the handful of already-single-skinned named characters
+  (Kyle, Rosh, etc.) that happened to work before. `RE_RegisterSkin` now
+  calls it for real (previously a stub returning a fake handle `1`). The
+  model cache key is
   `(fileName, skinHandle)`, not just `fileName`, since the same `.glm`
   loaded with two different skins needs two different sets of baked
   per-surface textures/descriptor sets.
@@ -690,7 +708,7 @@ The follow-up to the above: `G2API_SetBoneAnim` and friends now really
 work, so a model instance plays the animation the game actually asked for,
 advancing over real time, instead of a permanently frozen frame 0.
 
-**Caveat added much later, see "Character animation investigation: three
+**Caveat added much later, see "Character animation investigation: four
 real bugs, and a wrong conclusion corrected" below**: everything in this
 section describes the frame-advance machinery working correctly in
 isolation, which it does - but for a long time afterward, none of it was
@@ -781,7 +799,7 @@ playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
 **Correction, found much later (see "Character animation investigation:
-three real bugs, and a wrong conclusion corrected" below): the specific
+four real bugs, and a wrong conclusion corrected" below): the specific
 `wait 100`/`wait 400` observations above can't be trusted.** `com_fixedtime`
 (used to control for
 render-speed timing skew here) is not this cvar's real registered name -
@@ -1246,7 +1264,7 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
-## Character animation investigation: three real bugs, and a wrong
+## Character animation investigation: four real bugs, and a wrong
 conclusion corrected
 
 **Bottom line up front, since the investigation below initially got this
@@ -1410,18 +1428,60 @@ so a bare `nullptr` on that pre-existing, separate skin-resolution gap
 would have turned a already-known cosmetic issue into a hard crash instead
 of leaving it exactly as visible (or not) as it was before.
 
+**Bug 4 (functional, in this renderer, found by a second round of user
+pushback): `VK_RegisterSkin` didn't implement the three-part
+`head|torso|lower` composite skin macro at all** - a scope cut the "Skin
+support" bullet above already disclosed, but one that turned out to matter
+far more than "cosmetic." Asked to check again after Bug 3 shipped, because
+the fixed poses still looked "far from exact resemblance" to vanilla side
+by side, direct comparison at matched crops showed vanilla's academy1
+courtyard with roughly twice as many visible NPCs as this renderer's -
+not a pose difference, an *entity count* difference. The log line
+`rd-vulkan: ghoul2: 9/18 scene entities drew 9 sub-model(s)` was the tell:
+half of academy1's NPCs weren't drawing anything at all. Those are the
+generic filler-student models (`jedi_tf`, `jedi_hm`, `jedi_hf`, `jedi_kdm`,
+`jedi_zf`, `jedi_rm` - randomized head+torso+lower-body combinations, used
+for background students in the sparring scene), and every one of them is
+assigned a skin name like `models/players/jedi_tf/|head_a1|torso_a1|lower_a1`
+rather than a plain `.skin` file path. `VK_RegisterSkin` had no special
+handling for the `|`-delimited macro syntax, so it tried to
+`ri.FS_ReadFile` that literal string as a filename (logged as
+`VK_RegisterSkin: ...|head_a1|torso_a1|lower_a1 not found`), got nothing,
+and every surface of every one of those models fell back to
+`VK_LoadGhoul2Model`'s "has no drawable surfaces" case - a fully loaded,
+fully animated, completely *invisible* entity. Fixed by porting
+rd-vanilla's real `RE_SplitSkins`/`RE_RegisterIndividualSkin` (`tr_skin.cpp`)
+as `VK_SplitCompositeSkinName`/`VK_ParseSkinFile` (`tr_model.cpp`): split the
+macro into its three real `.skin` file paths, parse and merge all three into
+one `VulkanSkin` (including the real `"_off"`-suffixed-surface-name
+handling, not just the common case), de-duplicating identical part paths the
+same way the real function does. Verified: academy1's log now reads
+`ghoul2: 18/18 scene entities drew 18 sub-model(s)`, and a direct crop
+comparison shows the full crowd/formation - not just the handful of
+already-single-skinned named characters that happened to work before -
+now visibly matching vanilla's NPC count and rough layout for the same
+cutscene moment.
+
 **What this actually means for character animation quality**: with all
-three bugs fixed, `sp_academy1_spawn` now shows NPCs in varied, distinct
-poses matching the general character of rd-vanilla's same cutscene moment
-(a sparring/training scene - some standing, some walking, some down) instead
-of one identical frozen pose repeated on every model. It is still not a
-pixel `MATCH` against rd-vanilla - the single-track, no-blend,
-no-sub-frame-interpolation simplifications documented in "Live animation"
-above are all still real and still there, and the specific choreographed
-beats of a scripted combat sequence won't line up frame-for-frame with
-vanilla's real multi-track blended timing - but animation is now actually
-*playing*, which it was not doing at all before this fix, on any character,
-in any scene, ever.
+four bugs fixed, `sp_academy1_spawn` now shows the *right number* of NPCs,
+in varied, distinct poses, in roughly the right formation, matching the
+general character of rd-vanilla's same cutscene moment (a sparring/training
+scene - some standing, some walking, some down) instead of one identical
+frozen pose repeated on a fraction of the models. The `diff.py` mean
+pixel-difference figure for `sp_academy1_spawn` dropped from ~23.5% (Bug
+3 fixed, Bug 4 not yet found) to ~17.1% (both fixed) against the matched-
+`fixedtime` vanilla capture. It is still not a pixel `MATCH`, and individual
+poses still don't line up frame-for-frame with vanilla's - the single-track,
+no-blend, no-sub-frame-interpolation simplifications documented in "Live
+animation" above are all still real and still there, so a scripted combat
+sequence's exact choreographed beats (which frame of which animation a
+given character is on at a given millisecond) won't match rd-vanilla's real
+multi-track blended timing model bone-for-bone without reproducing that
+model in full - a substantially larger undertaking than either bug fixed
+here. What changed is qualitative, not just quantitative: every character is
+now the right model, visible, and actually animating in a plausible,
+varied, roughly-correctly-timed way, which was not true at all before this
+investigation.
 
 **One thing this investigation explicitly ruled out**: `sp_yavin1_spawn`'s
 pre-existing ICARUS crash (documented above) was hypothesized to be
@@ -1745,7 +1805,7 @@ verified after the fact, but the wrong key (`com_fixedtime`) is what ended
 up permanently baked into `tests/render-regression/scenes.json`'s
 automation - and went undetected for a long time, because `+set` silently
 creates a new, harmless-looking, entirely unread cvar for any unrecognized
-name rather than erroring. See "Character animation investigation: three
+name rather than erroring. See "Character animation investigation: four
 real bugs, and a wrong conclusion corrected" further below for the full
 account of how this was finally caught, what it actually changed once
 fixed, and why the specific hoth2/academy1 screenshots this section used
