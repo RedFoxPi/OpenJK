@@ -332,12 +332,13 @@ int VK_RegisterSkin( const char *name )
 
 // Per-frame queue of entities added via RE_AddRefEntityToScene, cleared by
 // RE_ClearScene. RT_MODEL entities carrying a Ghoul2 model are drawn by
-// VK_DrawGhoul2Entities; RT_SPRITE/RT_ORIENTED_QUAD/RT_SABER_GLOW/RT_BEAM/
-// RT_LINE/RT_CYLINDER/RT_ELECTRICITY are drawn by VK_DrawScenePolys (same
-// function that draws RE_AddPolyToScene polys - see its comment for why).
-// Only RT_LATHE and RT_CLOUDS are still silently ignored, see README.md.
-// Runtime polys (RE_AddPolyToScene) are a separate queue, not a
-// refEntity_t at all - see s_scenePolys below.
+// VK_DrawGhoul2Entities; every other refEntityType_t (RT_SPRITE,
+// RT_ORIENTED_QUAD, RT_SABER_GLOW, RT_BEAM, RT_LINE, RT_CYLINDER,
+// RT_ELECTRICITY, RT_LATHE, RT_CLOUDS) is drawn by VK_DrawScenePolys (same
+// function that draws RE_AddPolyToScene polys - see its comment for why),
+// except RT_PORTALSURFACE, which real rd-vanilla doesn't draw either (see
+// README.md). Runtime polys (RE_AddPolyToScene) are a separate queue, not
+// a refEntity_t at all - see s_scenePolys below.
 static std::vector<refEntity_t> s_sceneEntities;
 static const size_t MAX_SCENE_ENTITIES = 256;
 
@@ -1986,6 +1987,288 @@ void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 	{
 		s_debugElectricityLogsRemaining--;
 		ri.Printf( PRINT_ALL, "rd-vulkan: RT_ELECTRICITY entities drawn: %d\n", drawnElectricityCount );
+	}
+
+	// RT_LATHE - a cubic-Bezier profile curve revolved ("lathed") a full
+	// circle around a fixed world Z axis anchored at ent.origin. Copied
+	// from rd-vanilla's real RB_SurfaceLathe (tr_surface.cpp). The profile
+	// is a 2D (radius, height) curve with 4 control points - ent.axis[0]
+	// (start), ent.axis[1]/ent.axis[2] (the two Bezier handles), and
+	// ent.oldorigin (end) - only their X/Y components are used, so despite
+	// the names these are curve-shape data here, not an orientation (same
+	// "reused per-reType" pattern as every union/axis[]/backlerp field
+	// elsewhere in this whole ref-entity series). ent.endTime optionally
+	// grows the visible profile length over the real second before it
+	// (real code: `d = 1 - (endTime - time)/1000`); ent.frame - here a real
+	// timestamp of a recent hit, not an RNG seed like RT_ELECTRICITY's use
+	// of the same field - drives a brief post-hit texture "pain" wobble
+	// that decays over one second, using the entity's own floatTime
+	// (`fd->time * 0.001 - ent.shaderTime`, matching the real per-entity
+	// `backEnd.refdef.floatTime` computation, tr_backend.cpp - the first
+	// ref-entity type in this series that actually needs it). Segment
+	// counts (both along the profile and around the lathe) are LOD-scaled
+	// by r_lodbias exactly like the real code - already clamped to a sane
+	// [1,4] range by the real formula itself, so unlike RT_ELECTRICITY's
+	// unclamped one, no extra defensive cap is needed here. Like
+	// RT_LINE/RT_CYLINDER/RT_ELECTRICITY, this resolves the entity's real
+	// customShader.
+	static int s_debugLatheLogsRemaining = 3;
+	int drawnLatheCount = 0;
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_LATHE )
+		{
+			continue;
+		}
+		if ( ent.renderfx & RF_THIRD_PERSON )
+		{
+			continue;
+		}
+
+		image_t *img = VK_GetImageByHandle( ent.customShader );
+		if ( !img )
+		{
+			continue;
+		}
+
+		float d = 1.0f;
+		if ( ent.endTime != 0.0f && ent.endTime > (float)fd->time )
+		{
+			d = 1.0f - ( ent.endTime - (float)fd->time ) / 1000.0f;
+		}
+		float entityFloatTime = (float)fd->time * 0.001f - ent.shaderTime;
+		float pain = 0.0f;
+		if ( ent.frame != 0 && (float)ent.frame + 1000.0f > (float)fd->time )
+		{
+			pain = ( (float)fd->time - (float)ent.frame ) / 1000.0f;
+			pain = ( 1.0f - pain ) * 0.08f;
+		}
+
+		int lod = r_lodbias->integer + 1;
+		if ( lod > 4 ) lod = 4;
+		if ( lod < 1 ) lod = 1;
+		float bezierStep = 0.05f * lod;
+		float latheStepDeg = 10.0f * lod;
+
+		float lOldPt[2] = { ent.axis[0][0], ent.axis[0][1] };
+		bool overflowed = false;
+
+		for ( float mu = 0.0f; mu <= 1.01f * d && !overflowed; mu += bezierStep )
+		{
+			float mum1 = 1.0f - mu;
+			float mum13 = mum1 * mum1 * mum1;
+			float mu3 = mu * mu * mu;
+			float group1 = 3.0f * mu * mum1 * mum1;
+			float group2 = 3.0f * mu * mu * mum1;
+
+			float lOldPt2[2];
+			for ( int i = 0; i < 2; i++ )
+			{
+				lOldPt2[i] = mum13 * ent.axis[0][i] + group1 * ent.axis[1][i] + group2 * ent.axis[2][i] + mu3 * ent.oldorigin[i];
+			}
+
+			float oldPt[2] = { lOldPt[0], 0.0f };
+			float oldPt2[2] = { lOldPt2[0], 0.0f };
+
+			for ( float t = latheStepDeg; t <= 360.0f; t += latheStepDeg )
+			{
+				float s = sinf( DEG2RAD( t ) );
+				float c = cosf( DEG2RAD( t ) );
+				float pt[2] = { lOldPt[0] * c, lOldPt[0] * s };
+				float pt2[2] = { lOldPt2[0] * c, lOldPt2[0] * s };
+
+				if ( cursor + 6 > POLY_VERTEX_BUFFER_CAPACITY )
+				{
+					overflowed = true;
+					break;
+				}
+
+				// Real code's texture-V wobble truncates this dot-product
+				// to an int before adding floatTime (`int i = pt[0]*0.1f +
+				// pt[1]*0.1f;`) - a real precision-losing quirk, preserved
+				// rather than "fixed" (see README.md's policy on this).
+				float corner[4][3] = {
+					{ oldPt[0], oldPt[1], lOldPt[1] },
+					{ oldPt2[0], oldPt2[1], lOldPt2[1] },
+					{ pt[0], pt[1], lOldPt[1] },
+					{ pt2[0], pt2[1], lOldPt2[1] },
+				};
+				float uv[4][2] = {
+					{ ( t - latheStepDeg ) / 360.0f, mu - bezierStep + cosf( (float)(int)( oldPt[0] * 0.1f + oldPt[1] * 0.1f ) + entityFloatTime ) * pain },
+					{ ( t - latheStepDeg ) / 360.0f, mu + cosf( (float)(int)( oldPt2[0] * 0.1f + oldPt2[1] * 0.1f ) + entityFloatTime ) * pain },
+					{ t / 360.0f, mu - bezierStep + cosf( (float)(int)( pt[0] * 0.1f + pt[1] * 0.1f ) + entityFloatTime ) * pain },
+					{ t / 360.0f, mu + cosf( (float)(int)( pt2[0] * 0.1f + pt2[1] * 0.1f ) + entityFloatTime ) * pain },
+				};
+				// Real indices (vbase,vbase+1,vbase+3),(vbase+3,vbase+2,vbase).
+				const int order[6] = { 0, 1, 3, 3, 2, 0 };
+
+				uint32_t firstVertex = cursor;
+				PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + cursor;
+				for ( int v = 0; v < 6; v++ )
+				{
+					int c4 = order[v];
+					out[v].pos[0] = ent.origin[0] + corner[c4][0];
+					out[v].pos[1] = ent.origin[1] + corner[c4][1];
+					out[v].pos[2] = ent.origin[2] + corner[c4][2];
+					out[v].uv[0] = uv[c4][0];
+					out[v].uv[1] = uv[c4][1];
+					out[v].color[0] = ent.shaderRGBA[0] / 255.0f;
+					out[v].color[1] = ent.shaderRGBA[1] / 255.0f;
+					out[v].color[2] = ent.shaderRGBA[2] / 255.0f;
+					out[v].color[3] = ent.shaderRGBA[3] / 255.0f;
+				}
+				cursor += 6;
+				VK_DrawPolyRange( cmd, img, firstVertex, 6 );
+
+				oldPt[0] = pt[0]; oldPt[1] = pt[1];
+				oldPt2[0] = pt2[0]; oldPt2[1] = pt2[1];
+			}
+
+			lOldPt[0] = lOldPt2[0]; lOldPt[1] = lOldPt2[1];
+		}
+		drawnLatheCount++;
+	}
+
+	if ( s_debugLatheLogsRemaining > 0 && drawnLatheCount > 0 )
+	{
+		s_debugLatheLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: RT_LATHE entities drawn: %d\n", drawnLatheCount );
+	}
+
+	// RT_CLOUDS - a disk (default) or tube (RF_GROW) built from a small
+	// fixed-size strip of (position, alpha, curve-height) keyframes lathed
+	// around a full circle, 30 degrees per step. Copied from rd-vanilla's
+	// real RB_SurfaceClouds (tr_surface.cpp). ent.radius/ent.rotation
+	// define the outer/inner radius (`stripDef[i]*(radius-rotation) +
+	// rotation`) and ent.backlerp scales the curve height - RF_GROW negates
+	// backlerp ("needs to be reversed", the real comment) and switches to
+	// the 6-keyframe tube table instead of the 4-keyframe disk one. Color
+	// is a real, deliberate quirk worth keeping exactly as rd-vanilla has
+	// it, not "fixed": RGB all come from `shaderRGBA[0]` (the red channel
+	// only) times the keyframe's own alpha value, while the vertex alpha
+	// itself stays constant at `shaderRGBA[3]` - the shape fades to black
+	// at its edges rather than fading transparent, only reading right
+	// under additive-style blending where black is already invisible.
+	// Texture coords are the vertex's final world-space X/Y scaled by 0.1,
+	// not a lathe-angle wraparound like RT_LATHE above. Like the rest of
+	// this bucket, resolves the entity's real customShader.
+	static int s_debugCloudsLogsRemaining = 3;
+	int drawnCloudsCount = 0;
+	for ( const refEntity_t &ent : s_sceneEntities )
+	{
+		if ( ent.reType != RT_CLOUDS )
+		{
+			continue;
+		}
+		if ( ent.renderfx & RF_THIRD_PERSON )
+		{
+			continue;
+		}
+
+		image_t *img = VK_GetImageByHandle( ent.customShader );
+		if ( !img )
+		{
+			continue;
+		}
+
+		static const float diskStripDef[4] = { 0.0f, 0.4f, 0.7f, 1.0f };
+		static const float diskAlphaDef[4] = { 1.0f, 1.0f, 0.4f, 0.0f };
+		static const float diskCurveDef[4] = { 0.0f, 0.0f, 0.008f, 0.02f };
+		static const float tubeStripDef[6] = { 0.0f, 0.05f, 0.1f, 0.5f, 0.7f, 1.0f };
+		static const float tubeAlphaDef[6] = { 0.0f, 0.45f, 1.0f, 1.0f, 0.45f, 0.0f };
+		static const float tubeCurveDef[6] = { 0.0f, 0.004f, 0.006f, 0.01f, 0.006f, 0.0f };
+
+		const float *stripDef, *alphaDef, *curveDef;
+		int count;
+		float backlerp = ent.backlerp;
+		if ( ent.renderfx & RF_GROW )
+		{
+			stripDef = tubeStripDef; alphaDef = tubeAlphaDef; curveDef = tubeCurveDef;
+			count = 6;
+			backlerp = -backlerp; // "needs to be reversed" - real comment
+		}
+		else
+		{
+			stripDef = diskStripDef; alphaDef = diskAlphaDef; curveDef = diskCurveDef;
+			count = 4;
+		}
+
+		const float latheStepDeg = 30.0f;
+		bool overflowed = false;
+
+		for ( int i = 0; i < count - 1 && !overflowed; i++ )
+		{
+			float oldPt[3] = { ( stripDef[i] * ( ent.radius - ent.rotation ) ) + ent.rotation, 0.0f, curveDef[i] * ent.radius * backlerp };
+			float oldPt2[3] = { ( stripDef[i + 1] * ( ent.radius - ent.rotation ) ) + ent.rotation, 0.0f, curveDef[i + 1] * ent.radius * backlerp };
+
+			for ( float t = latheStepDeg; t <= 360.0f; t += latheStepDeg )
+			{
+				float pt[3], pt2[3];
+				if ( t < 360.0f )
+				{
+					float s = sinf( DEG2RAD( latheStepDeg ) );
+					float c = cosf( DEG2RAD( latheStepDeg ) );
+					pt[0] = c * oldPt[0] - s * oldPt[1];
+					pt[1] = s * oldPt[0] + c * oldPt[1];
+					pt[2] = oldPt[2];
+					pt2[0] = c * oldPt2[0] - s * oldPt2[1];
+					pt2[1] = s * oldPt2[0] + c * oldPt2[1];
+					pt2[2] = oldPt2[2];
+				}
+				else
+				{
+					// Last segment glues directly back to the def points
+					// rather than continuing the incremental rotation, to
+					// avoid a visible seam from accumulated float error -
+					// same real reasoning as the comment in RB_SurfaceClouds.
+					pt[0] = ( stripDef[i] * ( ent.radius - ent.rotation ) ) + ent.rotation; pt[1] = 0.0f; pt[2] = curveDef[i] * ent.radius * backlerp;
+					pt2[0] = ( stripDef[i + 1] * ( ent.radius - ent.rotation ) ) + ent.rotation; pt2[1] = 0.0f; pt2[2] = curveDef[i + 1] * ent.radius * backlerp;
+				}
+
+				if ( cursor + 6 > POLY_VERTEX_BUFFER_CAPACITY )
+				{
+					overflowed = true;
+					break;
+				}
+
+				float world[4][3];
+				VectorAdd( ent.origin, oldPt, world[0] );
+				VectorAdd( ent.origin, oldPt2, world[1] );
+				VectorAdd( ent.origin, pt, world[2] );
+				VectorAdd( ent.origin, pt2, world[3] );
+				float vertexAlphaDef[4] = { alphaDef[i], alphaDef[i + 1], alphaDef[i], alphaDef[i + 1] };
+				const int order[6] = { 0, 1, 3, 3, 2, 0 };
+
+				uint32_t firstVertex = cursor;
+				PolyVertex *out = (PolyVertex *)vk.polyVertexBufferMapped + cursor;
+				for ( int v = 0; v < 6; v++ )
+				{
+					int c4 = order[v];
+					out[v].pos[0] = world[c4][0];
+					out[v].pos[1] = world[c4][1];
+					out[v].pos[2] = world[c4][2];
+					out[v].uv[0] = world[c4][0] * 0.1f;
+					out[v].uv[1] = world[c4][1] * 0.1f;
+					float rgb = ( ent.shaderRGBA[0] * vertexAlphaDef[c4] ) / 255.0f;
+					out[v].color[0] = rgb;
+					out[v].color[1] = rgb;
+					out[v].color[2] = rgb;
+					out[v].color[3] = ent.shaderRGBA[3] / 255.0f;
+				}
+				cursor += 6;
+				VK_DrawPolyRange( cmd, img, firstVertex, 6 );
+
+				VectorCopy( pt, oldPt );
+				VectorCopy( pt2, oldPt2 );
+			}
+		}
+		drawnCloudsCount++;
+	}
+
+	if ( s_debugCloudsLogsRemaining > 0 && drawnCloudsCount > 0 )
+	{
+		s_debugCloudsLogsRemaining--;
+		ri.Printf( PRINT_ALL, "rd-vulkan: RT_CLOUDS entities drawn: %d\n", drawnCloudsCount );
 	}
 }
 

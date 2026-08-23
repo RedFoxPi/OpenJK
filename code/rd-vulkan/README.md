@@ -1155,6 +1155,68 @@ mentions `sp_yavin1_spawn`, `hoth2`, `vjun1`, `academy1` alongside it from
 before this bug was found should be read as "the scenes that didn't crash
 before this was discovered," not as "yavin1 was confirmed fine."
 
+### RT_LATHE and RT_CLOUDS ref entities (tr_model.cpp)
+
+The last two `refEntityType_t` values - every one of them is now handled in
+some form (see "What's actually implemented" below). Both are lathed
+(surface-of-revolution) shapes, copied from rd-vanilla's real
+`RB_SurfaceLathe`/`RB_SurfaceClouds` (`tr_surface.cpp`), and both resolve
+the entity's real `customShader` like the rest of this bucket.
+
+`RT_LATHE` revolves a cubic-Bezier profile curve - `ent.axis[0]` (start),
+`ent.axis[1]`/`ent.axis[2]` (the two Bezier handles), and `ent.oldorigin`
+(end), only their X/Y components used as a 2D (radius, height) curve, not
+an actual orientation - a full circle around a fixed world Z axis anchored
+at `ent.origin`. `ent.endTime` optionally grows the visible profile length
+over the real second before it; `ent.frame` - here a real timestamp of a
+recent hit, not an RNG seed like `RT_ELECTRICITY`'s use of the same field -
+drives a brief post-hit texture "pain" wobble decaying over one second,
+using the entity's own floatTime (`fd->time * 0.001 - ent.shaderTime`,
+matching the real per-entity `backEnd.refdef.floatTime`,
+`tr_backend.cpp` - the first type in this series needing it). One quirk
+preserved exactly: the wobble's phase truncates a dot product to an `int`
+before use (real code: `int i = pt[0]*0.1f + pt[1]*0.1f;`) - a real
+precision-losing accident in rd-vanilla, not something to "fix" by keeping
+it as a float. Segment counts (both along the profile and around the
+lathe) are LOD-scaled by `r_lodbias` exactly like the real code - already
+clamped to a sane `[1,4]` range by the real formula itself, so unlike
+`RT_ELECTRICITY`'s unclamped one, no extra defensive cap was needed here.
+
+`RT_CLOUDS` is a disk (default) or tube (`RF_GROW`) built from a small
+fixed-size strip of (position, alpha, curve-height) keyframes lathed
+around a full circle, 30 degrees per step - `ent.radius`/`ent.rotation`
+set the outer/inner radius, `ent.backlerp` scales curve height, and
+`RF_GROW` negates `backlerp` ("needs to be reversed", the real comment)
+and switches from the 4-keyframe disk table to the 6-keyframe tube one. A
+real, deliberate-looking quirk kept exactly as rd-vanilla has it, not
+"fixed": color RGB all come from `shaderRGBA`'s **red channel only**,
+times the keyframe's own alpha value, while the vertex's actual alpha
+stays constant at `shaderRGBA[3]` - the shape fades to black at its edges
+rather than fading transparent, which only reads correctly under
+additive-style blending where black is already invisible. Texture
+coordinates are the vertex's final world-space X/Y scaled by `0.1`, not a
+lathe-angle wraparound like `RT_LATHE` above - a different, simpler UV
+scheme the two types don't actually share despite both being "lathe a
+strip around a circle."
+
+**Verified**: clean rebuild, zero warnings. No crash and no Vulkan
+validation errors on `sp_menu`/`sp_academy1_spawn`/`sp_hoth2_spawn`/
+`sp_vjun1_spawn` (correct binary, `--renderer rd-vulkan`, real Xvfb+
+lavapipe setup - see the harness-bug section above for why that
+qualification is stated explicitly now rather than assumed).
+`sp_yavin1_spawn` still hits the pre-existing, unrelated ICARUS crash
+documented above. Same honest caveat as every ref-entity type in this
+whole series: debug prints never fired on any captured scene, so this is
+verified as "compiles, doesn't crash, and the geometry/UV/color math was
+cross-checked against the real formulas," not "seen on screen and looked
+right."
+
+With this, **every `refEntityType_t` value now does something** other than
+`RT_MODEL`: real Ghoul2 rendering for `RT_MODEL`, real geometry for all
+nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
+a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
+behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -1278,6 +1340,12 @@ touch this code)
   only one stress-tested directly (synthetic worst-case entity, all
   relevant `renderfx` flags at once) rather than only confirmed to compile
   and never get queued by a captured scene.
+- `RT_LATHE` (a lathed cubic-Bezier profile) and `RT_CLOUDS` (a lathed
+  disk/tube of fixed keyframes) ref entities - see "RT_LATHE and
+  RT_CLOUDS ref entities" above. The last two `refEntityType_t` values;
+  every one of them now does something other than `RT_MODEL` (or, for
+  `RT_PORTALSURFACE`, correctly nothing - matching rd-vanilla's own real
+  behavior for it).
 
 ## What's not implemented yet (safe no-ops, won't crash, won't draw)
 
@@ -1329,18 +1397,6 @@ touch this code)
   warping/subdivision (visible seams at box edges), no `RDF_SKYBOXPORTAL`
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
-- Two non-Ghoul2 ref entity types. `AddRefEntityToScene` is real for
-  Ghoul2 (`RT_MODEL`, see "Ghoul2 rendering" above), runtime polys
-  (`AddPolyToScene`, see "Runtime polys" above), `RT_SPRITE`/
-  `RT_ORIENTED_QUAD` (see "Sprite and oriented-quad ref entities" above),
-  `RT_SABER_GLOW`/`RT_BEAM` (see "Saber glow and beam ref entities" above),
-  `RT_LINE`/`RT_CYLINDER` (see "Line and cylinder ref entities" above), and
-  now `RT_ELECTRICITY` (see "RT_ELECTRICITY ref entities" above), but
-  `RT_LATHE` and `RT_CLOUDS` are still queued and silently ignored at draw
-  time - nothing about those two types renders yet. (`RT_PORTALSURFACE`
-  isn't a rendering gap: rd-vanilla's real handling of it doesn't draw
-  anything either, it only carries portal placement info - see
-  `R_AddEntitySurfaces`, `tr_main.cpp`.)
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`blendFunc`, and (for fog shaders specifically, see "3D world
   geometry" above) a top-level `fogparms` line, are read - later stages,
