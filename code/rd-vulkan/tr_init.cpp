@@ -1805,7 +1805,55 @@ void G2API_LoadGhoul2Models( CGhoul2Info_v &ghoul2, char *buffer ) { (void)ghoul
 void G2API_LoadSaveCodeDestructGhoul2Info( CGhoul2Info_v &ghoul2 ) { (void)ghoul2; }
 qboolean G2API_PauseBoneAnim( CGhoul2Info *ghlInfo, const char *boneName, const int t ) { return VK_PauseGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ), t ) ? qtrue : qfalse; }
 qboolean G2API_PauseBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, const int t ) { return VK_PauseGhoul2BoneAnim( ghlInfo, boneIndex, t ) ? qtrue : qfalse; }
-qhandle_t G2API_PrecacheGhoul2Model( const char *fileName ) { (void)fileName; return 0; }
+// Real implementation now - this used to be a hardcoded `return 0;`
+// (always "not found"), which was more consequential than a normal
+// precache no-op: NPC_stats.cpp's G_ParseAnimFileSet (the only real
+// caller) uses this to register a level's "cinematic" per-map animation
+// GLA (e.g. "models/players/_humanoid/_humanoid_academy1.gla" - a
+// map-specific set of extra animations used only by that map's scripted
+// cutscenes) *in addition to* the standard "_humanoid.gla" every humanoid
+// model already uses, and it gates loading that entire cinematic
+// animation set behind this call's return value being truthy
+// (`if (cineGLAIndex) { G_ParseAnimationFile(1, ...); ... }`) - a
+// permanent `return 0;` silently meant no map's cinematic-only animations
+// ever loaded, for any NPC, ever - not just "this specific .gla is
+// missing," every map that ships one. Uses a dedicated handle cache
+// (`s_precachedModelHandles`), not `RE_RegisterModel`'s existing
+// hardcoded-1 stub (see its own comment) or `VK_LoadGhoul2Skeleton`'s real
+// per-skeleton cache (a different handle space, used for a different
+// purpose - actually rendering a skeleton, not this ordinal "did it
+// register, and did the second one land right after the first" check) -
+// `G_ParseAnimFileSet` asserts a *second* precache call (the cinematic
+// GLA) returns exactly the *first* call's handle (the standard GLA) plus
+// one, so this needs handles assigned strictly in first-seen call order,
+// with no other unrelated precache activity able to land in between and
+// break that invariant. Returns 0 (falsy, matching real RE_RegisterModel
+// semantics for "file doesn't exist") only when a never-before-seen
+// filename genuinely can't be read - the common, expected case for any
+// map that doesn't ship a cinematic-specific GLA at all, not an error.
+static std::unordered_map<std::string, int> s_precachedModelHandles;
+qhandle_t G2API_PrecacheGhoul2Model( const char *fileName )
+{
+	if ( !fileName || !fileName[0] )
+	{
+		return 0;
+	}
+	auto it = s_precachedModelHandles.find( fileName );
+	if ( it != s_precachedModelHandles.end() )
+	{
+		return (qhandle_t)it->second;
+	}
+	void *buffer = nullptr;
+	long len = ri.FS_ReadFile( fileName, &buffer );
+	if ( !buffer || len <= 0 )
+	{
+		return 0;
+	}
+	ri.FS_FreeFile( buffer );
+	int handle = (int)s_precachedModelHandles.size() + 1;
+	s_precachedModelHandles[fileName] = handle;
+	return (qhandle_t)handle;
+}
 qboolean G2API_RagEffectorGoal( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t pos ) { (void)ghoul2; (void)boneName; (void)pos; return qfalse; }
 qboolean G2API_RagEffectorKick( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t velocity ) { (void)ghoul2; (void)boneName; (void)velocity; return qfalse; }
 qboolean G2API_RagForceSolve( CGhoul2Info_v &ghoul2, qboolean force ) { (void)ghoul2; (void)force; return qfalse; }

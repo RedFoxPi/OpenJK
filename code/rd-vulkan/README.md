@@ -708,7 +708,7 @@ The follow-up to the above: `G2API_SetBoneAnim` and friends now really
 work, so a model instance plays the animation the game actually asked for,
 advancing over real time, instead of a permanently frozen frame 0.
 
-**Caveat added much later, see "Character animation investigation: five
+**Caveat added much later, see "Character animation investigation: six
 real bugs, and a wrong conclusion corrected" below**: everything in this
 section describes the frame-advance machinery working correctly in
 isolation, which it does - but for a long time afterward, none of it was
@@ -808,7 +808,7 @@ playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
 **Correction, found much later (see "Character animation investigation:
-five real bugs, and a wrong conclusion corrected" below): the specific
+six real bugs, and a wrong conclusion corrected" below): the specific
 `wait 100`/`wait 400` observations above can't be trusted.** `com_fixedtime`
 (used to control for
 render-speed timing skew here) is not this cvar's real registered name -
@@ -1379,7 +1379,7 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
-## Character animation investigation: five real bugs, and a wrong
+## Character animation investigation: six real bugs, and a wrong
 conclusion corrected
 
 **Bottom line up front, since the investigation below initially got this
@@ -1664,15 +1664,72 @@ on two *different* animation clips entirely (a real 40-frame gesture in
 rd-vanilla vs. a short idle micro-loop here). Since game logic
 (`bg_panimate.cpp`/NPC AI, `code/game`) is identical between the two -
 same `.so`, same simulated time now confirmed - this points at some form
-of state divergence upstream of animation selection (a randomized idle
-gesture choice affected by different RNG consumption during this
-renderer's own asset precache is the leading hypothesis, not confirmed) -
-a *new*, different, not-yet-understood issue, and explicitly out of scope
-for this write-up. The harness timing bug this section describes is fixed
-and verified on its own terms (matched simulated time, confirmed
-independently of any specific NPC's animation content); whatever is
-choosing a different animation for this NPC despite that is a separate
-problem to chase next.
+of state divergence upstream of animation selection. The harness timing
+bug this section describes is fixed and verified on its own terms (matched
+simulated time, confirmed independently of any specific NPC's animation
+content); whatever is choosing a different animation for this NPC despite
+that is chased down in Bug 6 below.
+
+**Bug 6 (functional, in this renderer, found by chasing the residual gap
+Bug 5 surfaced): `G2API_PrecacheGhoul2Model` was a hardcoded
+`return 0;` stub.** The leading hypothesis going into this - some form of
+RNG-consumption divergence during this renderer's own asset precache,
+since `Q_irand`'s state (`shared/qcommon/q_math.c`'s static `holdrand`) is
+private to whichever `.so` calls it and can't actually cross between the
+game module and this renderer - turned out to be a dead end on inspection
+(game.so and this renderer have independent, non-interacting RNG state by
+construction; there was never a plausible mechanism for one to perturb the
+other). The real cause was more mundane and fully deterministic:
+`NPC_stats.cpp`'s `G_ParseAnimFileSet` - the only real caller of
+`G2API_PrecacheGhoul2Model` - uses it to register a level's "cinematic"
+per-map animation `.gla` (e.g.
+`models/players/_humanoid/_humanoid_academy1.gla` - a map-specific set of
+*extra* animations used only by that map's scripted cutscenes) *in
+addition to* the standard `_humanoid.gla` every humanoid model already
+uses, and gates loading that entire cinematic animation set behind this
+call's return value being truthy
+(`if (cineGLAIndex) { G_ParseAnimationFile(1, ...); ... }`). A permanent
+`return 0;` meant that branch was dead code for every map, for the entire
+history of this renderer - not "this specific NPC's animation is missing,"
+every map-specific cutscene animation on every map, silently replaced by
+whatever this renderer's per-bone track happened to resolve to instead
+(in this case, a coincidental-looking but meaningless 2-frame slice deep in
+`_humanoid.gla`'s own shared frame pool).
+
+Fixed with a real implementation (`tr_init.cpp`): a dedicated ordinal
+handle cache (`s_precachedModelHandles`) separate from both
+`RE_RegisterModel`'s existing hardcoded-`1` stub (see its own comment -
+reusing it would have made every precache call collide on the same fake
+handle) and `VK_LoadGhoul2Skeleton`'s real per-skeleton cache (a different
+handle space serving a different purpose - actually resolving a skeleton
+for rendering, not this ordinal "did it register, and is the second one
+exactly the first one's handle plus one" check
+`G_ParseAnimFileSet` depends on). Checks real file existence via
+`ri.FS_ReadFile` before minting a handle, so a map that genuinely has no
+cinematic `.gla` (most maps) still correctly gets `0` back, not a false
+truthy value.
+
+**Verified precisely, not just visually**: re-running the same
+side-by-side internal-animation-state comparison this whole investigation
+has relied on, right at spawn (`t=1600`, before this NPC's gesture has had
+time to loop even once), this renderer now reports the *exact same*
+`startFrame`/`endFrame` (`383`/`423`) as rd-vanilla - previously `14651`/
+`14653`, a completely unrelated slice of the frame pool. At the scene's
+actual default capture point (`wait_ms: 4800`, roughly a loop and a half
+into this 40-frame `BONE_ANIM_OVERRIDE_LOOP` gesture), the two renderers
+now visibly differ only in *which point in the same loop* they're
+showing - a real, but far smaller and better-understood residual, plausibly
+just the ~6ms figure Bug 5 already measured accumulating slightly further
+over a couple of loop cycles - not a different animation, and not
+something this write-up chases further. `diff.py`'s
+`sp_academy1_spawn` mean-pixel-difference figure barely moved (~17.2%,
+statistically the same as before this fix) precisely because of that: a
+correctly-selected but different-phase-of-the-same-loop pose isn't
+something a single static screenshot's pixel-difference metric was ever
+going to credit clearly, the same limitation already noted for the
+`G2_TimingModel` port above. Full SP scene suite
+(menu/academy1/hoth2/yavin1/vjun1) re-verified clean afterward: no
+crashes, no new warnings, on both renderers.
 
 **One thing this investigation explicitly ruled out**: `sp_yavin1_spawn`'s
 pre-existing ICARUS crash (documented above) was hypothesized to be
@@ -2003,7 +2060,7 @@ verified after the fact, but the wrong key (`com_fixedtime`) is what ended
 up permanently baked into `tests/render-regression/scenes.json`'s
 automation - and went undetected for a long time, because `+set` silently
 creates a new, harmless-looking, entirely unread cvar for any unrecognized
-name rather than erroring. See "Character animation investigation: five
+name rather than erroring. See "Character animation investigation: six
 real bugs, and a wrong conclusion corrected" further below for the full
 account of how this was finally caught, what it actually changed once
 fixed, and why the specific hoth2/academy1 screenshots this section used
