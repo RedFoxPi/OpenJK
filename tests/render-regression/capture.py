@@ -88,7 +88,27 @@ def build_args(scene: dict, basepath: Path, homepath: Path, renderer: str | None
         args += ["+set", k, str(v)]
     if scene.get("map"):
         args += ["+devmap", scene["map"]]
-    args += ["+wait", str(scene.get("wait_frames", 120))]
+    if "wait_ms" in scene:
+        # Simulated-time wait (see "waituntiltime"/"waittime", qcommon/
+        # cmd.cpp) rather than a raw frame count - required for any scene
+        # with a "map" that's meant to be compared against another
+        # renderer build. "+wait N" counts real Cbuf_Execute calls
+        # regardless of how much simulated time (per fixedtime) each one
+        # represents, and devmap's own loading can itself consume a
+        # real-time-dependent, renderer-speed-dependent number of those
+        # calls before "+wait" even starts counting - so two differently-
+        # performing renderer builds given the identical scripted
+        # wait_frames value can land at genuinely different absolute
+        # simulated times, not a fair comparison (confirmed empirically:
+        # ~3.4s apart between two renderer builds at an identical
+        # wait_frames=300, see rd-vulkan/README.md). "waittime <ms>"
+        # targets an absolute point on the engine's own fixedtime-forced
+        # clock instead, which self-corrects for whatever came before it
+        # regardless of cause. Requires "fixedtime" to already be set in
+        # extra_set for the result to mean anything reproducible.
+        args += ["+waittime", str(scene["wait_ms"])]
+    else:
+        args += ["+wait", str(scene.get("wait_frames", 120))]
     args += ["+screenshot_png", scene["id"]]
     args += ["+quit"]
     return args

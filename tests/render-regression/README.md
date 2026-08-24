@@ -80,13 +80,15 @@ cp install/JediAcademy/rd-vanilla_x86_64.so     gamedata/base/
 
 Each entry: `id` (used for filenames), `binary` (`sp` or `mp`, selects
 which executable/renderer), `map` (BSP name, or `null` for a menu-only
-scene), `wait_frames` (settle time before the screenshot), optional
-`extra_set` (cvar overrides), and `notes` describing what it's meant to
-exercise. The starter set covers: UI/2D-only, indoor+outdoor static
-geometry with a skeletal NPC, snow/outdoor terrain, foliage/vegetation,
-dark atmospheric lighting/fog, and both the SP and MP renderer code
-copies (`code/rd-vanilla` vs `codemp/rd-vanilla` are separate,
-independently-maintained copies of the same renderer).
+scene), a settle time before the screenshot (`wait_ms` for any scene with
+a `map` - see below for why `wait_frames` isn't enough for those - or
+`wait_frames` for a menu-only scene, where there's no map-load/ICARUS
+timing to get wrong), optional `extra_set` (cvar overrides), and `notes`
+describing what it's meant to exercise. The starter set covers: UI/2D-only,
+indoor+outdoor static geometry with a skeletal NPC, snow/outdoor terrain,
+foliage/vegetation, dark atmospheric lighting/fog, and both the SP and MP
+renderer code copies (`code/rd-vanilla` vs `codemp/rd-vanilla` are
+separate, independently-maintained copies of the same renderer).
 
 **Every map-based scene sets `fixedtime` (currently `16`, i.e. a fixed
 16ms/frame simulated timestep) via `extra_set`** - this is what makes
@@ -128,6 +130,38 @@ the full account and what it changed once actually fixed. If you're
 scripting captures directly rather than through `scenes.json`, double-check
 you're typing `+set fixedtime <ms>`, not `+set com_fixedtime <ms>`.
 
+**Even with the cvar name fixed, `wait_frames` still isn't enough for a
+scene with a `map` - use `wait_ms` (see the "waittime" console command,
+`qcommon/cmd.cpp`) instead.** This is a *third*, deeper timing bug, found
+by tracing a specific character's pose directly (not just diffing pixels)
+after a user reported it still looked wrong even with `fixedtime` correctly
+named: `wait <N>` counts real `Cbuf_Execute` calls (one per engine frame),
+regardless of how much simulated time each one represents. `fixedtime`
+makes *that part* deterministic - but `devmap`'s own map load, before
+`wait <N>` even starts counting, can itself consume a real-time-dependent,
+renderer-speed-dependent number of those calls (loading-screen ticks,
+precache retries, whatever the underlying cause on a given build). Two
+renderer builds that take a different number of frames to get through
+*that* land at genuinely different absolute simulated times by the time
+`wait <N>` finishes, even though `fixedtime` is correctly set and named -
+confirmed empirically at ~3.4 seconds apart between two builds at an
+identical `wait_frames: 300`, by comparing each renderer's own internal
+animation-frame accounting (not screenshots) for the literal same NPC.
+`waittime <ms>` (the console command backing `scenes.json`'s `wait_ms`
+field) fixes this by targeting an *absolute* point on the engine's own
+`com_fixedSimTime` clock - which only ever advances via each frame's real,
+`fixedtime`-forced `msec` (`qcommon/common.cpp`'s `Com_Frame`) - rather
+than a fixed frame count from wherever the script happened to already be.
+Whatever `com_fixedSimTime` already is when `waittime` runs (whether the
+map loaded in 100 frames or 400), the result always lands at exactly
+`com_fixedSimTime + ms`, so two renderer builds converge to the same
+absolute simulated time regardless of how differently their loading
+performed. Verified: re-running the same two builds with `waittime 8000`
+instead of an equivalent `wait_frames`, both landed within 6ms of each
+other (down from the ~3.4 second gap) at the same command. `wait_frames`
+is still fine, and preferred, for a scene with no `map` (nothing to load,
+so nothing for this to apply to).
+
 ## Comparing two renderers (`diff.py`)
 
 Run `capture.py` twice - once per renderer, into separate `--out`
@@ -154,10 +188,11 @@ right now, with `rd-vulkan`'s `.shader`-script gap (see
 and treat the diff image as a diagnostic, not a pass/fail signal.
 
 **A `MAJOR_DIFF` is only informative if both screenshots are actually of
-the same moment** - see the `fixedtime` note above. Scene captures
-taken before `fixedtime` was added *and correctly named* in `scenes.json`
-can't be trusted to isolate genuine rendering differences from this timing
-confound; a
+the same moment** - see the `fixedtime` and `wait_ms`/`waittime` notes
+above. Scene captures taken before `fixedtime` was added *and correctly
+named*, or before map-based scenes switched from `wait_frames` to
+`wait_ms`, in `scenes.json` can't be trusted to isolate genuine rendering
+differences from these timing confounds; a
 `MAJOR_DIFF` on an old capture pair may partly or entirely be "two
 different points in the same cutscene," not a rendering bug. Re-capture
 with the current `scenes.json` before drawing conclusions from a diff on

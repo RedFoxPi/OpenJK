@@ -708,7 +708,7 @@ The follow-up to the above: `G2API_SetBoneAnim` and friends now really
 work, so a model instance plays the animation the game actually asked for,
 advancing over real time, instead of a permanently frozen frame 0.
 
-**Caveat added much later, see "Character animation investigation: four
+**Caveat added much later, see "Character animation investigation: five
 real bugs, and a wrong conclusion corrected" below**: everything in this
 section describes the frame-advance machinery working correctly in
 isolation, which it does - but for a long time afterward, none of it was
@@ -808,7 +808,7 @@ playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
 **Correction, found much later (see "Character animation investigation:
-four real bugs, and a wrong conclusion corrected" below): the specific
+five real bugs, and a wrong conclusion corrected" below): the specific
 `wait 100`/`wait 400` observations above can't be trusted.** `com_fixedtime`
 (used to control for
 render-speed timing skew here) is not this cvar's real registered name -
@@ -1379,7 +1379,7 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
-## Character animation investigation: four real bugs, and a wrong
+## Character animation investigation: five real bugs, and a wrong
 conclusion corrected
 
 **Bottom line up front, since the investigation below initially got this
@@ -1603,6 +1603,76 @@ currently exercises) and closing the remaining, much smaller diff gap that
 comes from cumulative ICARUS/camera-cut timing drift and the
 already-documented `.shader`-script rendering gap - not from the animation
 math itself anymore.
+
+**Bug 5 (test harness, found by a third round of user pushback, on the same
+specific character): `wait_frames` still wasn't enough for a scripted
+scene, even with the `fixedtime` cvar name fixed.** Asked to check again
+after the `G2_TimingModel` port above still didn't make one particular
+NPC's pose (academy1's lone character standing on the raised platform
+between the entrance pillars) match rd-vanilla's, direct comparison at
+matched crops showed a genuinely different pose - not a subtle drift, an
+entirely different animation clip. Rather than keep guessing from pixels,
+this was traced by temporarily instrumenting *both* renderers identically
+(a debug build of each, since `rd-vanilla` is just as much a part of this
+repository as `rd-vulkan` is) to print that exact NPC's real internal
+animation-bone state - matched across builds by its world-space origin,
+confirmed identical between them - side by side. That showed the real
+problem directly: at the identical `wait_frames: 300`, this renderer
+reached simulated time **t≈7.7s** while rd-vanilla reached **t≈11.2s** -
+a **3.4 second gap**, despite `fixedtime` being set and correctly named in
+both. `wait <N>` (`Cmd_Wait_f`, `qcommon/cmd.cpp`) counts real
+`Cbuf_Execute` calls (one per engine frame) - `fixedtime` makes each of
+*those* frames advance simulated time by a fixed, deterministic amount,
+but it does nothing about *how many* such frames `devmap`'s own map load
+consumes before `wait <N>` even starts counting, and that number is itself
+real-time-dependent and renderer-speed-dependent (loading-screen ticks,
+precache retries, whatever the exact mechanism on a given build - not
+fully root-caused, since the fix below doesn't require knowing it). Two
+renderer builds that take a different number of frames to get through
+loading land at genuinely different absolute simulated times by the time
+`wait <N>` finishes, even with `fixedtime` working exactly as designed -
+not a rendering bug in either renderer, a comparison of two different
+moments in the same script.
+
+Fixed at the engine level, in `qcommon/`, so it benefits every renderer
+(not something rd-vulkan-specific): a new `com_fixedSimTime` global
+(`common.cpp`) that accumulates only `Com_Frame`'s own real,
+`fixedtime`-forced per-frame `msec` - nothing else ever touches it - and a
+new `waittime <ms>` console command (`cmd.cpp`, implemented as a
+`waituntiltime <absoluteMs>` continuation that re-queues itself via
+`Cbuf_InsertText` once a frame, mirroring `Cmd_Wait_f`'s own `cmd_wait`
+mechanism) that waits until `com_fixedSimTime` reaches `com_fixedSimTime +
+ms`, computed at the moment the command runs - not a fixed frame count set
+in advance. Because the target is computed *from wherever
+`com_fixedSimTime` already is*, it's self-correcting regardless of how
+much (or little) simulated time anything earlier in the script - a slow
+map load included - already consumed: two renderer builds converge on the
+same absolute simulated time by construction, not by coincidence.
+`tests/render-regression/capture.py`/`scenes.json` now use this
+(`wait_ms` instead of `wait_frames`) for every scene with a `map`. Verified
+directly: re-running the same two builds with `waittime 8000` instead of
+an equivalent `wait <N>`, both landed within **6ms** of each other - down
+from the 3.4 second gap - confirmed via the same side-by-side internal
+animation-state comparison, not just screenshots.
+
+**What this does and doesn't resolve**: with simulated time now actually
+matched, this specific NPC's animation-track *timing* (`startFrame`/
+`endFrame`/current position) is directly comparable between the two
+renderers for the first time - and doing so surfaced a *further*, different
+residual gap: even at matched simulated time, the two builds have this NPC
+on two *different* animation clips entirely (a real 40-frame gesture in
+rd-vanilla vs. a short idle micro-loop here). Since game logic
+(`bg_panimate.cpp`/NPC AI, `code/game`) is identical between the two -
+same `.so`, same simulated time now confirmed - this points at some form
+of state divergence upstream of animation selection (a randomized idle
+gesture choice affected by different RNG consumption during this
+renderer's own asset precache is the leading hypothesis, not confirmed) -
+a *new*, different, not-yet-understood issue, and explicitly out of scope
+for this write-up. The harness timing bug this section describes is fixed
+and verified on its own terms (matched simulated time, confirmed
+independently of any specific NPC's animation content); whatever is
+choosing a different animation for this NPC despite that is a separate
+problem to chase next.
 
 **One thing this investigation explicitly ruled out**: `sp_yavin1_spawn`'s
 pre-existing ICARUS crash (documented above) was hypothesized to be
@@ -1933,7 +2003,7 @@ verified after the fact, but the wrong key (`com_fixedtime`) is what ended
 up permanently baked into `tests/render-regression/scenes.json`'s
 automation - and went undetected for a long time, because `+set` silently
 creates a new, harmless-looking, entirely unread cvar for any unrecognized
-name rather than erroring. See "Character animation investigation: four
+name rather than erroring. See "Character animation investigation: five
 real bugs, and a wrong conclusion corrected" further below for the full
 account of how this was finally caught, what it actually changed once
 fixed, and why the specific hoth2/academy1 screenshots this section used

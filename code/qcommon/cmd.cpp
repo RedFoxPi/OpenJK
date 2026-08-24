@@ -61,6 +61,68 @@ void Cmd_Wait_f( void ) {
 	}
 }
 
+/*
+============
+Cmd_WaitUntilTime_f
+
+waituntiltime <absoluteMs> - internal continuation for "waittime", not
+meant to be typed/scripted directly (no target duration of its own, just
+an already-computed absolute one). Re-queues itself, a frame at a time,
+until com_fixedSimTime (qcommon/common.cpp) reaches the given value, then
+falls through and lets the rest of the command buffer proceed normally.
+============
+*/
+extern int com_fixedSimTime;
+void Cbuf_InsertText( const char *text );
+void Cmd_WaitUntilTime_f( void ) {
+	if ( Cmd_Argc() != 2 ) {
+		return;
+	}
+	int target = atoi( Cmd_Argv( 1 ) );
+	if ( com_fixedSimTime < target ) {
+		char text[64];
+		Com_sprintf( text, sizeof( text ), "waituntiltime %d\n", target );
+		Cbuf_InsertText( text );
+		cmd_wait = 1;
+	}
+}
+
+/*
+============
+Cmd_WaitTime_f
+
+waittime <ms> - like "wait", but counts simulated milliseconds
+(com_fixedSimTime) rather than real Cbuf_Execute calls, and is immune to
+how many of those calls anything earlier in the same script needed. "wait
+<N>" counts frames regardless of how much simulated time each one
+represents - normally fine, but if something earlier in the same script
+(e.g. "devmap") took a real-time-dependent, renderer-speed-dependent
+number of frames to get through loading before this command is even
+reached, "wait <N>" issued right after it lands at a genuinely different
+absolute simulated time for a slower renderer than a faster one, even with
+com_fixedtime set - not a fair comparison between two renderer builds at
+"the same" scripted moment (see tests/render-regression/README.md).
+"waittime <ms>" instead targets an absolute point on com_fixedSimTime,
+which only ever advances via Com_Frame's own real, fixedtime-forced
+per-frame msec, making the wait self-correcting regardless of what came
+before it: whatever com_fixedSimTime already is when this command runs,
+the result always lands at target = com_fixedSimTime + ms, not a fixed
+frame count. Requires com_fixedtime to be set for the result to be
+reproducible across separate runs at all - without it, com_fixedSimTime
+just tracks real elapsed time, same as "wait" already implicitly does.
+============
+*/
+void Cmd_WaitTime_f( void ) {
+	if ( Cmd_Argc() != 2 ) {
+		Com_Printf( "waittime <ms>: wait until <ms> milliseconds of simulated time (not real frames) have passed\n" );
+		return;
+	}
+	int target = com_fixedSimTime + atoi( Cmd_Argv( 1 ) );
+	char text[64];
+	Com_sprintf( text, sizeof( text ), "waituntiltime %d\n", target );
+	Cbuf_InsertText( text );
+}
+
 
 /*
 =============================================================================
@@ -811,4 +873,6 @@ void Cmd_Init (void) {
 	Cmd_SetCommandCompletionFunc( "vstr", Cvar_CompleteCvarName );
 	Cmd_AddCommand ("echo",Cmd_Echo_f);
 	Cmd_AddCommand ("wait", Cmd_Wait_f);
+	Cmd_AddCommand ("waittime", Cmd_WaitTime_f);
+	Cmd_AddCommand ("waituntiltime", Cmd_WaitUntilTime_f);
 }

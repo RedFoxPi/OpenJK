@@ -84,6 +84,17 @@ int		numTraces;
 
 int			com_frameTime;
 int			com_frameNumber = 0;
+// Cumulative simulated time, advanced only by Com_Frame's own real,
+// fixedtime-forced per-frame msec (see Com_Frame's "com_fixedSimTime +="
+// line) - never by anything else. Backs the "waittime"/"waituntiltime"
+// console commands (cmd.cpp): unlike "wait <N>", which counts real
+// Cbuf_Execute calls regardless of how much simulated time (if any,
+// per com_fixedtime) each one represents, this lets a script wait for an
+// absolute point on this specific clock, immune to how many of those calls
+// anything earlier in the same script - e.g. a slow map load - happened to
+// need. See tests/render-regression/README.md for the cross-renderer
+// timing-comparison problem this was added to solve.
+int			com_fixedSimTime = 0;
 
 qboolean	com_errorEntered = qfalse;
 qboolean	com_fullyInitialized = qfalse;
@@ -1407,6 +1418,7 @@ void Com_Frame( void ) {
 		// mess with msec if needed
 		float fractionMsec=0.0f;
 		msec = Com_ModifyMsec( msec, fractionMsec);
+		com_fixedSimTime += msec;
 
 		//
 		// server side
