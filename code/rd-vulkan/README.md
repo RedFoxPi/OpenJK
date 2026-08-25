@@ -1940,6 +1940,70 @@ touch this code)
   **If you add fields to the push constant struct or the shaders, re-check
   this alignment by hand** - nothing will catch a mismatch for you.
 
+## Overbright brightness bug (Ghoul2 characters and any real sky texture)
+
+A user directly reported that Vulkan screenshots read "much brighter" than
+`rd-vanilla`'s, across scenes with no obvious connection to the character-
+animation investigation above - the wrong pose was one bug, this was a
+completely separate one, and both happened to be visible in the same
+academy1 pillar screenshot without either explaining the other.
+
+`world.frag`'s `diffuse.rgb * lightmap.rgb * 2.0` approximates Quake3's
+"overbright bits" - real BSP lightmaps are baked assuming the renderer
+doubles them back out at draw time, so multiplying by 2.0 is the right call
+*for real, baked lightmap data*. The bug: this renderer reuses that same
+shader and that same unconditional `*2.0` for two other things that are
+*not* real overbright-compensated lightmap data, each paired with a plain
+white placeholder in the lightmap texture slot purely to reuse the shared
+descriptor-set/shader plumbing:
+
+- **Ghoul2 characters** (`VK_BuildWorldDescriptorSet(..., vk.whiteImage)`,
+  `tr_model.cpp`) - white(1,1,1) * diffuse * 2.0 silently rendered every
+  character exactly twice as bright as its own diffuse texture. This
+  renderer has no real per-character lighting yet (no dynamic lights, see
+  below) - that's a documented, deliberate scope cut - but doubling isn't
+  "unlit," it's wrong in a specific, fixable direction.
+- **Sky faces, including real farbox textures** (`VK_LoadSky`,
+  `tr_world.cpp`) - confirmed by reading `rd-vanilla`'s own real sky code
+  (`DrawSkyBox`, `tr_sky.cpp`): it sets a flat `qglColor3f(tr.identityLight,
+  ...)` vertex colour specifically to *cancel* overbright for sky faces
+  (`tr.identityLight = 1.0 / (1 << tr.overbrightBits)`, the exact inverse of
+  the doubling), so a real farbox texture displays at its own natural
+  brightness. This renderer's sky previously got the same undeserved `*2.0`
+  as real lightmapped world geometry, which clips any map's actual sky
+  texture toward solid white - confirmed on academy1's real
+  `textures/skies/yavin` farbox, which rendered as a blown-out white sky
+  before this fix and a correct blue-and-cloud gradient after it. An
+  earlier fallback-sky fix (see "Bugs found and fixed" above this section)
+  had already noticed the fallback box's own colour needed pre-halving to
+  avoid clipping to white under this `*2.0` - a working band-aid for a
+  synthetic solid-colour fallback, but one that left the underlying wrong
+  convention in place for every map with a *real* sky texture.
+
+**Fixed**: `vkWorldPushConstants_t` gains a per-draw overbright factor,
+carried in `camPos.w` (previously documented as unused - see
+`vkWorldPushConstants_t`'s own comment, `tr_local.h`, and `world.vert`/
+`world.frag`'s). Real BSP-lightmapped world geometry keeps `2.0`; Ghoul2
+draws and sky draws (both real farbox and the flat fallback) now pass
+`1.0`. The fallback sky colour's earlier pre-halving is undone to match
+(`(70,75,80)` → `(140,150,160)`, its originally-intended on-screen value).
+
+**Verified**: side-by-side academy1 comparison at matched simulated time -
+the pillar NPC's clothing/skin tone now closely matches `rd-vanilla`'s own
+(previously visibly lighter/flatter), and the sky through both window
+openings shows the same blue-gradient-with-clouds look instead of solid
+white. `sp_hoth2_spawn`'s player-character close-up, which the "Investigate
+hoth2 white/black anomaly" checkpoint (task list) had already flagged as
+looking washed-out/near-white, now shows the correct olive-green skin tone
+matching `rd-vanilla` - the same Ghoul2 overbright bug, not a separate
+hoth2-specific anomaly as originally suspected. `sp_yavin1_spawn` and
+`sp_vjun1_spawn` spot-checked clean too (natural clothing/skin tones, no
+blown-out sky). Full SP scene suite re-verified clean on both renderers
+afterward (no crashes, no new warnings). Real per-character ambient/
+directional lighting is still not implemented (unchanged scope cut, see
+below) - this fix only removes an incorrect doubling, it doesn't add the
+missing feature.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render

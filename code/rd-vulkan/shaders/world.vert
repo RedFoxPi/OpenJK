@@ -10,7 +10,7 @@ layout(location = 2) out float fragFogDist;
 
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
-    vec4 camPos;   // xyz = camera world position (unused w)
+    vec4 camPos;   // xyz = camera world position, w = overbright factor (world.frag)
     vec4 fogColor; // rgb = fog colour, a = opaque distance (0 = no fog)
 } pc;
 

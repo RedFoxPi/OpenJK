@@ -298,15 +298,25 @@ static void VK_LoadSky( const char *baseName )
 		// is a much closer approximation than black, even though it isn't
 		// the shader's real colour.
 		// Sky faces are drawn through the same world.frag as everything else,
-		// paired with s_whiteLightmap (full white) - see the *2.0 "overbright
-		// bits" approximation there. That doubles this image's colour before
-		// it hits the screen, so halve the intended on-screen grey (~140,150,
-		// 160) here or it clips to solid white, same mistake as the first
-		// attempt at this fallback.
+		// but - see the sky push constant's own comment (RE_RenderScene,
+		// this file) - with overbright *disabled* (factor 1.0, not the 2.0
+		// real BSP lightmaps need): rd-vanilla's own real sky draw
+		// (DrawSkyBox, tr_sky.cpp) sets a flat `tr.identityLight` vertex
+		// colour specifically to cancel overbright for the sky, so a real
+		// farbox texture displays at its own natural brightness, not
+		// doubled. This fallback colour is the intended on-screen grey
+		// directly, not pre-halved to compensate for a doubling that no
+		// longer happens - an earlier version of this renderer got that
+		// backwards (paired the *2.0 rd-vanilla's own sky code deliberately
+		// avoids with a pre-halved fallback colour to compensate), which
+		// happened to still look reasonable for this synthetic fallback but
+		// would have clipped any real map's actual sky texture to solid
+		// white - exactly the "much brighter than rd-vanilla" symptom a user
+		// directly reported.
 		static image_t *s_skyFallbackFace = nullptr;
 		if ( !s_skyFallbackFace )
 		{
-			s_skyFallbackFace = VK_CreateSolidImage( "*skyFallback", 70, 75, 80, 255 );
+			s_skyFallbackFace = VK_CreateSolidImage( "*skyFallback", 140, 150, 160, 255 );
 		}
 		for ( int i = 0; i < 6; i++ )
 		{
@@ -925,13 +935,27 @@ void RE_RenderScene( const refdef_t *fd )
 		// world.frag) - it's meant to read as infinitely distant, and this
 		// renderer's flat-colour fog fallback for farbox-less skies (see
 		// VK_LoadSky) already approximates the same "hazy backdrop" look
-		// fog would otherwise add here. camPos is irrelevant with fog off,
-		// left zeroed. Push the whole struct, not just mvp - an undersized
-		// push leaves camPos/fogColor holding whatever a previous draw call
-		// in this command buffer wrote there (Vulkan push constants persist
-		// across draws until overwritten), not zero.
+		// fog would otherwise add here. camPos.xyz is irrelevant with fog
+		// off, left zeroed - but camPos.w (the overbright factor, see
+		// world.frag's comment) is NOT irrelevant, and is deliberately 1.0
+		// here, NOT the 2.0 real BSP-lightmapped world geometry needs:
+		// rd-vanilla's own real sky draw (DrawSkyBox, tr_sky.cpp) sets a flat
+		// `tr.identityLight` vertex colour specifically to cancel overbright
+		// for sky faces, so a farbox texture shows at its own natural
+		// brightness rather than doubled - sky is paired with a white
+		// "lightmap" purely so it can reuse this same descriptor-set/shader
+		// plumbing (VK_LoadSky), not because it should be shaded like a real
+		// baked-and-overbright-compensated lightmapped surface. Getting this
+		// backwards silently clipped any map's real sky texture toward solid
+		// white - a user-reported "Vulkan looks much brighter than
+		// rd-vanilla" symptom, not a subtle one. Push the whole struct, not
+		// just mvp - an undersized push leaves camPos/fogColor holding
+		// whatever a previous draw call in this command buffer wrote there
+		// (Vulkan push constants persist across draws until overwritten),
+		// not zero.
 		vkWorldPushConstants_t skyPush = {};
 		memcpy( skyPush.mvp, skyMvp, sizeof( skyMvp ) );
+		skyPush.camPos[3] = 1.0f;
 		vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 			0, sizeof( skyPush ), &skyPush );
 
@@ -958,6 +982,7 @@ void RE_RenderScene( const refdef_t *fd )
 	worldPush.camPos[0] = fd->vieworg[0];
 	worldPush.camPos[1] = fd->vieworg[1];
 	worldPush.camPos[2] = fd->vieworg[2];
+	worldPush.camPos[3] = 2.0f; // overbright factor - see world.frag's comment
 	if ( s_worldFogEnabled )
 	{
 		worldPush.fogColor[0] = s_worldFogColor[0];

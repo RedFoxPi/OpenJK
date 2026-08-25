@@ -3017,9 +3017,19 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 			// this used before the fog work touched that layout. Ghoul2
 			// models aren't fogged (see README.md), so fogColor.a stays 0
 			// (disabling the mix in world.frag) same as the sky's own push
-			// in tr_world.cpp.
+			// in tr_world.cpp. camPos.w is the overbright factor (world.
+			// frag's comment) - 1.0, NOT world/sky's 2.0: Ghoul2 surfaces are
+			// paired with a plain white placeholder in the lightmap slot
+			// (VK_BuildWorldDescriptorSet's ghoul2 call site, this file),
+			// not a real baked-and-overbright-compensated lightmap, so the
+			// *2.0 world geometry needs would just silently render every
+			// character twice as bright as its own diffuse texture - this
+			// was a real, confirmed bug (a user directly noticed Vulkan's
+			// screenshots reading much brighter than rd-vanilla's), not a
+			// deliberate simplification.
 			vkWorldPushConstants_t entityPush = {};
 			memcpy( entityPush.mvp, entityMvp, sizeof( entityMvp ) );
+			entityPush.camPos[3] = 1.0f;
 			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				0, sizeof( entityPush ), &entityPush );
 

@@ -160,7 +160,17 @@ struct PolyVertex
 // padding trap there either. fogColor[3] doubles as the fog's "opaque"
 // distance (see VK_LoadWorldFog in tr_world.cpp) - 0 disables fog entirely
 // (the sky draw always passes 0 here; see RE_RenderScene), matching
-// world.frag's `if (fogColor.a > 0.0)` gate.
+// world.frag's `if (fogColor.a > 0.0)` gate. camPos[3] similarly doubles as
+// a per-draw overbright factor (world.frag's comment): 2.0 for real BSP
+// lightmapped world/sky geometry (baked assuming this doubling - Quake3's
+// "overbright bits"), 1.0 for Ghoul2 draws (tr_model.cpp), which are paired
+// with a plain white placeholder in the lightmap slot rather than an actual
+// baked-and-compensated one - doubling that too silently rendered every
+// character twice as bright as its own diffuse texture, a real, user-
+// reported bug (Vulkan screenshots reading much brighter than rd-vanilla's),
+// not a deliberate simplification. Every call site must set this
+// explicitly - a zero-initialized push (`= {}`) defaults camPos[3] to 0.0,
+// which multiplies the surface to solid black, not "no overbright."
 struct vkWorldPushConstants_t
 {
 	float mvp[16];
