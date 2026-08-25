@@ -437,6 +437,11 @@ bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex );
 void VK_LoadShaderScripts( void );
 vkBlendMode_t VK_GetShaderBlendMode( const char *name );
 bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist );
+// First stage's `map`/`clampmap` file path, or nullptr - see this
+// function's own comment (tr_shader.cpp) for why RE_LoadWorldMap
+// (tr_world.cpp) needs this as a fallback when a shader's own name isn't
+// directly a texture file.
+const char *VK_GetShaderMapImage( const char *name );
 
 // tr_image.cpp
 image_t *VK_FindImage( const char *name );

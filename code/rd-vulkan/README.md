@@ -2004,6 +2004,128 @@ directional lighting is still not implemented (unchanged scope cut, see
 below) - this fix only removes an incorrect doubling, it doesn't add the
 missing feature.
 
+## hoth2's missing terrain (three bugs, one real fix and two real limits)
+
+A user asked specifically about `sp_hoth2_spawn`'s wide, `waittime`-matched
+shot: the player character's torso read as flat grey and "the rest is just
+grey" too - not the overbright/skin-tone issue above (already fixed by
+then), a second, unrelated problem where almost the entire screen showed a
+single flat colour instead of any snow terrain at all.
+
+**First ruled out, with actual evidence, not assumption**: temporarily
+forcing `VK_AABBOutsideFrustum` to never cull produced a *pixel-identical*
+screenshot to culling left on - the same flat grey, same silhouette. If
+over-aggressive frustum culling had been dropping visible terrain, disabling
+it entirely would have to change something. It didn't, so the real cause
+had to be somewhere earlier: either the terrain never made it into
+`s_worldSurfaces` in the first place, or it was being submitted but
+rendering as the same colour as everything else around it. Sampling the
+screenshot's raw pixels confirmed the latter half of that isn't quite right
+either - the colour was **exactly** `(140,150,160)`, this renderer's own sky
+fallback constant, uniformly across the entire frame, which only makes
+sense if no world-geometry fragment was reaching the screen at all (a
+partially-fogged or wrongly-lit terrain would still show *some* pixel
+variation).
+
+**Bug (real, fixed): `RE_LoadWorldMap`'s opaque-surface loop treated "shader
+name doesn't resolve to a texture file" as "this must be a stages-only
+effect shader, skip it" - true for some shaders, false for hoth2's actual
+terrain.** A one-line instrumentation pass (counting *why* each of hoth2's
+7421 raw BSP surfaces was or wasn't added to `s_worldSurfaces`) found
+`skipNoImage=3024` - **41% of the entire map**, not a handful of decorative
+effects. The first few skipped shader names, e.g.
+`textures/hoth/metal_lg_lt_vertex`, led straight to the actual cause on
+reading `shaders/vertex.shader`:
+
+```
+textures/hoth/metal_lg_lt_vertex
+{
+	qer_editorimage	textures/impgarrison/metal_lg_lt
+	q3map_nolightmap
+	q3map_nonplanar
+    {
+        map textures/impgarrison/metal_lg_lt
+        rgbGen exactVertex
+    }
+}
+```
+
+This shader's real base texture is `textures/impgarrison/metal_lg_lt` - a
+name that shares nothing with the shader's own name
+(`textures/hoth/metal_lg_lt_vertex`), a `_vertex`-suffixed variant that
+reuses an *existing* texture from a completely different directory purely
+to get `rgbGen exactVertex` (per-vertex lighting) instead of a lightmap.
+`VK_FindImage(shaders[surf.shaderNum].shader)` only ever tries the shader's
+own name as a file path - correct for the common case where they match, but
+silently wrong for any shader (not just effect/fog shaders) that legitimately
+has a real, different-named base texture. This is exactly the kind of
+authoring pattern outdoor Quake3-engine terrain uses constantly (vertex-lit
+variants, terrain-blend variants, ...) and academy1's mostly-indoor,
+mostly-conventionally-named architecture almost never does - which is why
+this went unnoticed through every earlier checkpoint that verified academy1/
+yavin1/vjun1 but only ever glanced at hoth2.
+
+Fixed by extending the existing minimal `.shader` parser
+(`tr_shader.cpp`, previously only tracking blend mode and `fogparms`) to
+also record each shader's first stage's `map`/`clampmap` argument
+(`VK_GetShaderMapImage`, skipping `$whiteimage`/`$lightmap`-style generated
+references, which have no file to find). `RE_LoadWorldMap` now retries
+`VK_FindImage` against that recorded path when the shader's own name fails
+to resolve - but **only when the shader's own recorded blend mode is
+`BLEND_OPAQUE`** (no `blendFunc` keyword in its first stage). That guard
+isn't optional: an earlier, ungated version of this fix made academy1
+regress hard, resolving `textures/common/dark_dust`'s real `clampmap
+textures/common/gradient` and drawing it *opaque* across a huge portion of
+the screen - `dark_dust` has `blendFunc GL_ONE GL_ONE` (additive) and is
+meant to be a translucent haze effect, exactly the "no blend pipeline for
+world geometry yet, so drawing this opaque is actively wrong" case the
+original code's own comment already warned about for shaders with *no*
+`map` at all. A real shader legitimately having a `map` doesn't make it any
+safer to force-draw opaque if it was never meant to be opaque. With the
+`BLEND_OPAQUE` gate, only genuinely-opaque-but-differently-named shaders
+(hoth2's terrain) take the new fallback path; genuinely translucent effect
+shaders (academy1's dust, and hoth2's own presumably) still correctly fall
+through to "skip this surface."
+
+**Two more real, if smaller, limits found and fixed alongside it**:
+
+- **`VK_BuildProjectionMatrix`'s fixed `zFar` was 4096 units** - "generous"
+  only relative to academy1's compact indoor courtyard, the scene it was
+  originally tuned against. hoth2's BSP bounds span roughly 25400 units
+  corner-to-corner; any camera more than 4096 units from visible terrain -
+  the ordinary case for most of an open snow field, not a corner case - had
+  that terrain silently far-plane-clipped every frame. Confirmed directly by
+  temporarily raising the constant and watching previously-invisible
+  terrain and distant structures appear. Raised to 65536, comfortably
+  covering hoth2's actual measured worst case with margin, still far short
+  of causing obviously bad depth-buffer precision loss for near geometry.
+  Still a fixed constant, not rd-vanilla's real per-frame computed `zFar`
+  from actual visibility bounds (see "What's not implemented yet" below) -
+  a bigger, unrelated undertaking this fix doesn't attempt.
+- View-frustum culling itself was directly verified correct in the course
+  of ruling it out above (see "First ruled out" - forcing zero culling
+  changed nothing), not merely assumed innocent because the other two fixes
+  worked without touching it.
+
+**Verified**: `sp_hoth2_spawn` now shows visible snow terrain filling the
+frame's lower half plus distant terrain/structure silhouettes, closely
+matching `rd-vanilla`'s own composition for the same shot - not just "some
+grey terrain now," the actual shape of the ground and horizon line. Full SP
+scene suite re-verified clean on both renderers after each of the three
+changes, including specifically re-checking `sp_academy1_spawn` after the
+`BLEND_OPAQUE` gate was added (it's the scene that caught the regression the
+gate fixes, so it's the one most likely to reveal if the gate itself is
+wrong).
+
+**Left for another day, spotted but out of scope for this pass**:
+`sp_vjun1_spawn`'s cockpit-interior shot is missing its cabin walls/ceiling/
+dashboard geometry the same way hoth2's terrain was (confirmed present
+identically *before* this session's fixes too, so not a regression from
+anything above) - very plausibly the same category of shader-name-
+resolution bug hitting vjun1's ship-interior shaders, but not verified, and
+a real orange rendering artifact behind the Twi'lek NPC in that same shot
+that hasn't been looked at at all.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render

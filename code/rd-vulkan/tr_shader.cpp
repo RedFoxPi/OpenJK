@@ -41,6 +41,18 @@ struct vkShaderFogParms_t
 };
 static std::unordered_map<std::string, vkShaderFogParms_t> s_shaderFogParms;
 
+// First stage's `map <path>` argument, keyed by shader name - see
+// VK_GetShaderMapImage's comment for why this exists: a shader's own name is
+// NOT reliably the same path as its actual base texture (e.g. hoth2's
+// `textures/hoth/metal_lg_lt_vertex`, whose first stage is actually `map
+// textures/impgarrison/metal_lg_lt` - a vertex-lit variant shader reusing an
+// existing texture under a different name, not a special case - see
+// rd-vulkan/README.md). Only real file paths are recorded here - `$whiteimage`/
+// `$lightmap`/`$lightmapgrid` (generated images, no file to find) are left
+// unrecorded, same "nothing to resolve" outcome as a shader with no `map` at
+// all in its first stage.
+static std::unordered_map<std::string, std::string> s_shaderMapImage;
+
 static vkBlendMode_t BlendFactorsToMode( const char *src, const char *dst )
 {
 	if ( !Q_stricmp( src, "GL_ONE" ) && !Q_stricmp( dst, "GL_ONE" ) )
@@ -93,6 +105,7 @@ static void ParseShaderFile( const char *text )
 		vkBlendMode_t blendMode = BLEND_OPAQUE;
 		bool haveFogParms = false;
 		vkShaderFogParms_t fogParms = {};
+		std::string mapImage;
 
 		while ( depth > 0 )
 		{
@@ -144,6 +157,24 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
+			// `map <path>` (or the legacy synonym `clampmap`) is the stage's
+			// base image - only the first stage's, and only its first `map`/
+			// `clampmap` keyword if a stage somehow has more than one
+			// (real shaders don't). `$whiteimage`/`$lightmap`/`$lightmapgrid`
+			// are generated placeholders, not files - see mapImage's own
+			// comment (s_shaderMapImage) for why those are deliberately left
+			// unrecorded rather than treated as a (nonexistent) file path.
+			if ( depth == 2 && inFirstStage && mapImage.empty() &&
+				( !Q_stricmp( tok, "map" ) || !Q_stricmp( tok, "clampmap" ) ) )
+			{
+				const char *path = COM_ParseExt( &p, qfalse );
+				if ( path[0] && path[0] != '$' )
+				{
+					mapImage = path;
+				}
+				continue;
+			}
+
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "blendFunc" ) )
 			{
 				const char *a = COM_ParseExt( &p, qfalse );
@@ -179,6 +210,10 @@ static void ParseShaderFile( const char *text )
 		if ( haveFogParms && s_shaderFogParms.find( name ) == s_shaderFogParms.end() )
 		{
 			s_shaderFogParms[name] = fogParms;
+		}
+		if ( !mapImage.empty() && s_shaderMapImage.find( name ) == s_shaderMapImage.end() )
+		{
+			s_shaderMapImage[name] = mapImage;
 		}
 	}
 
@@ -261,4 +296,37 @@ bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist )
 	color[2] = it->second.color[2];
 	*opaqueDist = it->second.opaqueDist;
 	return true;
+}
+
+// Looks up a shader's first stage's `map`/`clampmap` path - the only
+// caller, RE_LoadWorldMap's opaque-world-surface loop (tr_world.cpp), uses
+// this as a *fallback* when a shader's own name doesn't directly resolve to
+// a texture file (VK_FindImage(shaders[surf.shaderNum].shader) failed):
+// plenty of real shaders, not just stages-only effect shaders, reuse an
+// existing texture under a differently-named shader (e.g. a `_vertex`
+// variant for `rgbGen exactVertex` terrain blending - hoth2's
+// `textures/hoth/metal_lg_lt_vertex`, whose first stage is actually `map
+// textures/impgarrison/metal_lg_lt`). Treating every such shader-name lookup
+// failure as "no direct image, presumably a translucent effect shader, skip
+// this surface" (the assumption RE_LoadWorldMap otherwise makes) was
+// silently discarding ~40% of hoth2's opaque terrain surfaces - a real,
+// confirmed bug (a user reported the character's own torso and the whole
+// level reading as flat grey), not a deliberate simplification like the
+// genuine effect-shader skip is. Returns nullptr if the shader was never
+// seen, or was seen but its first stage has no real file `map` (a bare
+// stages-only effect shader, or one using a generated `$whiteimage`/
+// `$lightmap` image - see s_shaderMapImage's own comment for why those
+// aren't recorded) - RE_LoadWorldMap's existing "skip the surface" handling
+// is still exactly correct for that case, this fallback only helps the
+// cases where a real file exists under a different name than the shader.
+const char *VK_GetShaderMapImage( const char *name )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderMapImage.find( name );
+	if ( it == s_shaderMapImage.end() )
+	{
+		return nullptr;
+	}
+	return it->second.c_str();
 }

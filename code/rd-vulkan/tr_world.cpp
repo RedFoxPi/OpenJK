@@ -634,21 +634,45 @@ void RE_LoadWorldMap( const char *name )
 		image_t *img = VK_FindImage( shaders[surf.shaderNum].shader );
 		if ( !img )
 		{
-			// Unlike RE_StretchPic's out-of-range-handle case (which really
-			// does mean "caller asked for white"), a failed lookup here
-			// means the shader has no plain image of its own - typically a
-			// stages-only effect shader (fog/dust volumes, decals) whose
-			// name doesn't resolve to a file because it's meant to be built
-			// from its stages' own `map` references, which this renderer
-			// doesn't parse for world geometry (see README.md). Those are
-			// usually explicitly translucent (surfaceparm trans/nonopaque -
-			// e.g. academy1's textures/common/dark_dust) and this renderer
-			// has no blend pipeline for world geometry yet (see
-			// VK_CreateWorldPipeline), so drawing them as an *opaque white*
-			// quad is actively wrong, not just imprecise - it was covering
-			// large parts of the screen. Skip the surface instead, same
-			// "invisible beats wrong" call as the RE_RegisterShaderNoMip
-			// videologo fix in tr_image.cpp.
+			// A shader's own name is not reliably the same path as its real
+			// base texture - see VK_GetShaderMapImage's comment (tr_shader.cpp)
+			// for the confirmed real-world case that motivated this fallback
+			// (hoth2's terrain, ~40% of its opaque surfaces silently dropped
+			// before this fix, not a handful of edge cases). Gated on
+			// BLEND_OPAQUE (no blendFunc keyword in the first stage) -
+			// confirmed the hard way: an earlier version of this fallback
+			// applied unconditionally and made academy1's
+			// textures/common/dark_dust (`clampmap textures/common/gradient`,
+			// `blendFunc GL_ONE GL_ONE`) resolve to a real image and cover
+			// large parts of the screen as an opaque wash, exactly the
+			// failure mode the comment below already warned about for
+			// shaders with no `map` at all - a real shader that legitimately
+			// has one is no safer to draw opaque if it's meant to be
+			// additive/blended. Only surfaces whose shader is genuinely
+			// opaque, just differently-named than its texture (hoth2's
+			// vertex-lit terrain, not a translucent effect), take this path.
+			// If the shader has no recorded map at all, or isn't opaque, we
+			// fall back to "no direct image at all" - genuinely true for a
+			// stages-only effect shader (fog/dust volumes, decals) built
+			// entirely from its stages' own `map` references in a way this
+			// renderer doesn't parse for world geometry (see README.md).
+			// Those are usually explicitly translucent (surfaceparm trans/
+			// nonopaque) and this renderer has no blend pipeline for world
+			// geometry yet (see VK_CreateWorldPipeline), so drawing them as
+			// an *opaque* quad is actively wrong, not just imprecise. Skip
+			// the surface instead, same "invisible beats wrong" call as the
+			// RE_RegisterShaderNoMip videologo fix in tr_image.cpp.
+			if ( VK_GetShaderBlendMode( shaders[surf.shaderNum].shader ) == BLEND_OPAQUE )
+			{
+				const char *mapImage = VK_GetShaderMapImage( shaders[surf.shaderNum].shader );
+				if ( mapImage )
+				{
+					img = VK_FindImage( mapImage );
+				}
+			}
+		}
+		if ( !img )
+		{
 			continue;
 		}
 
@@ -814,8 +838,20 @@ static void VK_BuildProjectionMatrix( const refdef_t *fd, float *out )
 	const float zNear = 4.0f;
 	// No dynamic far-clip/visBounds computation yet (see README.md) - a
 	// generous fixed distance is safe for a first pass, just less efficient
-	// depth precision-wise than rd-vanilla's per-frame computed zFar.
-	const float zFar = 4096.0f;
+	// depth precision-wise than rd-vanilla's per-frame computed zFar. This
+	// was 4096 originally ("generous" for academy1's compact indoor
+	// courtyard, the scene it was tuned against) but far too short for a
+	// real open outdoor level: hoth2's BSP bounds span roughly 25400 units
+	// corner-to-corner, so any camera more than 4096 units from a piece of
+	// visible terrain - trivially true for most of an open snow field, not
+	// an edge case - had that terrain silently far-plane-clipped every
+	// frame, confirmed directly (raising this value made previously-missing
+	// terrain reappear) while chasing a user report that hoth2 rendered as
+	// almost entirely flat grey. 65536 comfortably covers hoth2's actual
+	// measured worst case (camera at one corner, geometry at the opposite
+	// one) with margin for other maps, without being large enough to cause
+	// obviously bad depth-buffer precision for near geometry.
+	const float zFar = 65536.0f;
 
 	float ymax = zNear * tanf( fd->fov_y * (float)M_PI / 360.0f );
 	float ymin = -ymax;
