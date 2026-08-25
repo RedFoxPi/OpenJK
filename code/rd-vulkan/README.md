@@ -708,7 +708,7 @@ The follow-up to the above: `G2API_SetBoneAnim` and friends now really
 work, so a model instance plays the animation the game actually asked for,
 advancing over real time, instead of a permanently frozen frame 0.
 
-**Caveat added much later, see "Character animation investigation: seven
+**Caveat added much later, see "Character animation investigation: eight
 real bugs, and a wrong conclusion corrected" below**: everything in this
 section describes the frame-advance machinery working correctly in
 isolation, which it does - but for a long time afterward, none of it was
@@ -808,7 +808,7 @@ playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
 **Correction, found much later (see "Character animation investigation:
-seven real bugs, and a wrong conclusion corrected" below): the specific
+eight real bugs, and a wrong conclusion corrected" below): the specific
 `wait 100`/`wait 400` observations above can't be trusted.** `com_fixedtime`
 (used to control for
 render-speed timing skew here) is not this cvar's real registered name -
@@ -1379,7 +1379,7 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
-## Character animation investigation: seven real bugs, and a wrong
+## Character animation investigation: eight real bugs, and a wrong
 conclusion corrected
 
 **Bottom line up front, since the investigation below initially got this
@@ -1830,19 +1830,73 @@ numeric comparison, not visual guessing:
   90-degree-ish discrepancy isn't coming from a root-bone orientation bug
   either.
 
-In short: camera, shared entity-level facing, and root-bone orientation
-are all independently confirmed correct and identical to `rd-vanilla`, yet
-the rendered mesh still comes out rotated. That narrows the remaining bug
-to somewhere in the *child*-bone hierarchy composition
-(`VK_ComputeGhoul2BoneRecursive`/`VK_ResolveGhoul2BonePose`) - specifically
-something about *this NPC's currently-playing clip* (frame `15449`, from
-the academy1-specific cinematic `.gla` Bug 6 taught this renderer to load
-at all) that a normal `_humanoid.gla` idle animation apparently doesn't
-trigger, since spawn-point verifications elsewhere in this file never
-surfaced anything like it. **This is not fixed.** It's included here,
-fully documented with the exact evidence trail above, specifically so the
-next attempt doesn't have to re-derive "is it the camera, the entity axis,
-or the root bone" from scratch - all three are already ruled out.
+In short: camera, shared entity-level facing, and this renderer's own
+*mathematical* root-bone identity were all independently confirmed correct
+and identical to `rd-vanilla`. That result was real but incomplete - it
+proved this renderer's root bone had no rotation of its own, not that no
+rotation was *supposed* to be there.
+
+**Bug 8 (functional, in this renderer, and the actual cause of the pillar
+NPC's orientation): `VK_ComputeGhoul2BoneRecursive` seeded every root
+bone's hierarchy walk with a true mathematical identity matrix, when
+`rd-vanilla` always seeds it with a fixed 90-degree rotation instead.**
+Found by extending the `G2ANIM` debug tool (above) into a direct
+world-space bone-matrix dump for this NPC on both renderers
+(`VK_ComputeGhoul2Pose`'s output composed with `ent.axis`/`ent.origin` on
+this side; `EvalBoneCache` on `rd-vanilla`'s side, once its
+`CBoneCache` is populated by `G2_TransformGhoulBones`) - the *rotation*
+submatrices matched exactly once composed with each renderer's own root
+seed, which is what made it obvious the seeds themselves had to differ.
+Reading `rd-vanilla`'s real `RootMatrix()` (`tr_ghoul2.cpp`) confirmed it:
+for the ordinary case (no `GHOUL2_NEWORIGIN` reparenting), it returns a
+file-scope constant named - misleadingly - `identityMatrix`:
+
+```cpp
+const static mdxaBone_t identityMatrix =
+{
+	{
+		{ 0.0f, -1.0f, 0.0f, 0.0f },
+		{ 1.0f, 0.0f, 0.0f, 0.0f },
+		{ 0.0f, 0.0f, 1.0f, 0.0f }
+	}
+};
+```
+
+That is **not** the mathematical identity - it is a fixed 90-degree
+rotation, and every single Ghoul2 model in the real game is skinned
+relative to it, unconditionally, before the entity's own `ent.axis` is
+ever applied on top. It is the fixed remap between the `.gla`/`.glm`
+asset convention and the engine's world convention, the same category of
+thing as this renderer's own fixed camera-convention "flip" constant in
+`VK_BuildViewMatrix` (`tr_world.cpp`) - a real, load-bearing part of the
+pipeline with a name that only describes what it *isn't*. This renderer's
+`VK_ComputeGhoul2BoneRecursive` used an actual identity for the same seed,
+which is indistinguishable from correct for a bone that happens to have no
+local rotation of its own, and produces exactly this NPC's 90-degree-off
+orientation for one that does. It doesn't matter whether the specific
+bone or clip playing has "extra" rotation in it - **every** Ghoul2 model
+on **every** map was missing this fixed rotation; it simply wasn't visible
+before because most camera angles tested up to this point happened not to
+make a 90-degree body-facing error look dramatically wrong the way a
+tight, symmetric, pillar-framed portrait shot does.
+
+Fixed in `VK_ComputeGhoul2BoneRecursive`'s `parent < 0` (root bone) case:
+instead of `outBones[boneIndex] = delta;`, it now composes
+`delta` with this same fixed rotation constant via the existing
+`VK_Multiply3x4Matrix`, exactly mirroring `G2_TransformGhoulBones`'s own
+`rootMatrix` seeding. **Verified**: the pillar shot now matches
+`rd-vanilla` face-on, pillars-framing-symmetric, at the identical matched
+`t` - not just "closer," the same shot. Full SP scene suite
+(menu/academy1/hoth2/yavin1/vjun1) re-verified clean on both renderers
+afterward (no crashes, no new warnings), and a visual spot-check of
+`sp_hoth2_spawn` (a completely different model, a completely different
+`ent.axis`, viewed from behind rather than in front) confirms the fix
+generalizes rather than being tuned to this one shot - the character's
+pose there is unchanged and still correctly matches `rd-vanilla`'s own
+from-behind framing. The remaining pixel difference on the pillar shot
+(`diff.py` still reports `MAJOR_DIFF`) is lighting/shading only - no
+dynamic lights, a scope cut documented since early in this file - not
+orientation; the two screenshots show the same pose from the same angle.
 
 One thing this round of investigation improved regardless of whether it
 explains the above: `G2API_GetBoltMatrix` (Ghoul2 rendering section,
@@ -2180,7 +2234,7 @@ verified after the fact, but the wrong key (`com_fixedtime`) is what ended
 up permanently baked into `tests/render-regression/scenes.json`'s
 automation - and went undetected for a long time, because `+set` silently
 creates a new, harmless-looking, entirely unread cvar for any unrecognized
-name rather than erroring. See "Character animation investigation: seven
+name rather than erroring. See "Character animation investigation: eight
 real bugs, and a wrong conclusion corrected" further below for the full
 account of how this was finally caught, what it actually changed once
 fixed, and why the specific hoth2/academy1 screenshots this section used

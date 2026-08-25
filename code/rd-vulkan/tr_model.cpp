@@ -899,7 +899,26 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 	int parent = skel.bones[boneIndex].parent;
 	if ( parent < 0 )
 	{
-		outBones[boneIndex] = delta;
+		// rd-vanilla seeds every root bone's hierarchy walk with a fixed
+		// matrix it calls `identityMatrix` (tr_ghoul2.cpp) - a name that's
+		// misleading enough to cost a whole investigation (see README.md's
+		// character-animation section): it is NOT the mathematical identity,
+		// it's a fixed 90-degree rotation, `{{0,-1,0,0},{1,0,0,0},{0,0,1,0}}`
+		// (RootMatrix() returns exactly this for the normal, non-
+		// GHOUL2_NEWORIGIN case - confirmed by directly printing its real
+		// runtime value). It's the fixed remap from the .gla/.glm's own
+		// modeling convention into the engine's world convention - every
+		// Ghoul2 model needs it, unconditionally, same as e.g.
+		// VK_BuildViewMatrix's own fixed camera-convention "flip" constant
+		// elsewhere in this file, not something ent.axis or any per-instance
+		// state already accounts for. Using a true identity here instead
+		// (as this renderer did until now) left every Ghoul2 model rotated
+		// 90 degrees short of rd-vanilla's orientation at the root - normally
+		// masked by the rest of the mesh still reading as "a person," but
+		// glaringly visible on any shot where the camera's own facing isn't
+		// also off by the same 90 degrees to compensate.
+		static const mdxaBone_t s_g2RootRotation = { { { 0.0f, -1.0f, 0.0f, 0.0f }, { 1.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 1.0f, 0.0f } } };
+		VK_Multiply3x4Matrix( &outBones[boneIndex], &s_g2RootRotation, &delta );
 	}
 	else
 	{
