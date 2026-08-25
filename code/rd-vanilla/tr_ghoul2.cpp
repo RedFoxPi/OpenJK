@@ -72,6 +72,7 @@ void G2Time_ReportTimers(void)
 
 //rww - RAGDOLL_BEGIN
 #include <float.h>
+#include <map>
 //rww - RAGDOLL_END
 
 extern	cvar_t	*r_Ghoul2UnSqash;
@@ -79,6 +80,7 @@ extern	cvar_t	*r_Ghoul2AnimSmooth;
 extern	cvar_t	*r_Ghoul2NoLerp;
 extern	cvar_t	*r_Ghoul2NoBlend;
 extern	cvar_t	*r_Ghoul2UnSqashAfterSmooth;
+extern	cvar_t	*r_ghoul2AnimDebug;
 
 bool HackadelicOnClient=false; // means this is a render traversal
 
@@ -2552,6 +2554,72 @@ static inline bool bInShadowRange(vec3_t location)
 
 /*
 ==============
+R_DebugLogGhoul2Anim
+
+Permanent debug tool (see r_ghoul2AnimDebug's declaration comment,
+tr_init.cpp), not one-off dev scaffolding: prints one line per animated
+bone-track on this entity's first Ghoul2 sub-model, rate-limited per
+(instance, bone) to once every 200ms of *simulated* time (currentTime)
+rather than real elapsed time, so a looping animation doesn't flood the
+log and two separate runs produce directly comparable timing. Output
+format is deliberately identical to rd-vulkan's own matching
+"r_ghoul2animdebug" print (tr_model.cpp's VK_DebugLogGhoul2Anim) - same
+field order and units, bone *name* (via each bone's own mdxaSkel_t entry,
+same offset-table walk R_AddGhoulSurfaces already relies on elsewhere in
+this file) rather than a bare index - specifically so the two renderers'
+logs can be grepped for the same entity (matched by world-space origin,
+the one identifier both sides can agree on) and diffed directly against
+each other.
+==============
+*/
+static void R_DebugLogGhoul2Anim( trRefEntity_t *ent, CGhoul2Info_v &ghoul2, int currentTime )
+{
+	extern qboolean G2_Get_Bone_Anim_Index( boneInfo_v &blist, const int index, const int currentTime,
+		float *retcurrentFrame, int *startFrame, int *endFrame, int *flags, float *retAnimSpeed, int numFrames );
+
+	if ( !r_ghoul2AnimDebug->integer || ghoul2.size() == 0 || !ghoul2[0].aHeader )
+	{
+		return;
+	}
+	const mdxaHeader_t *header = ghoul2[0].aHeader;
+	boneInfo_v &blist = ghoul2[0].mBlist;
+
+	static std::map<const CGhoul2Info *, std::map<int, int>> s_lastPrintTime;
+	std::map<int, int> &perBone = s_lastPrintTime[&ghoul2[0]];
+
+	for ( size_t bi = 0; bi < blist.size(); bi++ )
+	{
+		if ( blist[bi].boneNumber == -1 )
+		{
+			continue;
+		}
+		int boneIndex = blist[bi].boneNumber;
+		std::map<int, int>::iterator lastIt = perBone.find( boneIndex );
+		if ( lastIt != perBone.end() && currentTime - lastIt->second < 200 )
+		{
+			continue;
+		}
+		perBone[boneIndex] = currentTime;
+
+		float curFrame = 0.0f; int sf = 0, ef = 0, fl = 0; float spd = 0.0f;
+		G2_Get_Bone_Anim_Index( blist, (int)bi, currentTime, &curFrame, &sf, &ef, &fl, &spd, header->numBones ? header->numFrames : 0 );
+
+		const char *boneName = "?";
+		if ( boneIndex >= 0 && boneIndex < header->numBones )
+		{
+			const mdxaSkelOffsets_t *offsets = (const mdxaSkelOffsets_t *)( (const byte *)header + sizeof( mdxaHeader_t ) );
+			const mdxaSkel_t *skel = (const mdxaSkel_t *)( (const byte *)header + sizeof( mdxaHeader_t ) + offsets->offsets[boneIndex] );
+			boneName = skel->name;
+		}
+
+		ri.Printf( PRINT_ALL, "G2ANIM t=%d pos=(%.0f,%.0f,%.0f) bone=%s start=%d end=%d cur=%.2f speed=%.2f flags=0x%x\n",
+			currentTime, ent->e.origin[0], ent->e.origin[1], ent->e.origin[2], boneName,
+			sf, ef, curFrame, spd, fl );
+	}
+}
+
+/*
+==============
 R_AddGHOULSurfaces
 ==============
 */
@@ -2584,6 +2652,7 @@ void R_AddGhoulSurfaces( trRefEntity_t *ent ) {
 
 	int currentTime=G2API_GetTime(tr.refdef.time);
 
+	R_DebugLogGhoul2Anim( ent, ghoul2, currentTime );
 
 	// cull the entire model if merged bounding box of both frames
 	// is outside the view frustum.

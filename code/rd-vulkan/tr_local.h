@@ -52,6 +52,18 @@ extern cvar_t *com_buildScript;
 // clamped rather than used as raw as rd-vanilla's own "2 - r_lodbias"
 // formula does.
 extern cvar_t *r_lodbias;
+// Permanent debug tool, not a one-off: prints one line per animated Ghoul2
+// bone-track per drawn entity, at a fixed real-time rate, in a format
+// identical to rd-vanilla's own "r_ghoul2animdebug" (tr_ghoul2.cpp) so the
+// two renderers' logs can be directly diffed/grepped against each other by
+// entity position and bone name - see tr_model.cpp's VK_DrawGhoul2Entities
+// for the exact fields. Added after repeated one-off temporary
+// instrumentation (added, used to find a real bug, then deleted) during
+// the character-animation investigation (README.md) turned out to be
+// needed more than once - a permanent, symmetrical tool in both renderers
+// answers "what is this NPC's animation state doing over time in each
+// renderer" directly, without re-deriving throwaway prints each time.
+extern cvar_t *r_ghoul2AnimDebug;
 
 #define MAX_VK_IMAGES 4096
 #define VK_FRAMES_IN_FLIGHT 2
@@ -350,14 +362,18 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle );
 // VulkanSkin in tr_model.cpp), returns a handle usable as VK_LoadGhoul2Model's
 // skinHandle. Called from RE_RegisterSkin below.
 int VK_RegisterSkin( const char *name );
-// Bind-pose-only bolt support (see VulkanSkeleton's comment in
-// tr_model.cpp) - used by G2API_AddBolt/G2API_GetBoltMatrix below.
-// modelCacheIndex is a VK_LoadGhoul2Model return value (i.e.
-// CGhoul2Info::mModel). VK_FindGhoul2Bone returns -1 if not found (same
-// contract as G2API_AddBolt); VK_GetGhoul2BoneBasePoseMat returns false
-// (leaving *out untouched) on any invalid index.
+// Bolt support (see VulkanSkeleton's comment in tr_model.cpp) - used by
+// G2API_AddBolt/G2API_GetBoltMatrix below. modelCacheIndex is a
+// VK_LoadGhoul2Model return value (i.e. CGhoul2Info::mModel).
+// VK_FindGhoul2Bone returns -1 if not found (same contract as
+// G2API_AddBolt). VK_GetGhoul2BoneBasePoseMat (rest pose) and
+// VK_GetGhoul2BoneCurrentPoseMat (this instance's actual currently animated
+// pose - see its own comment, tr_model.cpp, for why G2API_GetBoltMatrix
+// needs this one, not the rest-pose one) both return false (leaving *out
+// untouched) on any invalid index.
 int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName );
 bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t *out );
+bool VK_GetGhoul2BoneCurrentPoseMat( int modelCacheIndex, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime, mdxaBone_t *out );
 // The .gla's own recorded name (mdxaHeader_t::name, e.g.
 // "models/players/_humanoid/_humanoid" - no extension), read straight out
 // of VulkanSkeleton::fileData (kept resident for exactly this kind of

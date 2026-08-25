@@ -722,6 +722,39 @@ bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t
 	return true;
 }
 
+// Same contract as VK_GetGhoul2BoneBasePoseMat, but the bone's *currently
+// animated* world-space (relative to model root) matrix instead of its
+// fixed rest pose - reuses VK_ComputeGhoul2Pose, the same per-frame
+// hierarchy walk VK_DrawGhoul2Entities already runs for skinning, so a
+// bolted bone (e.g. a cutscene camera's tracking tag) reports the NPC's
+// actual current pose rather than a static bind-pose orientation. See
+// G2API_GetBoltMatrix's comment (tr_init.cpp) for why this is needed:
+// without it, academy1's per-shot cutscene camera - bolted to this NPC and
+// re-queried every frame by cg_camera.cpp's CGCam_FollowUpdate - was
+// visibly pointed in the wrong direction despite the NPC's own skeleton
+// pose matching rd-vanilla frame-for-frame (confirmed via the G2ANIM debug
+// tool, README.md's character-animation investigation).
+bool VK_GetGhoul2BoneCurrentPoseMat( int modelCacheIndex, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime, mdxaBone_t *out )
+{
+	if ( modelCacheIndex <= 0 || (size_t)modelCacheIndex >= s_ghoul2Models.size() || !ghlInfo || !out )
+	{
+		return false;
+	}
+	int skeletonIndex = s_ghoul2Models[modelCacheIndex].skeletonIndex;
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return false;
+	}
+	std::vector<mdxaBone_t> pose;
+	VK_ComputeGhoul2Pose( skeletonIndex, ghlInfo, currentTime, pose );
+	if ( boneIndex < 0 || (size_t)boneIndex >= pose.size() )
+	{
+		return false;
+	}
+	*out = pose[boneIndex];
+	return true;
+}
+
 // out = a applied first, then b (i.e. out transforms a point by a, then by
 // b) - arithmetic copied verbatim from rd-vanilla's real
 // Multiply_3x4Matrix (tr_ghoul2.cpp), not rederived: this is exactly the
@@ -2792,8 +2825,77 @@ void VK_DrawScenePolys( const float *mvp, const refdef_t *fd )
 	}
 }
 
+// Permanent debug tool (see r_ghoul2AnimDebug's comment, tr_local.h):
+// prints one line per animated bone-track on every drawn Ghoul2 entity,
+// rate-limited per (instance, bone) to once every 200ms of *simulated*
+// time (currentTime) rather than real elapsed time, so two separate runs
+// (or, more to the point, this renderer and rd-vanilla running the exact
+// same scripted scene) produce directly comparable log timing rather than
+// one flooded with every single frame of a looping animation. Output
+// format is deliberately identical to rd-vanilla's own matching
+// "r_ghoul2animdebug" print (tr_ghoul2.cpp) - same field order and units,
+// bone *name* rather than a bare index (indices happen to already agree
+// between the two renderers for a shared skeleton, but names remove any
+// doubt and stay readable) - specifically so the two renderers' logs can
+// be grepped for the same entity (matched by world-space origin, the one
+// identifier both sides can agree on - see this project's
+// character-animation investigation, README.md, for why origin and not a
+// pointer/handle) and `diff`d directly against each other, rather than
+// re-deriving one-off temporary instrumentation every time a new
+// animation discrepancy needs chasing.
+static void VK_DebugLogGhoul2Anim( const refEntity_t &ent, const CGhoul2Info *ghlInfo, const VulkanSkeleton *skel, int currentTime )
+{
+	if ( !r_ghoul2AnimDebug->integer || !ghlInfo )
+	{
+		return;
+	}
+	auto instIt = s_ghoul2AnimState.find( ghlInfo );
+	if ( instIt == s_ghoul2AnimState.end() )
+	{
+		return;
+	}
+	static std::unordered_map<const CGhoul2Info *, std::unordered_map<int, int>> s_lastPrintTime;
+	auto &perBone = s_lastPrintTime[ghlInfo];
+	int numFrames = VK_GetGhoul2NumFrames( ghlInfo );
+	for ( auto &kv : instIt->second )
+	{
+		int boneIndex = kv.first;
+		const VulkanGhoul2AnimState &state = kv.second;
+		auto lastIt = perBone.find( boneIndex );
+		if ( lastIt != perBone.end() && currentTime - lastIt->second < 200 )
+		{
+			continue;
+		}
+		perBone[boneIndex] = currentTime;
+		const char *boneName = "?";
+		if ( skel && boneIndex >= 0 && (size_t)boneIndex < skel->bones.size() )
+		{
+			boneName = skel->bones[boneIndex].name.c_str();
+		}
+		float pos = VK_Ghoul2CurrentFramePosition( state, currentTime, numFrames );
+		ri.Printf( PRINT_ALL, "G2ANIM t=%d pos=(%.0f,%.0f,%.0f) bone=%s start=%d end=%d cur=%.2f speed=%.2f flags=0x%x\n",
+			currentTime, ent.origin[0], ent.origin[1], ent.origin[2], boneName,
+			state.startFrame, state.endFrame, pos, state.animSpeed, state.flags );
+	}
+}
+
+// Last currentTime this renderer actually drew a Ghoul2 scene at - the only
+// per-frame animation clock this renderer has, needed by
+// VK_GetGhoul2BoneCurrentPoseMat (G2API_GetBoltMatrix's real caller,
+// cg_camera.cpp's CGCam_FollowUpdate, has no currentTime of its own to pass
+// in; the real engine's equivalent just re-evaluates the instance's own live
+// animation state, which amounts to the same "whatever time we're currently
+// rendering at" value). One render-call of lag behind the very next
+// RE_RenderScene is an unavoidable, harmless consequence of camera-bolt
+// queries happening src-side before this frame's scene is actually drawn -
+// see G2API_GetBoltMatrix's comment (tr_init.cpp) for why this replaced a
+// bind-pose-only bolt matrix that made cutscene cameras track a
+// rest-pose orientation instead of the NPC's actual current pose.
+int g_vkGhoul2LastRenderTime = 0;
+
 void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 {
+	g_vkGhoul2LastRenderTime = currentTime;
 	if ( s_sceneEntities.empty() || !vk.frameActive )
 	{
 		return;
@@ -2886,6 +2988,9 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 			std::vector<mdxaBone_t> pose;
 			VK_ComputeGhoul2Pose( model.skeletonIndex, &g2Instance, currentTime, pose );
 			VK_SkinGhoul2Model( model, pose, skinSlot );
+			VK_DebugLogGhoul2Anim( ent, &g2Instance,
+				( model.skeletonIndex > 0 && (size_t)model.skeletonIndex < s_skeletons.size() ) ? &s_skeletons[model.skeletonIndex] : nullptr,
+				currentTime );
 
 			// Full push constant struct (mvp + camPos + fogColor), both
 			// stages - matching vk.worldPipelineLayout's actual range (see

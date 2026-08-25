@@ -156,6 +156,13 @@ cvar_t	*r_Ghoul2UnSqash;
 cvar_t	*r_Ghoul2TimeBase=0;
 cvar_t	*r_Ghoul2NoLerp;
 cvar_t	*r_Ghoul2NoBlend;
+// Permanent debug tool, not rd-vanilla-specific dev scaffolding: prints one
+// line per animated bone-track per drawn Ghoul2 entity, in a format
+// identical to rd-vulkan's own matching "r_ghoul2animdebug" registration
+// (tr_init.cpp) so the two renderers' logs can be diffed directly - see
+// rd-vulkan/tr_local.h's comment and R_AddGhoulSurfaces (tr_ghoul2.cpp)
+// for the print itself.
+cvar_t	*r_ghoul2AnimDebug;
 cvar_t	*r_Ghoul2BlendMultiplier=0;
 cvar_t	*r_Ghoul2UnSqashAfterSmooth;
 
@@ -1643,6 +1650,9 @@ Ghoul2 Insert Start
 	r_Ghoul2TimeBase = ri.Cvar_Get( "r_ghoul2timebase", "2", 0);
 	r_Ghoul2NoLerp = ri.Cvar_Get( "r_ghoul2nolerp", "0", 0);
 	r_Ghoul2NoBlend = ri.Cvar_Get( "r_ghoul2noblend", "0", 0);
+	// Same name/flags as rd-vulkan's own registration (tr_init.cpp) - see
+	// this cvar's declaration comment above for why.
+	r_ghoul2AnimDebug = ri.Cvar_Get( "r_ghoul2animdebug", "0", 0 );
 	r_Ghoul2BlendMultiplier = ri.Cvar_Get( "r_ghoul2blendmultiplier", "1", 0);
 	r_Ghoul2UnSqashAfterSmooth = ri.Cvar_Get( "r_ghoul2unsquashaftersmooth", "1", 0);
 

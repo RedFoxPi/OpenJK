@@ -708,7 +708,7 @@ The follow-up to the above: `G2API_SetBoneAnim` and friends now really
 work, so a model instance plays the animation the game actually asked for,
 advancing over real time, instead of a permanently frozen frame 0.
 
-**Caveat added much later, see "Character animation investigation: six
+**Caveat added much later, see "Character animation investigation: seven
 real bugs, and a wrong conclusion corrected" below**: everything in this
 section describes the frame-advance machinery working correctly in
 isolation, which it does - but for a long time afterward, none of it was
@@ -808,7 +808,7 @@ playback, which this demonstrably now is. No crash across
 academy1/vjun1/hoth2, clean rebuild, zero warnings.
 
 **Correction, found much later (see "Character animation investigation:
-six real bugs, and a wrong conclusion corrected" below): the specific
+seven real bugs, and a wrong conclusion corrected" below): the specific
 `wait 100`/`wait 400` observations above can't be trusted.** `com_fixedtime`
 (used to control for
 render-speed timing skew here) is not this cvar's real registered name -
@@ -1379,7 +1379,7 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
-## Character animation investigation: six real bugs, and a wrong
+## Character animation investigation: seven real bugs, and a wrong
 conclusion corrected
 
 **Bottom line up front, since the investigation below initially got this
@@ -1739,6 +1739,126 @@ per-bone fix above with the real `fixedtime` cvar: identical crash, same
 assertion, same line. That hypothesis is now closed; the real cause is
 still unknown and still out of scope for this write-up.
 
+**A permanent debug tool, added on user request rather than another
+one-off temporary print**: comparing screenshots alone couldn't settle
+whether a visible pose difference was a genuine animation bug or just an
+unrelated camera-timing artifact (both this write-up and its readers kept
+having to re-derive the answer from scratch each time). `r_ghoul2animdebug`
+(new cvar, flags `0` - **not** `CVAR_CHEAT`, see below) turns on a `G2ANIM`
+console/log line per tracked bone, on both renderers, in the same format:
+`G2ANIM t=<currentTime> pos=(x,y,z) bone=<name> start=<f> end=<f>
+cur=<f.ff> speed=<f.f> flags=0x<hex>` - entity world position (this
+project's established cross-renderer/cross-run NPC-matching key, since
+spawn positions are deterministic - see the harness-timing section above)
+plus that bone's real current animation state, throttled to once per 200ms
+per bone so it stays readable over a multi-second capture instead of
+flooding one line per frame. `rd-vanilla`'s version
+(`R_DebugLogGhoul2Anim`, `tr_ghoul2.cpp`) walks the real
+`boneInfo_v`/`G2_Get_Bone_Anim_Index` per-bone list and resolves bone names
+from the `.gla`'s `mdxaSkelOffsets_t` table; this renderer's version
+(`VK_DebugLogGhoul2Anim`, `tr_model.cpp`) walks its own
+`s_ghoul2AnimState` per-instance-per-bone map and resolves names from the
+already-parsed `VulkanSkeleton::bones` array - different data structures,
+identical log line shape, so a `grep`+`diff` across both renderers' logs
+for the same NPC's world position is directly meaningful. Both are true
+no-ops with the cvar at its default `"0"` (verified: identical log output
+and the full SP scene suite still clean on both renderers with it unset).
+
+**Bug 7 (functional, in this renderer, found while first trying to use the
+new debug tool): `r_ghoul2animdebug` was registered `CVAR_CHEAT`, so
+`+set r_ghoul2animdebug 1` silently did nothing.** Both renderers'
+`ri.Cvar_Get( "r_ghoul2animdebug", "0", CVAR_CHEAT )` calls happen during
+early engine bring-up (`Com_Init`), before the command buffer's `+set`
+arguments are processed - confirmed by reading `Cvar_Set2`/`Cvar_Get`
+directly (`qcommon/cvar.cpp`): `Cvar_Set2` (what `+set` goes through)
+silently rejects any value change on a `CVAR_CHEAT` cvar while
+`cvar_cheats->integer` is `0`, which it still was at the point `+set`
+ran, regardless of whether `+set r_ghoul2animdebug 1` was placed before or
+after `+devmap` on the command line (`devmap` enables cheats, but only
+once it actually runs, after `+set` arguments already tried and failed).
+This renderer's own established convention for this exact category of
+debug cvar - `r_Ghoul2NoLerp`/`r_Ghoul2NoBlend`
+(`ri.Cvar_Get( "r_ghoul2nolerp", "0", 0 )`, no `CVAR_CHEAT`) - was right
+there to copy and wasn't; fixed by registering with flags `0` in both
+`code/rd-vulkan/tr_init.cpp` and `code/rd-vanilla/tr_init.cpp`, confirmed
+working (`G2ANIM` lines now actually appear with `+set r_ghoul2animdebug 1`
+on either side of `+devmap`).
+
+**Using the new tool on the exact NPC this section opened with** (the
+pillar-framed close-up shot, world position `(-1408,-1304,744)`, the one a
+user directly pointed at as still visibly wrong after every fix up to and
+including Bug 6): captured `G2ANIM` lines from both renderers across
+several seconds of simulated time (`waittime` 400 through 4800ms, same
+technique as the harness). Result: **the animation-clip data has been
+fully fixed by Bug 6 and stayed fixed** - both renderers report the exact
+same `start=15449 end=15451 cur=<matching value>` for this NPC's
+`model_root`/`Motion`/`lower_lumbar` bones at every sampled timestamp, and
+both transition to the exact same next clip (`start=18 end=42 cur=21`) at
+the exact same simulated time. This is not a coincidence or a loose
+approximation - it is bit-for-bit the same frame data, frame for frame,
+confirming this specific residual concern from Bug 6's write-up is fully
+resolved, not just "close."
+
+**Yet the screenshots at that exact matched simulated time still show a
+real, visible difference**: `rd-vanilla` shows the NPC face-on, framed
+between the two pillars (the shot this whole section is named for);
+this renderer shows the same NPC in side profile, same pillars, same
+lighting, at the identical `t`. Since the bone *animation* data is now
+proven identical, this has to be a *pose/orientation*, not a timing,
+difference - a different kind of bug than anything else in this section.
+Chased as far as this session's evidence trail goes, all of it via direct
+numeric comparison, not visual guessing:
+
+- The `refdef_t` this renderer's `RE_RenderScene` receives (camera
+  `vieworg`/`viewaxis`/`fov`) is **byte-identical** to what `rd-vanilla`
+  receives at the same `t` (confirmed via matched temporary prints in both
+  `RE_RenderScene`s) - cgame's camera computation is shared code and isn't
+  the problem.
+- Hand-multiplying this renderer's own logged `mvp` matrix against the
+  NPC's world-space origin lands it almost exactly screen-centered
+  (`x_ndc≈0.03`) - the shared view/projection math is correct for this
+  shot; the camera isn't pointed the wrong way and isn't misprojecting.
+- `ent.axis` for this NPC (its facing, from shared cgame code, unaffected
+  by which renderer is loaded) is also byte-identical between the two
+  renderers at this `t` - `axis0=(0,1,0)`, i.e. facing world `+Y`, which
+  *is* consistent with the front-on shot `rd-vanilla` actually shows
+  (camera looks toward `-Y` from the `+Y` side, straight at the NPC's
+  front). The entity-level facing this renderer is told to use is correct.
+- `VK_ComputeGhoul2Pose`'s root-bone matrix for this NPC, at this `t`, has
+  **no rotation component at all** (identity rotation, matching the
+  `.gla`'s base pose rotation exactly, just a translation) - so the visible
+  90-degree-ish discrepancy isn't coming from a root-bone orientation bug
+  either.
+
+In short: camera, shared entity-level facing, and root-bone orientation
+are all independently confirmed correct and identical to `rd-vanilla`, yet
+the rendered mesh still comes out rotated. That narrows the remaining bug
+to somewhere in the *child*-bone hierarchy composition
+(`VK_ComputeGhoul2BoneRecursive`/`VK_ResolveGhoul2BonePose`) - specifically
+something about *this NPC's currently-playing clip* (frame `15449`, from
+the academy1-specific cinematic `.gla` Bug 6 taught this renderer to load
+at all) that a normal `_humanoid.gla` idle animation apparently doesn't
+trigger, since spawn-point verifications elsewhere in this file never
+surfaced anything like it. **This is not fixed.** It's included here,
+fully documented with the exact evidence trail above, specifically so the
+next attempt doesn't have to re-derive "is it the camera, the entity axis,
+or the root bone" from scratch - all three are already ruled out.
+
+One thing this round of investigation improved regardless of whether it
+explains the above: `G2API_GetBoltMatrix` (Ghoul2 rendering section,
+further below) was using this NPC's *bind pose* for a bolted bone's world
+matrix, not its actual current animated pose - a real bug in its own
+right, benign for a stationary idle but wrong in general for any bolt on
+a moving bone (e.g. a cutscene camera tracking a tag on an animating NPC).
+Fixed by routing it through a new `VK_GetGhoul2BoneCurrentPoseMat`
+(reuses `VK_ComputeGhoul2Pose`, the same per-frame hierarchy walk skinning
+already runs) instead of the old bind-pose-only
+`VK_GetGhoul2BoneBasePoseMat`. Verified this doesn't regress anything
+(full SP scene suite still clean, no crashes, on both renderers) but did
+**not**, on its own, change the pillar-shot screenshot above - confirming
+the root cause of that specific discrepancy is elsewhere, as the bullet
+list above already independently established.
+
 ## Bugs found and fixed during that verification (worth knowing about if you
 touch this code)
 
@@ -2060,7 +2180,7 @@ verified after the fact, but the wrong key (`com_fixedtime`) is what ended
 up permanently baked into `tests/render-regression/scenes.json`'s
 automation - and went undetected for a long time, because `+set` silently
 creates a new, harmless-looking, entirely unread cvar for any unrecognized
-name rather than erroring. See "Character animation investigation: six
+name rather than erroring. See "Character animation investigation: seven
 real bugs, and a wrong conclusion corrected" further below for the full
 account of how this was finally caught, what it actually changed once
 fixed, and why the specific hoth2/academy1 screenshots this section used

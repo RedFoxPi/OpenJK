@@ -36,6 +36,7 @@ cvar_t *r_verbose = nullptr;
 cvar_t *se_language = nullptr;
 cvar_t *com_buildScript = nullptr;
 cvar_t *r_lodbias = nullptr;
+cvar_t *r_ghoul2AnimDebug = nullptr;
 
 extern void R_InitFonts( void );
 extern void R_ShutdownFonts( void );
@@ -1122,6 +1123,10 @@ void R_Init( void )
 	// Same name/default/flags as rd-vanilla's real registration (tr_init.cpp)
 	// - only RT_ELECTRICITY (tr_model.cpp) reads it in this renderer so far.
 	r_lodbias = ri.Cvar_Get( "r_lodbias", "0", CVAR_ARCHIVE_ND );
+	// Same name/flags as rd-vanilla's own registration (tr_init.cpp) - see
+	// tr_local.h's comment for why this exists in both renderers with a
+	// matching name and output format.
+	r_ghoul2AnimDebug = ri.Cvar_Get( "r_ghoul2animdebug", "0", 0 );
 
 	R_ImageLoader_Init();
 	R_InitFonts();
@@ -1586,13 +1591,27 @@ static void VK_Multiply3x4Matrix( mdxaBone_t *out, const mdxaBone_t *in2, const 
 	}
 }
 
-// Bind-pose-only (see README.md): frameNum/modelList are ignored - there is
-// no animation to select a frame of, a bolt always reports its rest-pose
-// position. This is what fixed academy1's cutscene camera collapsing onto
-// the NPC's own origin - see README.md's "Ghoul2 rendering" section for the
-// full story (CGCam_FollowUpdate, cg_camera.cpp, calls this every frame to
-// track a bolt on the NPC and never checks the qfalse this used to always
-// return).
+// frameNum/modelList (real engine legacy parameters, unused by the real
+// implementation either) are ignored, but the bolt itself now reports this
+// instance's actual *currently animated* pose, not a fixed rest pose - see
+// VK_GetGhoul2BoneCurrentPoseMat's comment (tr_model.cpp) for why: an
+// earlier bind-pose-only version of this function fixed academy1's cutscene
+// camera collapsing onto the NPC's own origin (see README.md's "Ghoul2
+// rendering" section for that story), but left the camera - bolted to this
+// NPC and re-queried every frame by cg_camera.cpp's CGCam_FollowUpdate -
+// pointed in a fixed rest-pose direction regardless of the NPC's real
+// current pose, a second, subtler bug the debug-log comparison against
+// rd-vanilla in README.md's character-animation investigation section
+// caught: the NPC's own skeleton pose matched rd-vanilla frame-for-frame,
+// yet the two renderers' cutscene camera angle for the identical shot
+// didn't, because only the camera's bolt matrix - not the NPC's own
+// skin - was still using the rest pose. g_vkGhoul2LastRenderTime (extern,
+// tr_model.cpp) is the only per-frame animation clock available here:
+// this function has no currentTime of its own (cg_camera.cpp doesn't pass
+// one), so it uses whatever time this renderer most recently drew a Ghoul2
+// scene at - one render-call of lag behind the very next RE_RenderScene,
+// unavoidable and harmless for a camera that's re-queried every frame.
+extern int g_vkGhoul2LastRenderTime;
 qboolean G2API_GetBoltMatrix( CGhoul2Info_v &ghoul2, const int modelIndex, const int boltIndex, mdxaBone_t *matrix, const vec3_t angles, const vec3_t position, const int frameNum, qhandle_t *modelList, const vec3_t scale )
 {
 	(void)frameNum; (void)modelList;
@@ -1625,7 +1644,7 @@ qboolean G2API_GetBoltMatrix( CGhoul2Info_v &ghoul2, const int modelIndex, const
 		CGhoul2Info &ghlInfo = ghoul2[modelIndex];
 		if ( boltIndex >= 0 && (size_t)boltIndex < ghlInfo.mBltlist.size() && ghlInfo.mBltlist[boltIndex].boneNumber >= 0 )
 		{
-			ok = VK_GetGhoul2BoneBasePoseMat( (int)ghlInfo.mModel, ghlInfo.mBltlist[boltIndex].boneNumber, &bolt );
+			ok = VK_GetGhoul2BoneCurrentPoseMat( (int)ghlInfo.mModel, &ghlInfo, ghlInfo.mBltlist[boltIndex].boneNumber, g_vkGhoul2LastRenderTime, &bolt );
 			if ( ok )
 			{
 				// Same conditional scale-the-translation step as the real
