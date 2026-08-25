@@ -599,6 +599,11 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 					wv.uv[1] = texCoords[v].texCoords[1];
 					wv.lightmapUV[0] = 0.0f;
 					wv.lightmapUV[1] = 0.0f;
+					// `WorldVertex wv = {}` above zero-inits colour to
+					// black, not white - see WorldVertex::color's own
+					// comment (tr_local.h) for why Ghoul2 meshes need this
+					// set explicitly.
+					wv.color[0] = wv.color[1] = wv.color[2] = wv.color[3] = 1.0f;
 					cpuVerts.push_back( wv );
 
 					GhoulSkinVertex sv = {};
@@ -794,6 +799,10 @@ int VK_LoadMD3Model( const char *fileName )
 					wv.uv[1] = st[v].st[1];
 					wv.lightmapUV[0] = 0.0f;
 					wv.lightmapUV[1] = 0.0f;
+					// See the other `WorldVertex wv = {}` site above (Ghoul2
+					// meshes) for why this needs to be white, not the
+					// zero-inited black.
+					wv.color[0] = wv.color[1] = wv.color[2] = wv.color[3] = 1.0f;
 					cpuVerts.push_back( wv );
 				}
 

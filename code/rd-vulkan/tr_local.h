@@ -166,16 +166,32 @@ struct vkPushConstants_t
 	float color[4];
 };
 
-// Static world geometry only (see tr_world.cpp): position, diffuse UV, and
-// lightmap UV. Still opaque, single-diffuse-texture-per-surface geometry -
-// no vertex color/normal, no dynamic lights - but lit by the map's baked
-// lightmap, which is what actually makes it comparable to rd-vanilla's
-// default (non-fullbright) output. See VK_LoadLightmaps in tr_world.cpp.
+// Static world geometry only (see tr_world.cpp): position, diffuse UV,
+// lightmap UV, and a per-vertex colour. Still opaque, single-diffuse-
+// texture-per-surface geometry - no normal, no dynamic lights - but lit by
+// the map's baked lightmap (VK_LoadLightmaps) and, for vertex-lit surfaces
+// specifically, this real baked per-vertex colour too (see `color`'s own
+// comment) - together what actually makes it comparable to rd-vanilla's
+// default (non-fullbright) output.
 struct WorldVertex
 {
 	float pos[3];
 	float uv[2];
 	float lightmapUV[2];
+	// dsurface_t/drawVert_t's real baked colour (style 0), normalized to
+	// 0..1 - but only genuinely populated from BSP data for vertex-lit
+	// surfaces (WorldSurfaceBatch::vertexLit, RE_LoadWorldMap); every other
+	// vertex - real lightmapped world geometry, sky faces, Ghoul2 meshes -
+	// gets a hardcoded (1,1,1,1) here instead of its own BSP-baked value
+	// (lightmapped surfaces have one too, but real Quake3 shaders for them
+	// use `rgbGen identityLighting`, not `rgbGen vertex`, so rd-vanilla
+	// itself never actually applies it - this renderer doesn't parse
+	// `rgbGen` at all, so hardcoding white for the surfaces where it
+	// wouldn't apply anyway reaches the same visual result without needing
+	// to). world.frag always multiplies by this unconditionally - a
+	// (1,1,1,1) here is a true no-op, so no shader-side branch is needed to
+	// tell vertex-lit and lightmapped/Ghoul2 vertices apart.
+	float color[4];
 };
 
 // Runtime polys (RE_AddPolyToScene - particles, sparks, decals; see

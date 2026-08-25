@@ -836,16 +836,17 @@ static void VK_CreateWorldPipeline( void )
 	stages[1].pName = "main";
 
 	VkVertexInputBindingDescription binding = { 0, sizeof( WorldVertex ), VK_VERTEX_INPUT_RATE_VERTEX };
-	VkVertexInputAttributeDescription attrs[3] = {
+	VkVertexInputAttributeDescription attrs[4] = {
 		{ 0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof( WorldVertex, pos ) },
 		{ 1, 0, VK_FORMAT_R32G32_SFLOAT, offsetof( WorldVertex, uv ) },
 		{ 2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof( WorldVertex, lightmapUV ) },
+		{ 3, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof( WorldVertex, color ) },
 	};
 
 	VkPipelineVertexInputStateCreateInfo vertexInput = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
 	vertexInput.vertexBindingDescriptionCount = 1;
 	vertexInput.pVertexBindingDescriptions = &binding;
-	vertexInput.vertexAttributeDescriptionCount = 3;
+	vertexInput.vertexAttributeDescriptionCount = 4;
 	vertexInput.pVertexAttributeDescriptions = attrs;
 
 	VkPipelineInputAssemblyStateCreateInfo inputAssembly = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };

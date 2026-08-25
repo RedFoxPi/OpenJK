@@ -3,6 +3,7 @@
 layout(location = 0) in vec2 fragUV;
 layout(location = 1) in vec2 fragLightmapUV;
 layout(location = 2) in float fragFogDist;
+layout(location = 3) in vec4 fragColor;
 layout(location = 0) out vec4 outColor;
 
 layout(binding = 0) uniform sampler2D diffuseTex;
@@ -19,8 +20,9 @@ layout(push_constant) uniform PushConstants {
 } pc;
 
 void main() {
-    // Baked lightmap only - no dynamic lights, no vertex color, see
-    // rd-vulkan/README.md. pc.camPos.w carries a per-draw overbright factor
+    // Baked lightmap, plus real per-vertex colour for vertex-lit surfaces
+    // (fragColor, see below) - still no dynamic lights, see rd-vulkan/
+    // README.md. pc.camPos.w carries a per-draw overbright factor
     // (see vkWorldPushConstants_t's comment, tr_local.h) rather than a
     // hardcoded 2.0: real BSP lightmaps are baked assuming the renderer
     // doubles them back out at draw time ("overbright bits"), so world/sky
@@ -34,9 +36,15 @@ void main() {
     // unearned doubling without pretending to add the real ambient/
     // directional lighting rd-vanilla applies instead (still not
     // implemented - this only removes a bug, it isn't the missing feature).
+    // fragColor (WorldVertex::color) is real baked per-vertex colour for
+    // vertex-lit surfaces, and a hardcoded (1,1,1,1) no-op for everything
+    // else (real lightmapped world geometry, sky, Ghoul2) - see
+    // WorldVertex::color's own comment (tr_local.h) for why that hardcoded
+    // default is correct rather than a placeholder, and why no shader-side
+    // branch is needed to tell the two cases apart.
     vec4 diffuse = texture(diffuseTex, fragUV);
     vec4 lightmap = texture(lightmapTex, fragLightmapUV);
-    vec3 shaded = diffuse.rgb * lightmap.rgb * pc.camPos.w;
+    vec3 shaded = diffuse.rgb * lightmap.rgb * fragColor.rgb * pc.camPos.w;
 
     // World fog (see VK_LoadWorldFog, tr_world.cpp) - a simplified linear
     // distance ramp toward this batch's own assigned fog's colour (global

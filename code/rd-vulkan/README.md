@@ -2363,20 +2363,14 @@ batch's category actually differs from the previous one drawn, not
 unconditionally per-batch, to avoid one push-constant call per surface
 across a 7000+-batch level like hoth2.
 
-**Not a complete fix**: this only removes the incorrect doubling - it does
-not add real per-vertex `rgbGen vertex` colour support. `drawVert_t::color`
-(the actual baked ambient/directional colour Quake3 map compilers write per
-vertex for exactly these surfaces) still isn't read or applied anywhere;
-`WorldVertex` has no colour attribute at all. The visible result after this
-fix is the diffuse texture's own colour and detail, undoubled and
-unclipped, not `rd-vanilla`'s exact per-vertex-shaded result - closely
-matching in practice for hoth2's snow (a mostly-flat, evenly-lit outdoor
-surface where per-vertex colour varies little), but not a general solution
-for a vertex-lit surface with strong per-vertex shading variation (e.g.
-sharp cast shadows baked into the vertices). Left for a future pass if a
-real case surfaces where the difference is visible - would need a new
-per-vertex colour attribute end-to-end (`WorldVertex`, `world.vert`,
-`world.frag`) similar in shape to `PolyVertex`'s existing colour field.
+**Was not a complete fix at the time**: this removed the incorrect
+doubling but didn't add real per-vertex `rgbGen vertex` colour support -
+`drawVert_t::color` (the actual baked ambient/directional colour Quake3 map
+compilers write per vertex for exactly these surfaces) wasn't read or
+applied anywhere yet; `WorldVertex` had no colour attribute at all. Since
+fixed - see "Real per-vertex colour for vertex-lit surfaces" below, which
+adds exactly the `WorldVertex`/`world.vert`/`world.frag` colour attribute
+this paragraph originally called out as the needed follow-up.
 
 **Also investigated, not a rendering bug**: two wampa creatures visible in
 `rd-vanilla`'s screenshot are absent from `rd-vulkan`'s for this same scene.
@@ -2714,6 +2708,61 @@ the same reason: a fixed spawn-point screenshot can't be expected to
 happen to frame every real map feature, and that's not a reason to skip
 implementing or documenting one honestly.
 
+## Real per-vertex colour for vertex-lit surfaces
+
+Closes a gap this file has flagged as a known limitation since "hoth2's
+overexposed terrain" above: that fix stopped vertex-lit surfaces
+(`q3map_nolightmap` + `rgbGen vertex`, no baked lightmap at all - hoth2's
+snow terrain is the confirmed real case) from being wrongly overbright-
+doubled, but left them with no real per-vertex shading at all - just the
+diffuse texture's own flat colour, undoubled but uniform. Real Quake3 map
+compilers bake genuine ambient/directional lighting per vertex for exactly
+these surfaces (`drawVert_t::color`), and `rgbGen vertex` tells the real
+renderer to actually use it - this was read nowhere in this renderer until
+now.
+
+**Implementation**: `WorldVertex` gains a `color[4]` attribute, a new
+vertex input binding (`world.vert`'s `inColor` at `location = 3`,
+`VK_FORMAT_R32G32B32A32_SFLOAT`) shared by every user of `vk.worldPipeline`
+- world geometry, the sky box, and Ghoul2 models all reuse this one
+pipeline/vertex layout, so all three needed a value, not just world
+surfaces. Rather than adding a shader-side branch to tell "this vertex has
+real baked colour" from "this vertex doesn't", every vertex that *isn't*
+vertex-lit - real lightmapped world geometry, sky faces, Ghoul2 meshes -
+gets a hardcoded `(1,1,1,1)` (white) instead of its own BSP data. This is
+correct, not just a placeholder: real lightmapped shaders use `rgbGen
+identityLighting`, not `rgbGen vertex`, so rd-vanilla itself never applies
+vertex colour to them either, even though their `drawVert_t` also happens
+to carry one - hardcoding white where it wouldn't be applied anyway
+reaches the identical visual result to a real `rgbGen` parse without
+needing one. `world.frag` then unconditionally multiplies
+`diffuse * lightmap * vertexColor * overbright` - a `(1,1,1,1)` multiply
+is a true no-op, so lightmapped/sky/Ghoul2 rendering is provably unchanged
+by this pass. `VK_TessellatePatchQuad`'s existing biquadratic-Bezier
+interpolation (already used for position/UV) was extended to interpolate
+colour the same way, so a vertex-lit curved surface (none of the four test
+maps happen to have one, but the code path is shared) would blend
+correctly too, not just flat-shade at the nearest control point.
+
+**Verified real improvement, not just a real difference**: pixel-diffed a
+build with this fix against one without it (same binaries otherwise, only
+`rd-vulkan_x86_64.so` swapped, via this project's `render_regression_*`
+CMake targets - see "tests: add CMake targets..." for why that comparison
+method is trustworthy now). academy1 and the main menu came back
+effectively unchanged (0.06%/0.0% mean diff, within this renderer's already
+-documented noise floor - see "World-geometry tcMod scroll" above);
+hoth2 - the only test map with any vertex-lit surfaces at all - showed a
+real, substantial difference (3.14% mean, 35.6% of pixels), concentrated
+exactly on the terrain, not scattered noise. Compared directly against a
+fresh `rdsp-vanilla` capture of the same scene: the *before* screenshot was
+a flat, uniformly neutral white/grey snowfield; both the *after* screenshot
+and real `rdsp-vanilla`'s own terrain show the same soft blue-lavender
+tint - a real, visible move toward matching the reference, confirmed by
+eye against an actual side-by-side, not assumed from the diff percentage
+alone.
+
+## What's actually implemented
+
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
   pass, framebuffers, per-frame command buffers and sync objects.
 - A working, verified 2D textured-quad draw path (`RE_StretchPic`, the
@@ -2854,11 +2903,11 @@ implementing or documenting one honestly.
   EXP2/gradient-texture falloff curve rd-vanilla's real fog uses (a linear
   distance ramp approximates it instead, same simplification as the base
   global-fog work).
-- Dynamic lighting for world geometry (`AddLightToScene` is a stub) and
-  vertex lighting/colors - only the map's precomputed, baked lightmap
-  applies (see "3D world geometry" above). No shadows other than what's
-  already baked into that lightmap; nothing moves, casts, or receives a
-  dynamic shadow.
+- Dynamic lighting for world geometry (`AddLightToScene` is a stub) - only
+  the map's precomputed, baked lightmap and (for vertex-lit surfaces, see
+  "Real per-vertex colour" below) baked per-vertex colour apply. No shadows
+  other than what's already baked into those; nothing moves, casts, or
+  receives a dynamic shadow.
 - BSP visibility (PVS) culling and back-face culling for world geometry -
   view-frustum culling *is* implemented (see "3D world geometry" above),
   but every surface potentially in view is still submitted regardless of

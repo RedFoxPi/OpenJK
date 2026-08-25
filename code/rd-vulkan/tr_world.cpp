@@ -453,6 +453,11 @@ static void VK_LoadSky( const char *baseName )
 			v.uv[1] = 1.0f - ( t + 1.0f ) * 0.5f;
 			v.lightmapUV[0] = 0.0f;
 			v.lightmapUV[1] = 0.0f;
+			// `WorldVertex v = {}` above zero-inits colour to black, not
+			// white - see WorldVertex::color's own comment for why every
+			// non-vertex-lit vertex (sky faces included) needs this set
+			// explicitly rather than relying on a default.
+			v.color[0] = v.color[1] = v.color[2] = v.color[3] = 1.0f;
 			cpuVerts.push_back( v );
 		}
 
@@ -686,6 +691,10 @@ static void VK_TessellatePatchQuad( const WorldVertex ctrl[3][3], int level,
 					out.uv[1] += w * p.uv[1];
 					out.lightmapUV[0] += w * p.lightmapUV[0];
 					out.lightmapUV[1] += w * p.lightmapUV[1];
+					out.color[0] += w * p.color[0];
+					out.color[1] += w * p.color[1];
+					out.color[2] += w * p.color[2];
+					out.color[3] += w * p.color[3];
 				}
 			}
 
@@ -789,6 +798,12 @@ void RE_LoadWorldMap( const char *name )
 		// aren't used by this renderer, see WorldVertex's comment.
 		cpuVerts[i].lightmapUV[0] = verts[i].lightmap[0][0];
 		cpuVerts[i].lightmapUV[1] = verts[i].lightmap[0][1];
+		// White (no-op) by default - overwritten below with this vertex's
+		// real baked colour, but only for surfaces the per-surface loop
+		// below determines are vertex-lit. See WorldVertex::color's own
+		// comment for why every other vertex deliberately keeps this
+		// hardcoded value instead of its own BSP-baked one.
+		cpuVerts[i].color[0] = cpuVerts[i].color[1] = cpuVerts[i].color[2] = cpuVerts[i].color[3] = 1.0f;
 	}
 
 	std::vector<uint32_t> cpuIndexes;
@@ -894,6 +909,26 @@ void RE_LoadWorldMap( const char *name )
 		if ( lightmapNum >= 0 && (size_t)lightmapNum < s_lightmapImages.size() )
 		{
 			lightmap = s_lightmapImages[lightmapNum];
+		}
+
+		// Real baked per-vertex colour (drawVert_t::color, style 0) for
+		// vertex-lit surfaces only - see WorldVertex::color's own comment
+		// for why every other surface keeps the white default already set
+		// above. Must happen before the isPatch/else block below, which
+		// reads cpuVerts (directly for triangle-soup/planar surfaces, via
+		// captured control points for patches) - both cases pick up the
+		// real colour automatically as long as it's written here first.
+		if ( lightmapNum < 0 )
+		{
+			for ( int v = 0; v < surf.numVerts; v++ )
+			{
+				const byte *c = verts[surf.firstVert + v].color[0];
+				WorldVertex &wv = cpuVerts[surf.firstVert + v];
+				wv.color[0] = c[0] / 255.0f;
+				wv.color[1] = c[1] / 255.0f;
+				wv.color[2] = c[2] / 255.0f;
+				wv.color[3] = c[3] / 255.0f;
+			}
 		}
 
 		// dsurface_t.fogNum directly indexes s_worldFogs (see VK_LoadWorldFog's

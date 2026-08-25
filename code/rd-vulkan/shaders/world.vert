@@ -3,10 +3,12 @@
 layout(location = 0) in vec3 inPos;
 layout(location = 1) in vec2 inUV;
 layout(location = 2) in vec2 inLightmapUV;
+layout(location = 3) in vec4 inColor;
 
 layout(location = 0) out vec2 fragUV;
 layout(location = 1) out vec2 fragLightmapUV;
 layout(location = 2) out float fragFogDist;
+layout(location = 3) out vec4 fragColor;
 
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
@@ -26,6 +28,7 @@ void main() {
     // BSP compile and never move independently of the surface itself.
     fragUV = inUV + pc.fogStart.yz;
     fragLightmapUV = inLightmapUV;
+    fragColor = inColor;
     // World-space Euclidean camera distance - a simplified stand-in for
     // rd-vanilla's real fog (tr_shade_calc.cpp RB_CalcFogTexCoords, a
     // dot-product "depth along the fog plane's normal" measure fed through
