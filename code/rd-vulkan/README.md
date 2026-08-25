@@ -1384,6 +1384,28 @@ nine of the "simple generated" types (`RT_SPRITE` through `RT_CLOUDS`), and
 a real no-op for `RT_PORTALSURFACE` (matching rd-vanilla's own real
 behavior for it, not a gap - see `R_AddEntitySurfaces`, `tr_main.cpp`).
 
+**The stale-build-artifact mixup (item 1 above) recurred once, months
+later, in the local fog/ranged fog work - still worth automating, not just
+noting.** Deleting the one stale copy fixed that specific instance, but
+didn't remove the actual hazard: two paths that both look like plausible
+build output (`build-vulkan/rd-vulkan_x86_64.so` at the build root, vs.
+`build-vulkan/code/rd-vulkan/rd-vulkan_x86_64.so`, CMake's real default for
+a target defined in a subdirectory) will keep coexisting for as long as
+anything - an old manual `cp`, an editor's "copy path" action, muscle
+memory from a different project's layout - ever puts a file at the wrong
+one, and nothing about the directory structure itself prevents that. It
+happened again: a top-level copy reappeared, and a whole session's worth of
+"before"/"after" fog-fix comparisons silently diffed that one stale file
+against itself (a suspicious pixel-perfect 0.0% match across every scene,
+including ones the fix should have changed, was the tell) before being
+caught and re-run correctly. Structurally fixed now, not just re-deleted
+again: `tests/render-regression/CMakeLists.txt`'s staging target copies
+every binary via CMake's own `$<TARGET_FILE:...>` generator expression -
+"wherever this target's build actually produced its output," resolved by
+CMake itself, not typed by a person - so this specific class of mistake
+can't recur a third time. See `tests/render-regression/README.md`'s
+"Recommended: CMake targets" section.
+
 ## Character animation investigation: eight real bugs, and a wrong
 conclusion corrected
 
@@ -2876,7 +2898,33 @@ Requires the Vulkan SDK (loader + headers) and `glslangValidator` (part of
 either dependency is missing, the CMake configure step disables this target
 with a warning rather than failing the whole build.
 
+**Use the Ninja generator** (`cmake -G Ninja ...`) rather than the default
+Unix Makefiles - this is a fast-moving renderer under active, incremental
+development (one-file touch-and-rebuild several times an hour during a real
+investigation), and Ninja's dependency tracking is both faster per-build
+and more reliable under it: a Unix-Makefiles build directory in this same
+project was observed reporting a target as already up to date (`[100%]
+Built target ...`) immediately after that target's own output file had been
+deleted out from under it - a real, reproducible false-negative, not a
+one-off fluke - which is exactly the kind of silent staleness this section
+and "Testing headlessly" below already warn about from a different angle
+(a stale binary quietly surviving a rebuild). Reconfigure an existing
+Makefiles build directory fresh (CMake can't switch an existing one's
+generator in place - delete it and re-run `cmake -G Ninja` with the same
+`-D` options) rather than trying to convert it.
+
 ## Testing headlessly
+
+**Prefer the CMake targets** (`ninja render_regression_vulkan` et al.) - see
+`tests/render-regression/README.md`'s "Recommended: CMake targets" section.
+They wrap exactly the manual invocation below, but name every binary they
+stage via CMake's own build-output mechanism rather than a hand-typed path
+- see this file's "A capture-harness bug that invalidated a run of
+'verified' claims" section (item 1, the stale-build-artifact one, and its
+"recurred once" follow-up paragraph at the end of that same section) for
+the exact mixup that motivated automating this, and why a one-off manual
+fix for it wasn't enough. The manual invocation remains useful for a
+one-off command, a custom scene, or debugging the harness itself.
 
 Mesa's `lavapipe` software Vulkan driver (package `mesa-vulkan-drivers`) is
 the Vulkan equivalent of `llvmpipe` for OpenGL, and works the same way for

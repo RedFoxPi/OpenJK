@@ -390,6 +390,13 @@ endif()
 
 add_subdirectory(${MPDir})
 
+# Real CMake targets for the headless render-regression capture/diff harness
+# (tests/render-regression/README.md) - independent of BuildTests/Boost
+# below, and must come after ${SPDir} above since it looks up the SP
+# engine/renderer/gamecode targets that subdirectory defines. See that
+# subdirectory's own CMakeLists.txt for what this adds and why.
+add_subdirectory("tests/render-regression")
+
 if(BuildSymbolServer)
 	add_subdirectory("tools/WinSymbol")
 endif()

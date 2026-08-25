@@ -12,7 +12,69 @@ needs Xvfb + the `x11` SDL driver + Mesa's `lavapipe` software Vulkan driver
 instead - see `code/rd-vulkan/README.md`'s "Testing headlessly" section for
 the exact invocation.
 
-## Requirements
+## Recommended: CMake targets
+
+Configuring, building, and manually copying the right `.so`s into the right
+`fs_basepath` directory before running `capture.py` by hand is exactly the
+kind of multi-step manual process that's easy to get subtly wrong once and
+not notice - see `code/rd-vulkan/README.md`'s "A capture-harness bug that
+invalidated a run of 'verified' claims" section for a real incident where a
+hand-typed path to a renderer `.so` silently kept resolving to a stale
+leftover build from an earlier point in the project, invalidating an entire
+session's worth of "verified" screenshots before the mixup was caught. The
+targets below exist to make that specific mistake structurally impossible:
+every binary they stage is named via CMake's own "wherever this target's
+build actually produced its output" mechanism, never a hand-typed path.
+
+```sh
+# Once, or whenever your game install moves:
+cmake -B build -DRenderRegressionBasepath=/path/to/gamedata ...
+
+# Any time after that:
+ninja -C build render_regression_vulkan   # rd-vulkan only
+ninja -C build render_regression_vanilla  # rdsp-vanilla only
+ninja -C build render_regression_diff     # both, then diff.py between them
+ninja -C build render_regression          # alias for render_regression_diff
+```
+
+`RenderRegressionBasepath` can also be overridden per-invocation, with no
+reconfigure, via the `RENDER_REGRESSION_BASEPATH` environment variable
+(checked first) - useful for CI or for switching between game installs
+without touching the CMake cache. These targets always run - they're not
+part of the default `ninja`/`make` build (no dependency from `all`) and
+CMake has no way to know if game/screenshot content changed since the last
+run, so treat them like a test suite you invoke on demand, not a build
+artifact that's cached.
+
+Output lands under `<build dir>/render-regression/`: `JediAcademy/` (the
+staged binaries), `home-<renderer>/` (fresh every run - see
+`run_capture.sh`'s own comment on why), `screenshots-<renderer>/`, and
+`diff/` (from `render_regression_diff`). None of it is committed - the
+whole `<build dir>` is gitignored already.
+
+Only exercises the **SP** scenes in `scenes.json` (filtered via
+`--filter sp_`) - these targets only stage the SP engine/gamecode/renderer
+binaries (`BuildSPEngine`/`BuildSPGame`/`BuildSPRdVanilla`/
+`BuildSPRdVulkan`). For MP scene coverage, build the MP targets
+(`BuildMPEngine` etc.) and invoke `capture.py` directly as described below.
+
+`render_regression_diff`'s underlying `diff.py` exits non-zero whenever it
+finds so much as one `MINOR_DIFF`/`MAJOR_DIFF` scene, not just on a real
+script error - so `ninja`/`make` will report that target (and the
+`render_regression` alias) as failed any time the two renderers'
+output differs meaningfully, which is still the expected, documented
+baseline at this stage of `rd-vulkan`'s development (see
+`code/rd-vulkan/README.md`). Read the actual per-scene summary this target
+prints, and the `.diff.png` images it writes, rather than treating a bare
+"FAILED" as a regression signal by itself.
+
+## Manual usage (what the targets above do under the hood)
+
+Useful directly for a one-off invocation, a scene subset, or a renderer/
+engine combination the CMake targets above don't cover (MP scenes, ASan
+builds, ...).
+
+### Requirements
 
 - A build of the engine (`openjk_sp.x86_64`/`openjk.x86_64` plus their
   renderer and game `.so`s, e.g. via `make install`).
@@ -24,7 +86,7 @@ the exact invocation.
 repository.** Point `--basepath`/`--homepath`/`--out` somewhere outside
 the working tree.
 
-## Usage
+### Usage
 
 ```sh
 python3 capture.py \
@@ -59,7 +121,7 @@ environment. The script scans each scene's log for sanitizer report
 markers and flags it as `SANITIZER` in the summary even if the process
 otherwise exited cleanly.
 
-## Known gotcha
+### Known gotcha
 
 `make install` places the game/renderer `.so`s in `<prefix>/OpenJK/`
 alongside the executables, but the engine's mod search path looks for
@@ -162,7 +224,7 @@ other (down from the ~3.4 second gap) at the same command. `wait_frames`
 is still fine, and preferred, for a scene with no `map` (nothing to load,
 so nothing for this to apply to).
 
-## Comparing two renderers (`diff.py`)
+### Comparing two renderers (`diff.py`)
 
 Run `capture.py` twice - once per renderer, into separate `--out`
 directories, each with the matching `--renderer` - then compare:
