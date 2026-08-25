@@ -12,7 +12,10 @@ layout(push_constant) uniform PushConstants {
     mat4 mvp;
     vec4 camPos;
     vec4 fogColor; // rgb = fog colour, a = opaque distance (0 = no fog)
-    vec4 fogStart; // x = distance before which no fog applies (see below)
+    // x = distance before which no fog applies (see below); yz = tcMod
+    // scroll UV offset, already applied to fragUV in world.vert - not read
+    // here
+    vec4 fogStart;
 } pc;
 
 void main() {

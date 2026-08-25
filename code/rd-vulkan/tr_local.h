@@ -206,7 +206,14 @@ struct PolyVertex
 // global one AND "ranged fog" is active (VK_SetRangedFog/a worldspawn
 // `linFogStart` key - see tr_world.cpp's own comment on s_rangedFog for
 // what that's for and why it's unverified against this renderer's own test
-// maps). fogStart[1..3] are unused padding. camPos[3] similarly doubles as
+// maps). fogStart[1]/fogStart[2] double again as this batch's tcMod scroll
+// UV offset (world.vert adds them directly to the diffuse UV) - already-
+// computed CPU-side as `scrollSpeed * currentTimeSeconds` (see
+// RE_RenderScene), not the raw per-second speed itself, so world.vert never
+// needs the current time as its own separate uniform. 0,0 for the common
+// case (no `tcMod scroll` on this batch's shader - see
+// VK_GetShaderTcModScroll, tr_shader.cpp). fogStart[3] is unused padding.
+// camPos[3] similarly doubles as
 // a per-draw overbright factor (world.frag's comment): 2.0 for real BSP
 // lightmapped world/sky geometry (baked assuming this doubling - Quake3's
 // "overbright bits"), 1.0 for Ghoul2 draws (tr_model.cpp), which are paired
@@ -529,12 +536,17 @@ bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex );
 // tr_shader.cpp
 //
 // Minimal .shader script support: just enough to recover the blend mode a
-// shader's first stage wants, so RE_StretchPic (tr_cmds.cpp) can pick the
-// matching VkPipeline. Does NOT implement multi-stage compositing, tcMod
-// animation, rgbGen, sky/fog, or anything beyond that - see README.md.
+// shader's first stage wants (so RE_StretchPic, tr_cmds.cpp, can pick the
+// matching VkPipeline), its fogparms (world fog volumes), and its first
+// stage's tcMod scroll (world-geometry scrolling textures) - see
+// README.md. Does NOT implement multi-stage compositing, any other tcMod
+// type, rgbGen/alphaGen waves, sky, or anything beyond that.
 void VK_LoadShaderScripts( void );
 vkBlendMode_t VK_GetShaderBlendMode( const char *name );
 bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist );
+// See this function's own comment (tr_shader.cpp) for what's actually
+// supported (just `scroll`) and the real test case that motivated it.
+bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed );
 // First stage's `map`/`clampmap` file path, or nullptr - see this
 // function's own comment (tr_shader.cpp) for why RE_LoadWorldMap
 // (tr_world.cpp) needs this as a fallback when a shader's own name isn't

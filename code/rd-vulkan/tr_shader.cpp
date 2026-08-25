@@ -41,6 +41,17 @@ struct vkShaderFogParms_t
 };
 static std::unordered_map<std::string, vkShaderFogParms_t> s_shaderFogParms;
 
+// First stage's `tcMod scroll <sSpeed> <tSpeed>`, keyed by shader name - see
+// VK_GetShaderTcModScroll's own comment for what this drives. Every other
+// tcMod type (`rotate`/`scale`/`stretch`/`turb`/`transform`/
+// `entityTranslate`) and every rgbGen/alphaGen wave are still unread - see
+// rd-vulkan/README.md.
+struct vkShaderTcModScroll_t
+{
+	float sSpeed, tSpeed;
+};
+static std::unordered_map<std::string, vkShaderTcModScroll_t> s_shaderTcModScroll;
+
 // First stage's `map <path>` argument, keyed by shader name - see
 // VK_GetShaderMapImage's comment for why this exists: a shader's own name is
 // NOT reliably the same path as its actual base texture (e.g. hoth2's
@@ -105,6 +116,8 @@ static void ParseShaderFile( const char *text )
 		vkBlendMode_t blendMode = BLEND_OPAQUE;
 		bool haveFogParms = false;
 		vkShaderFogParms_t fogParms = {};
+		bool haveTcModScroll = false;
+		vkShaderTcModScroll_t tcModScroll = {};
 		std::string mapImage;
 
 		while ( depth > 0 )
@@ -175,6 +188,30 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
+			// tcMod is a per-stage keyword with a type-specific argument
+			// count (`scroll <s> <t>`, `rotate <deg/sec>`, `stretch <func>
+			// <base> <amp> <phase> <freq>`, ...) - only `scroll`'s own two
+			// numeric arguments are understood and recorded here (see
+			// VK_GetShaderTcModScroll's comment for why just this one).
+			// Every other tcMod type's numeric arguments are deliberately
+			// left unconsumed after their type keyword is read - they fall
+			// through to the bottom of this loop as ordinary unmatched
+			// tokens and are silently skipped, exactly like any other
+			// unrecognized keyword already is (blendFunc/map's own
+			// specific handling works the same way: anything not
+			// specifically intercepted is just ignored, not an error).
+			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "tcMod" ) )
+			{
+				std::string modType = COM_ParseExt( &p, qfalse );
+				if ( !Q_stricmp( modType.c_str(), "scroll" ) )
+				{
+					tcModScroll.sSpeed = (float)atof( COM_ParseExt( &p, qfalse ) );
+					tcModScroll.tSpeed = (float)atof( COM_ParseExt( &p, qfalse ) );
+					haveTcModScroll = true;
+				}
+				continue;
+			}
+
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "blendFunc" ) )
 			{
 				// COM_ParseExt returns a pointer into its own single static
@@ -234,6 +271,10 @@ static void ParseShaderFile( const char *text )
 		if ( !mapImage.empty() && s_shaderMapImage.find( name ) == s_shaderMapImage.end() )
 		{
 			s_shaderMapImage[name] = mapImage;
+		}
+		if ( haveTcModScroll && s_shaderTcModScroll.find( name ) == s_shaderTcModScroll.end() )
+		{
+			s_shaderTcModScroll[name] = tcModScroll;
 		}
 	}
 
@@ -338,6 +379,28 @@ bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist )
 	color[1] = it->second.color[1];
 	color[2] = it->second.color[2];
 	*opaqueDist = it->second.opaqueDist;
+	return true;
+}
+
+// Looks up a shader's first stage's `tcMod scroll <sSpeed> <tSpeed>` (units
+// per second, added directly to the diffuse UV - see RE_LoadWorldMap/
+// RE_RenderScene, tr_world.cpp, the only caller). Returns false (speeds
+// left untouched) if the shader wasn't found or its first stage never
+// declared a scroll - the common case, and the caller's default (no
+// scroll) is exactly correct for it. Real, visible test case: vjun1's
+// `textures/impdetention/deathcon1a` (a containment-field texture, 51 real
+// world surfaces), confirmed by direct BSP/.shader parsing, not assumed.
+bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderTcModScroll.find( VK_StripShaderNameExtension( name ) );
+	if ( it == s_shaderTcModScroll.end() )
+	{
+		return false;
+	}
+	*sSpeed = it->second.sSpeed;
+	*tSpeed = it->second.tSpeed;
 	return true;
 }
 

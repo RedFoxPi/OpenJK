@@ -93,6 +93,16 @@ struct WorldSurfaceBatch
 	// to literally every surface regardless of what it was actually
 	// compiled to be in.
 	int fogIndex;
+	// This surface's shader's first-stage `tcMod scroll` speed (UV units per
+	// second), or 0,0 for the common no-scroll case - see
+	// VK_GetShaderTcModScroll's comment (tr_shader.cpp) for the real test
+	// case (vjun1's `textures/impdetention/deathcon1a` containment field,
+	// 51 surfaces) that motivated this. RE_RenderScene multiplies this by
+	// the current simulated time to get the actual per-frame UV offset -
+	// storing the raw speed here, not a precomputed offset, is what lets
+	// batches sharing the same speed still share one push-constant update
+	// per frame (same pattern as vertexLit/fogIndex above).
+	float scrollS, scrollT;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -451,10 +461,10 @@ static void VK_LoadSky( const char *baseName )
 		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 2 ); cpuIndexes.push_back( vertBase + 3 );
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, faces[axis], s_whiteLightmap );
-		// vertexLit/fogIndex are meaningless here - the sky draw loop uses its
-		// own dedicated push constants (camPos.w=1.0, fogColor.a=0), never
-		// s_worldSurfaces' per-batch values.
-		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 }, false, -1 } );
+		// vertexLit/fogIndex/scroll are meaningless here - the sky draw loop
+		// uses its own dedicated push constants (camPos.w=1.0, fogColor.a=0,
+		// no scroll), never s_worldSurfaces' per-batch values.
+		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 }, false, -1, 0.0f, 0.0f } );
 	}
 
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
@@ -896,6 +906,12 @@ void RE_LoadWorldMap( const char *name )
 			fogIndex = surf.fogNum;
 		}
 
+		// See WorldSurfaceBatch::scrollS/scrollT's comment - 0,0 (no lookup
+		// hit) is exactly correct for the vast majority of shaders that
+		// never declare a tcMod scroll at all.
+		float scrollS = 0.0f, scrollT = 0.0f;
+		VK_GetShaderTcModScroll( shaders[surf.shaderNum].shader, &scrollS, &scrollT );
+
 		uint32_t firstIndex = (uint32_t)cpuIndexes.size();
 		// AABB from the generated/surface vertex range, for view-frustum
 		// culling in RE_RenderScene - cheap to compute once here vs.
@@ -958,7 +974,8 @@ void RE_LoadWorldMap( const char *name )
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
-			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex } );
+			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
+			scrollS, scrollT } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1256,13 +1273,19 @@ void RE_RenderScene( const refdef_t *fd )
 
 	// worldPush.camPos[3] (overbright factor) already holds the common case
 	// (2.0, real baked lightmaps) from the push issued above this loop, and
-	// fogColor/fogStart already hold "no fog" (all zero) - only re-issue the
-	// push when a batch's vertexLit or fogIndex actually differs from the
-	// last one drawn, rather than unconditionally per-batch. See
-	// WorldSurfaceBatch::vertexLit/fogIndex's own comments for why they
-	// can't just share one fixed value across the whole draw.
+	// fogColor/fogStart already hold "no fog"/"no scroll" (all zero) - only
+	// re-issue the push when a batch's vertexLit/fogIndex/scroll speed
+	// actually differs from the last one drawn, rather than unconditionally
+	// per-batch. See WorldSurfaceBatch::vertexLit/fogIndex/scrollS's own
+	// comments for why they can't just share one fixed value across the
+	// whole draw. fd->time (ms) drives the scroll offset - see
+	// vkWorldPushConstants_t's own comment (tr_local.h) for why that
+	// multiply happens here, once per distinct scroll speed, rather than in
+	// world.vert every vertex.
 	bool currentPushIsVertexLit = false;
 	int currentFogIndex = -1;
+	float currentScrollS = 0.0f, currentScrollT = 0.0f;
+	float timeSeconds = (float)fd->time / 1000.0f;
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
 		if ( VK_AABBOutsideFrustum( batch.mins, batch.maxs, frustumPlanes ) )
@@ -1270,10 +1293,13 @@ void RE_RenderScene( const refdef_t *fd )
 			culledCount++;
 			continue;
 		}
-		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex )
+		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex ||
+			batch.scrollS != currentScrollS || batch.scrollT != currentScrollT )
 		{
 			currentPushIsVertexLit = batch.vertexLit;
 			currentFogIndex = batch.fogIndex;
+			currentScrollS = batch.scrollS;
+			currentScrollT = batch.scrollT;
 			worldPush.camPos[3] = currentPushIsVertexLit ? 1.0f : 2.0f;
 			if ( currentFogIndex >= 0 )
 			{
@@ -1289,6 +1315,8 @@ void RE_RenderScene( const refdef_t *fd )
 				worldPush.fogColor[0] = worldPush.fogColor[1] = worldPush.fogColor[2] = worldPush.fogColor[3] = 0.0f;
 				worldPush.fogStart[0] = 0.0f;
 			}
+			worldPush.fogStart[1] = currentScrollS * timeSeconds;
+			worldPush.fogStart[2] = currentScrollT * timeSeconds;
 			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				0, sizeof( worldPush ), &worldPush );
 		}

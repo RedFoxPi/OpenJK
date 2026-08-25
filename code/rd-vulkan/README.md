@@ -2642,7 +2642,77 @@ and none of this renderer's static spawn-point screenshots would exercise
 a live `RE_SetRangedFog` call either - same honesty-over-false-confidence
 standard as `spacedust`/`sand` above.
 
-## What's actually implemented
+## World-geometry tcMod scroll
+
+The first small step into real `.shader` script animation, picked because
+it's directly visible and independently testable against real map data,
+unlike some of this file's other recent additions. Extends `tr_shader.cpp`'s
+minimal parser to record a defined shader's first stage's
+`tcMod scroll <sSpeed> <tSpeed>` (UV units per second) - the single most
+common `tcMod` type in these game's real shaders - alongside its existing
+`map`/`blendFunc`/`fogparms` tracking. Every other `tcMod` type
+(`rotate`/`scale`/`stretch`/`turb`/`transform`/`entityTranslate`) is still
+unread: its numeric arguments fall through to the parser's existing
+"unrecognized token, skip it" path once its own type keyword is consumed,
+the same way any other not-specifically-handled keyword already is - not a
+half-implementation, a deliberately narrow one.
+
+**Confirmed against real map data before writing any code**, not
+implemented speculatively and hoped-for: parsed all four test maps'
+`LUMP_SHADERS`/`LUMP_SURFACES` and every one of this game's 68
+`shaders/*.shader` files (3365 shader blocks) directly to find real,
+currently-opaque, currently-drawn world surfaces whose shader's first
+stage has a real `tcMod scroll`. Five genuine matches, all confirmed by
+this renderer's own load-time behaviour (a temporary per-surface print,
+removed before committing, counted exactly these surfaces on each map -
+not just found by grepping - before the print was removed):
+
+| Map | Shader | scroll s,t | Surfaces |
+|---|---|---|---|
+| vjun1 | `textures/impdetention/deathcon1a` | 0, 0.1 | **51** |
+| academy1 | `textures/kejim/stars_scroll` | 0, 0.0195 | 2 |
+| academy1 | `models/map_objects/cinematics/imp_wall` | -0.3, 0 | 1 |
+| yavin1 | `models/map_objects/danger/ship_item04` | 0, 1 | 3 |
+| hoth2 | `textures/hoth/ion_feedtube` | 0, 1 | 1 |
+
+vjun1's `deathcon1a` (an Imperial-detention-level containment-field
+texture) is by far the largest real case - 51 surfaces, not one or two
+incidental ones.
+
+**Implementation**: `WorldSurfaceBatch` gained `scrollS`/`scrollT` (the raw
+per-second speed, looked up once at load time via the new
+`VK_GetShaderTcModScroll`, tr_shader.cpp) - 0,0 for the overwhelming
+majority of shaders that never declare one. `RE_RenderScene`'s draw loop
+folds this into the same per-batch push-constant-switch pattern already
+used for `vertexLit`/`fogIndex` (see "hoth2's overexposed terrain" and
+"Local fog volumes" above): storing the raw speed rather than a
+precomputed offset means every batch sharing the same scroll speed at a
+given moment still shares one push, not one per batch. The actual offset
+(`speed × current simulated seconds`) is computed once per distinct speed
+value per frame and packed into the existing `fogStart` push-constant
+field's otherwise-unused `.y`/`.z` components (see `vkWorldPushConstants_t`'s
+comment, `tr_local.h`) rather than growing the push constant struct further
+- still comfortably under Vulkan's guaranteed minimum 128-byte size.
+`world.vert` adds it directly to the diffuse UV (never the lightmap UV,
+which is baked per-vertex at compile time and never scrolls in real
+Quake3 either) before rasterization; `vk.worldSampler`'s existing
+`VK_SAMPLER_ADDRESS_MODE_REPEAT` wrap mode (already there for ordinary
+texture tiling) makes an ever-growing UV offset wrap correctly with no
+extra handling needed.
+
+**Verified**: full SP scene suite (menu/academy1/hoth2/yavin1/vjun1) clean,
+no crashes, full rebuild warning-free. The temporary per-surface print
+confirmed exact matches against the table above on every map (51 on
+vjun1, 1 on hoth2, 3+1 on yavin1, 1+2 on academy1) before being removed.
+**Not independently seen in motion on screen**: none of the five real
+matches happen to be in view from any of the four test maps' spawn-point
+camera framings (vjun1's spawn is the ship's cockpit interior, nowhere
+near the detention level's containment field; the others are similarly
+out of frame) - same "verified via data and code review, not by eye"
+standard already applied to local fog's colour and ranged fog above, for
+the same reason: a fixed spawn-point screenshot can't be expected to
+happen to frame every real map feature, and that's not a reason to skip
+implementing or documenting one honestly.
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
   pass, framebuffers, per-frame command buffers and sync objects.
@@ -2807,9 +2877,11 @@ standard as `spacedust`/`sand` above.
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
 - Full `.shader` script parsing: only a defined shader's first stage's
-  `map`/`blendFunc`, and (for fog shaders specifically, see "3D world
+  `map`/`blendFunc`/`tcMod scroll` (see "World-geometry tcMod scroll" below
+  for that last one), and (for fog shaders specifically, see "3D world
   geometry" above) a top-level `fogparms` line, are read - later stages,
-  `tcMod` animation, `rgbGen`/`alphaGen` waves, and `skyparms` are still
+  every other `tcMod` type (`rotate`/`scale`/`stretch`/`turb`/`transform`/
+  `entityTranslate`), `rgbGen`/`alphaGen` waves, and `skyparms` are still
   ignored. World geometry doesn't even get the 2D path's blend-mode
   selection yet (see above) - everything is one opaque pipeline.
 - Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, dissolves,
