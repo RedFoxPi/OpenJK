@@ -222,8 +222,11 @@ frames:
   runs/screenshots with no crash; a full clean rebuild is warning-free.
   `RE_SetRangedFog`/`R_SetTempGlobalFogColor` (the *dynamic* fog API, used
   for scripted fog changes mid-level, e.g. weather-effect entities in
-  `g_fx.cpp`) are still no-ops - only the BSP's static, load-time global
-  fog is implemented here.
+  `g_fx.cpp`) were still no-ops at the time of this fix - only the BSP's
+  static, load-time global fog was implemented here.
+  (`R_SetTempGlobalFogColor` is real now - see "World weather/particle
+  effects" below; `RE_SetRangedFog`, a separate ranged/distance-scaling API
+  used by other callers, is still a stub.)
 - A pixel diff against an `rd-vanilla` reference (same map, same camera, no
   special cvars now that lighting is real) is still a **`MAJOR_DIFF`, ~40%
   mean pixel difference**, and that's expected, not a regression to chase
@@ -2381,7 +2384,8 @@ Quake3-derived engines) compositing over the sky and world alike - a whole
 particle subsystem this renderer has never implemented (see "What's not
 implemented yet" below), not something this pass's overbright/lightmap fix
 could plausibly touch. Confirmed as a distinct, already-scoped-out gap
-rather than investigated as a new bug.
+rather than investigated as a new bug. (Since fixed - see "World
+weather/particle effects" below.)
 
 **Verified**: `sp_hoth2_spawn`'s terrain now shows real texture
 detail - visible surface variation, no longer a flat white wash - closely
@@ -2389,6 +2393,134 @@ matching `rd-vanilla`'s snow-coloured ground for the same shot. Full SP
 scene suite (menu/academy1/hoth2/yavin1/vjun1) re-verified clean on both
 renderers, including vjun1 and academy1 (both exercise the same world
 overbright push-constant path this fix touches) to confirm no regression.
+
+## World weather/particle effects (rain, snow, wind, blowing fog/sand/dust)
+
+Following directly from the previous section's flat-sky/no-particles finding
+(hoth2's blizzard haze coming from real Quake3's `fx_weather` system, not
+its skybox), this pass ports that whole subsystem: rd-vanilla's real
+`tr_WorldEffects.cpp`/`tr_WorldEffects.h` (2188/65 lines) - `COutside`
+(inside/outside testing), `CWindZone` (gust/target-velocity wind), and
+`CParticleCloud` (the actual billboard particle sim + rendering), all
+driven by `R_WorldEffectCommand`'s preset table. New file:
+`tr_weather.cpp`, ~1100 lines.
+
+**Confirmed real, unmodified call path from map to screen**, not a new
+mechanism invented for this renderer: `g_fx.cpp`'s `SP_CreateSnow`/
+`SP_CreateWind`/`SP_CreateRain` (triggered by `fx_snow`/`fx_wind`/`fx_rain`
+map entities) push a preset string into a configstring
+(`G_FindConfigstringIndex(cmd, CS_WORLD_FX, ...)`); `cgame`'s
+`CG_ConfigStringModified` relays it via `cgi_R_WorldEffectCommand` into
+`re.WorldEffectCommand`, which this renderer's `R_WorldEffectCommand`
+(tr_init.cpp) now forwards to `VK_WorldEffectCommand` instead of doing
+nothing. Confirmed via direct BSP entity-lump parsing which of the four
+test maps actually carry these entities: hoth2 has `fx_wind`
+(speed 3000, angle 180, spawnflags 6) and `fx_snow` (no flags -> "snow" +
+"fog"); vjun1 has `fx_rain` (spawnflags 8 -> "acidrain"); academy1 and
+yavin1 have neither (only an unrelated `fx_runner` on yavin1) - so those
+two are the built-in "must show nothing" regression cases for this feature.
+
+**Call sites, matching rd-vanilla's real ones exactly** (checked by grep,
+not assumed): `R_InitWorldEffects`/`R_ShutdownWorldEffects` run once at
+renderer startup/shutdown (`R_Init`/`VK_Shutdown`), not per map load -
+weather state persists across a map change unless a `"clear"` command says
+otherwise, same as real Quake3. `RE_RenderWorldEffects` is called from
+exactly one place in rd-vanilla, the very end of `RE_RenderScene`
+(tr_scene.cpp:414) - mirrored here by calling the new `VK_DrawWeatherEffects`
+right after `VK_DrawScenePolys` inside this renderer's own `RE_RenderScene`.
+
+**Rendering** reuses this renderer's existing 2D-polygon machinery wholesale
+- same `PolyVertex{pos,uv,color}` layout, same already-compiled
+`vk.polyPipeline`/`polyPipelineAdditive`/`polyPipelineLayout` (depth-test-on,
+depth-write-off; additive = `ONE,ONE` blend factors) - rather than standing
+up a whole parallel pipeline for what is, at the vertex level, the same
+kind of camera-facing textured quad. The one addition is a *separate*
+`vk.weatherVertexBuffer`/`weatherVertexBufferMapped` scratch buffer
+(`tr_local.h`), so this system's per-frame vertex writes can never collide
+with `VK_DrawScenePolys`'s own write cursor into its own buffer. Billboards
+are built from `fd->viewaxis[1]`/`[2]` (left/up), optionally 2D-rotated (the
+tumbling-snow look) or replaced with a velocity-aligned axis for streaked
+rain, exactly following `CParticleCloud::Render`'s real vertex math.
+
+**Three deliberate simplifications**, each with a real reason, not
+laziness:
+- **No cached inside/outside grid.** Real `COutside` builds a per-map
+  32-unit-cell grid, cached to disk, so a frame's worth of particles can be
+  outside-tested without touching the collision system live. This port
+  just calls `ri.CM_PointContents` directly per particle per frame -
+  always exactly correct, just without the caching optimization. At the
+  particle counts the real presets actually use (hundreds to low
+  thousands - see `MAX_WEATHER_PARTICLES_PER_CLOUD`'s comment,
+  `tr_local.h`) this hasn't been a measured cost on any test scene; the
+  cache is the thing to add back if that ever changes, not a reason to
+  guess instead of query.
+- **`CONTENTS_INSIDE` vs `CONTENTS_OUTSIDE` convention, found and fixed by
+  checking real map data, not by assumption.** Real `COutside::Cache`
+  doesn't just test one fixed content bit - it scans the whole map first
+  to see whether *this* map marks its (smaller) outdoor pockets as
+  `CONTENTS_OUTSIDE` against an implicit indoor default, or marks its
+  (smaller) indoor pockets as `CONTENTS_INSIDE` against an implicit
+  outdoor default, and uses whichever convention it finds evidence of
+  first. The first implementation here guessed the first convention
+  (`contents & CONTENTS_OUTSIDE`) and it was wrong: parsed
+  `LUMP_BRUSHES`/`LUMP_SHADERS` content flags directly for all four test
+  maps - academy1 (0 `CONTENTS_OUTSIDE`, 0 `CONTENTS_INSIDE` brushes),
+  yavin1 (0, 0), hoth2 (0, 16), vjun1 (0, 90). `CONTENTS_OUTSIDE` never
+  appears in any of them; every map that uses either flag at all uses only
+  `CONTENTS_INSIDE`, to mark a handful of interior volumes against an
+  otherwise-outdoor map. With the original guess, `VK_WPointOutside` was
+  permanently `false` everywhere on every test map, so every particle
+  cloud populated (commands parsed fine, particle arrays allocated fine)
+  but zero particles ever reached the `rendering` state - confirmed via
+  temporary instrumentation showing 1000 snow + 60 fog particles created
+  on hoth2, 0 ever visible. Fixed by testing
+  `(contents & CONTENTS_INSIDE) == 0` (after excluding water/solid)
+  instead - i.e. "outside" means "not solid/underwater and not inside an
+  explicitly `CONTENTS_INSIDE`-flagged volume", matching what this
+  checkout's real map data actually does. Rebuilt and reverified: hoth2's
+  particle counts went from 0 rendering to ~289-314 (snow)/~23-27 (fog)
+  per frame, with visible falling snow matching vanilla's look.
+- **Wind-zone timing uses real elapsed milliseconds, not frame-tick
+  counts.** Real `CWindZone::Update` decrements a countdown and ramps
+  velocity by fixed per-*call* amounts, implicitly framerate-dependent
+  since it's called once per rendered frame in the original engine. This
+  port measures both in real elapsed ms/seconds instead - a
+  framerate-independent equivalent of the same behaviour (gusts still
+  retarget roughly every 1-4 real seconds, velocity ramps still smooth out
+  over the same real time), not a different-looking result.
+
+Every preset's exact tuning constants (particle counts, texture paths,
+gravity, width/height, blend mode, colour/alpha, fade rate, mass range) for
+`lightrain`/`rain`/`acidrain`/`heavyrain`/`snow`/`spacedust`/`sand`/`fog`/
+`heavyrainfog`/`light_fog`/`wind`/`constantwind`/`gustingwind`/`windzone`
+are copied verbatim from rd-vanilla's real `R_WorldEffectCommand` - these
+are gameplay/visual tuning values, not something to approximate.
+`WE_SetTempGlobalFogColor` (`g_fx.cpp`'s `fx_fog` entity, used for
+on/off fog transitions independent of the weather clouds themselves) is
+also wired to a real implementation now, not a stub - see "World fog is
+now rendered" above for the base static fog this saves/restores around.
+
+**Verified**: full SP scene suite (menu/academy1/hoth2/yavin1/vjun1)
+re-ran clean on rd-vulkan with no crashes. hoth2 (`fx_wind`+`fx_snow`)
+shows falling snow closely matching vanilla's look. vjun1 (`fx_rain` ->
+acidrain, spawnflags 8) correctly shows **no** rain particles from inside
+the ship's interior cockpit view - the `CONTENTS_INSIDE` gating working
+as intended, gating the effect off exactly where a real player would
+expect it to, not just everywhere-or-nowhere. academy1 and yavin1 (no
+`fx_snow`/`fx_rain`/`fx_wind` entities) show zero particles and an
+unchanged screenshot, confirming the built-in "must show nothing"
+regression case actually holds.
+
+**Not attempted**: `spacedust`'s and `sand`'s specific look wasn't
+verified against a real map that actually uses them (none of the four test
+maps carry those entities) - only that the presets parse and would behave
+correctly per the ported physics, same trust level as any other
+code-reading-based port in this project. `VK_AddWeatherZone` (the
+`"zone (mins)(maxs)"` command) is a documented no-op: in real rd-vanilla
+its only job is priming `COutside`'s cached disk grid for a given region
+ahead of time, and this port has no such cache to prime - every "is this
+point outside" query already goes straight to the live collision system
+regardless, so there's nothing left for the command to do.
 
 ## What's actually implemented
 
@@ -2522,12 +2654,13 @@ overbright push-constant path this fix touches) to confirm no regression.
   bind-pose-only regardless of what the mesh is doing). See "Ghoul2 is not
   reused from rd-vanilla" below for why the animation system was a separate,
   larger task than the rest of this renderer.
-- Dynamic/scripted fog changes (`RE_SetRangedFog`/`R_SetTempGlobalFogColor`
-  are stubs, used by e.g. weather-effect entities in `g_fx.cpp` for
-  mid-level fog changes) and per-brush *local* fog volumes (a `LUMP_FOGS`
-  entry with a real `brushNum`, bounded to one convex region) - only a
-  map's single static *global* fog (see "3D world geometry" above) is
-  implemented.
+- `RE_SetRangedFog` (a separate ranged/distance-scaling fog API from the
+  weather system's own fog color override - see "World weather/particle
+  effects" below for that one, which *is* implemented) is still a stub.
+  Per-brush *local* fog volumes (a `LUMP_FOGS` entry with a real
+  `brushNum`, bounded to one convex region) are also still unimplemented -
+  only a map's single static *global* fog (see "3D world geometry" above)
+  is.
 - Dynamic lighting for world geometry (`AddLightToScene` is a stub) and
   vertex lighting/colors - only the map's precomputed, baked lightmap
   applies (see "3D world geometry" above). No shadows other than what's
@@ -2556,8 +2689,8 @@ overbright push-constant path this fix touches) to confirm no regression.
   `tcMod` animation, `rgbGen`/`alphaGen` waves, and `skyparms` are still
   ignored. World geometry doesn't even get the 2D path's blend-mode
   selection yet (see above) - everything is one opaque pipeline.
-- Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, weather/world
-  effects, dissolves, model bounds/tag queries.
+- Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, dissolves,
+  model bounds/tag queries.
 - Window resize / swapchain recreation - a resize will currently just log a
   warning and stop rendering rather than crash.
 

@@ -1109,6 +1109,13 @@ void RE_RenderScene( const refdef_t *fd )
 	// (tr_model.cpp).
 	VK_DrawScenePolys( mvp, fd );
 
+	// World weather/particle effects (tr_weather.cpp) - same call-site
+	// convention as rd-vanilla's real RE_RenderWorldEffects (tr_scene.cpp:
+	// called once per rendered scene, right after everything else), so a
+	// portal/mirror's separate scene render gets its own weather draw too,
+	// matching real behavior.
+	VK_DrawWeatherEffects( mvp, fd );
+
 	// Restore the full-screen viewport/scissor for any 2D drawing
 	// (RE_StretchPic) that follows this scene render within the same frame -
 	// it doesn't set its own, it relies on whatever RE_BeginFrame or the
@@ -1117,4 +1124,27 @@ void RE_RenderScene( const refdef_t *fd )
 	VkRect2D fullScissor = { { 0, 0 }, vk.swapchainExtent };
 	vkCmdSetViewport( cmd, 0, 1, &fullViewport );
 	vkCmdSetScissor( cmd, 0, 1, &fullScissor );
+}
+
+// Used only by tr_weather.cpp's VK_SetTempGlobalFogColor - see that
+// function's own comment (tr_local.h) for why weather needs to reach into
+// this file's fog state via accessors instead of touching s_worldFogColor/
+// s_worldFogEnabled directly.
+bool VK_HasWorldFog( void )
+{
+	return s_worldFogEnabled;
+}
+
+void VK_GetWorldFogColor( float outColor[3] )
+{
+	outColor[0] = s_worldFogColor[0];
+	outColor[1] = s_worldFogColor[1];
+	outColor[2] = s_worldFogColor[2];
+}
+
+void VK_SetWorldFogColor( const float color[3] )
+{
+	s_worldFogColor[0] = color[0];
+	s_worldFogColor[1] = color[1];
+	s_worldFogColor[2] = color[2];
 }

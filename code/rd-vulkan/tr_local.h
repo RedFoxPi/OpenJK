@@ -99,6 +99,19 @@ extern cvar_t *r_ghoul2AnimDebug;
 // "polys per frame" count like rd-vanilla's MAX_POLYS/MAX_POLYVERTS
 // (tr_local.h in rd-vanilla), a generous scratch-buffer size instead.
 #define POLY_VERTEX_BUFFER_CAPACITY 16384u
+// Fan-expanded triangle-list vertices per frame across every weather
+// particle actually drawn this frame (tr_weather.cpp) - sized generously
+// against real preset particle counts (rd-vanilla/tr_WorldEffects.cpp: the
+// largest single preset, rain/heavyrain, requests 1000-2000; hoth2's real
+// "snow"+"fog" combo is 1000+60=1060), not a hard per-cloud limit - see
+// MAX_WEATHER_PARTICLES_PER_CLOUD's own comment. 4096 particles' worth
+// (WEATHER_VERTEX_BUFFER_CAPACITY / 6 verts-per-quad).
+#define WEATHER_VERTEX_BUFFER_CAPACITY 24576u
+// Per-cloud particle count cap - real presets top out at 2000 (rain/
+// heavyrain/acidrain); generous headroom above that for any future preset,
+// same spirit as MAX_SCENE_ENTITIES/MAX_SCENE_POLYS elsewhere in this
+// renderer (a sane bound, not a measured hard engine limit).
+#define MAX_WEATHER_PARTICLES_PER_CLOUD 4096
 
 // Blend mode a UI draw needs, taken from the first stage of the image's
 // matching .shader script (see tr_shader.cpp). Vulkan bakes blend factors
@@ -302,6 +315,21 @@ typedef struct
 	VkDeviceMemory polyVertexBufferMemory = VK_NULL_HANDLE;
 	void *polyVertexBufferMapped = nullptr;
 
+	// Weather particles (tr_weather.cpp) - rain/snow/fog/etc world effects.
+	// Same PolyVertex layout and per-frame-scratch-buffer pattern as
+	// vk.polyVertexBuffer above (and deliberately reuses vk.polyPipeline/
+	// vk.polyPipelineAdditive/vk.polyPipelineLayout wholesale rather than
+	// creating dedicated ones - identical vertex format, identical depth-
+	// test-on/depth-write-off/blend-mode shape already covers exactly what
+	// camera-facing particle billboards need), but its own separate buffer
+	// so weather's per-frame write cursor can never collide with
+	// VK_DrawScenePolys' own (RE_AddPolyToScene decals, sprite/oriented-quad
+	// entities, electricity, ...) - two independent systems sharing one
+	// pipeline's compiled state, not one buffer's write cursor.
+	VkBuffer weatherVertexBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory weatherVertexBufferMemory = VK_NULL_HANDLE;
+	void *weatherVertexBufferMapped = nullptr;
+
 	// Shared across tr_cmds.cpp's and tr_world.cpp's draw calls (both bind
 	// pipelines into the same per-frame command buffer) so a pipeline bound
 	// by one never gets silently assumed still-bound by the other. Reset to
@@ -361,6 +389,13 @@ VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diff
 // function's definition in tr_world.cpp for the full explanation of why the
 // argument order is backwards from what the name suggests.
 void VK_MultiplyMatrix( const float *a, const float *b, float *out );
+// Used only by tr_weather.cpp's VK_SetTempGlobalFogColor, to temporarily
+// override (and later restore) the world's real global fog colour without
+// tr_weather.cpp reaching into tr_world.cpp's own file-static fog state
+// directly.
+bool VK_HasWorldFog( void );
+void VK_GetWorldFogColor( float outColor[3] );
+void VK_SetWorldFogColor( const float color[3] );
 
 // tr_model.cpp
 //
@@ -490,6 +525,57 @@ bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist )
 // (tr_world.cpp) needs this as a fallback when a shader's own name isn't
 // directly a texture file.
 const char *VK_GetShaderMapImage( const char *name );
+
+// tr_weather.cpp
+//
+// World weather/particle effects (rain, snow, wind-blown fog/dust/sand) -
+// a fresh, scoped port of rd-vanilla's real tr_WorldEffects.cpp
+// (CParticleCloud/CWindZone/COutside), not a reuse (that file leans on
+// Raven's own Ravl/Ratl container library, not part of this checkout - see
+// README.md's "Ghoul2 is not reused from rd-vanilla" for the same reasoning
+// applied here). Confirmed real motivation: hoth2's blizzard (`fx_snow` +
+// `fx_wind` map entities - g_fx.cpp's SP_CreateSnow/SP_CreateWind - send
+// "snow"/"fog"/"constantwind"/"gustingwind" through exactly these entry
+// points) and vjun1's exterior acid rain (`fx_rain`, spawnflags 8 ->
+// "acidrain") - see README.md's own weather section for what's a faithful
+// port vs a deliberate simplification (there are several: no persistent
+// disk-cached outside/inside grid - every "is this point outside" query is
+// a live ri.CM_PointContents call instead, real per-vertex-lit-surface
+// interaction aside; wind-zone retargeting drives off real elapsed time
+// rather than an assumed-per-frame tick count; no MakeNormalVectors/
+// VectorNormalize reuse from a shared math file since none of this
+// renderer's other code needed them either - small self-contained
+// equivalents live in this file instead).
+void VK_InitWorldEffects( void );
+void VK_ShutdownWorldEffects( void );
+// Parses and applies one weather console/script command - see
+// tr_weather.cpp's own comment on VK_WorldEffectCommand for the full
+// supported command list (mirrors rd-vanilla's R_WorldEffectCommand
+// exactly: clear/freeze/zone/wind/constantwind/gustingwind/windzone/
+// lightrain/rain/acidrain/heavyrain/snow/spacedust/sand/fog/heavyrainfog/
+// light_fog/outsideshake/outsidepain).
+void VK_WorldEffectCommand( const char *command );
+// Accepted and ignored - see this function's own comment (tr_weather.cpp)
+// for why zones (which only matter for rd-vanilla's cached outside/inside
+// grid) are a no-op once every "is this point outside" query is answered
+// live instead.
+void VK_AddWeatherZone( vec3_t mins, vec3_t maxs );
+// Called once per rendered scene from RE_RenderScene (tr_world.cpp), same
+// call site as rd-vanilla's real RE_RenderWorldEffects (tr_scene.cpp) -
+// updates every active particle cloud/wind zone by real elapsed time since
+// the last call, then draws whatever's left rendering after that update.
+void VK_DrawWeatherEffects( const float *mvp, const refdef_t *fd );
+bool VK_GetWindVector( vec3_t windVector, vec3_t atPoint );
+bool VK_GetWindGusting( vec3_t atPoint );
+bool VK_IsOutside( vec3_t pos );
+float VK_IsOutsideCausingPain( vec3_t pos );
+float VK_GetChanceOfSaberFizz( void );
+bool VK_IsShaking( vec3_t pos );
+// Temporarily overrides the world's real global fog colour (tr_world.cpp -
+// e.g. a lightning flash tinting fog red) - color[0..2] all zero restores
+// the original. Returns false (no-op) if this map has no global fog at
+// all, same convention as rd-vanilla's real function.
+bool VK_SetTempGlobalFogColor( vec3_t color );
 
 // tr_image.cpp
 image_t *VK_FindImage( const char *name );

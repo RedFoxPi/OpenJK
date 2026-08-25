@@ -1071,6 +1071,16 @@ static void VK_CreatePolyPipeline( void )
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		&vk.polyVertexBuffer, &vk.polyVertexBufferMemory );
 	vkMapMemory( vk.device, vk.polyVertexBufferMemory, 0, VK_WHOLE_SIZE, 0, &vk.polyVertexBufferMapped );
+
+	// Weather particles (tr_weather.cpp) - own buffer, same PolyVertex
+	// layout, reuses this same pipeline/layout - see vkGlobals_t::
+	// weatherVertexBuffer's comment (tr_local.h) for why it needs its own
+	// buffer despite sharing everything else with polyVertexBuffer above.
+	VK_CreateBuffer( sizeof( PolyVertex ) * WEATHER_VERTEX_BUFFER_CAPACITY,
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&vk.weatherVertexBuffer, &vk.weatherVertexBufferMemory );
+	vkMapMemory( vk.device, vk.weatherVertexBufferMemory, 0, VK_WHOLE_SIZE, 0, &vk.weatherVertexBufferMapped );
 }
 
 // ============================================================================
@@ -1135,6 +1145,10 @@ void R_Init( void )
 
 	R_ImageLoader_Init();
 	R_InitFonts();
+	// Same one-time-at-startup call site as rd-vanilla's real R_Init
+	// (tr_init.cpp) - see VK_InitWorldEffects' own declaration comment
+	// (tr_local.h) for why this isn't tied to map load/unload instead.
+	VK_InitWorldEffects();
 
 	vk.whiteImage = VK_CreateSolidImage( "*white", 255, 255, 255, 255 );
 	vk.images.push_back( vk.whiteImage );
@@ -1174,6 +1188,7 @@ void VK_Shutdown( qboolean destroyWindow )
 	VK_DestroyReadbackImage();
 	VK_ShutdownGhoul2Models();
 	VK_ShutdownWorld();
+	VK_ShutdownWorldEffects();
 
 	if ( vk.worldPipeline ) vkDestroyPipeline( vk.device, vk.worldPipeline, nullptr );
 	if ( vk.skyPipeline ) vkDestroyPipeline( vk.device, vk.skyPipeline, nullptr );
@@ -1190,6 +1205,9 @@ void VK_Shutdown( qboolean destroyWindow )
 	if ( vk.polyVertexBufferMemory ) vkUnmapMemory( vk.device, vk.polyVertexBufferMemory );
 	if ( vk.polyVertexBuffer ) vkDestroyBuffer( vk.device, vk.polyVertexBuffer, nullptr );
 	if ( vk.polyVertexBufferMemory ) vkFreeMemory( vk.device, vk.polyVertexBufferMemory, nullptr );
+	if ( vk.weatherVertexBufferMemory ) vkUnmapMemory( vk.device, vk.weatherVertexBufferMemory );
+	if ( vk.weatherVertexBuffer ) vkDestroyBuffer( vk.device, vk.weatherVertexBuffer, nullptr );
+	if ( vk.weatherVertexBufferMemory ) vkFreeMemory( vk.device, vk.weatherVertexBufferMemory, nullptr );
 
 	if ( vk.depthImageView ) vkDestroyImageView( vk.device, vk.depthImageView, nullptr );
 	if ( vk.depthImage ) vkDestroyImage( vk.device, vk.depthImage, nullptr );
@@ -1407,10 +1425,13 @@ void R_ModelBounds( qhandle_t model, vec3_t mins, vec3_t maxs ) { (void)model; V
 void RE_GetLightStyle( int style, color4ub_t color ) { (void)style; color[0] = color[1] = color[2] = color[3] = 255; }
 void RE_SetLightStyle( int style, int color ) { (void)style; (void)color; }
 void RE_GetBModelVerts( int bmodelIndex, vec3_t *vec, vec3_t normal ) { (void)bmodelIndex; (void)vec; (void)normal; }
-void R_WorldEffectCommand( const char *command ) { (void)command; }
+// Real implementation - tr_weather.cpp. See that file's own header comment
+// and tr_local.h's declarations for the full picture (a scoped port of
+// rd-vanilla's real tr_WorldEffects.cpp).
+void R_WorldEffectCommand( const char *command ) { VK_WorldEffectCommand( command ); }
 void RE_GetModelBounds( refEntity_t *refEnt, vec3_t bounds1, vec3_t bounds2 ) { (void)refEnt; VectorClear( bounds1 ); VectorClear( bounds2 ); }
 void RE_SVModelInit( void ) {}
-void R_InitWorldEffects( void ) {}
+void R_InitWorldEffects( void ) { VK_InitWorldEffects(); }
 void R_ClearStuffToStopGhoul2CrashingThings( void ) {}
 qboolean R_inPVS( vec3_t p1, vec3_t p2 ) { (void)p1; (void)p2; return qtrue; }
 static float s_zero = 0.f;
@@ -1419,14 +1440,14 @@ float *get_tr_distortionAlpha( void ) { return &s_zero; }
 float *get_tr_distortionStretch( void ) { return &s_zero; }
 qboolean *get_tr_distortionPrePost( void ) { return &s_qfalse; }
 qboolean *get_tr_distortionNegate( void ) { return &s_qfalse; }
-bool R_GetWindVector( vec3_t windVector, vec3_t atPoint ) { (void)atPoint; VectorClear( windVector ); return false; }
-bool R_GetWindGusting( vec3_t atpoint ) { (void)atpoint; return false; }
-bool R_IsOutside( vec3_t pos ) { (void)pos; return false; }
-float R_IsOutsideCausingPain( vec3_t pos ) { (void)pos; return 0.f; }
-float R_GetChanceOfSaberFizz( void ) { return 0.f; }
-bool R_IsShaking( vec3_t pos ) { (void)pos; return false; }
-void R_AddWeatherZone( vec3_t mins, vec3_t maxs ) { (void)mins; (void)maxs; }
-bool R_SetTempGlobalFogColor( vec3_t color ) { (void)color; return false; }
+bool R_GetWindVector( vec3_t windVector, vec3_t atPoint ) { return VK_GetWindVector( windVector, atPoint ); }
+bool R_GetWindGusting( vec3_t atpoint ) { return VK_GetWindGusting( atpoint ); }
+bool R_IsOutside( vec3_t pos ) { return VK_IsOutside( pos ); }
+float R_IsOutsideCausingPain( vec3_t pos ) { return VK_IsOutsideCausingPain( pos ); }
+float R_GetChanceOfSaberFizz( void ) { return VK_GetChanceOfSaberFizz(); }
+bool R_IsShaking( vec3_t pos ) { return VK_IsShaking( pos ); }
+void R_AddWeatherZone( vec3_t mins, vec3_t maxs ) { VK_AddWeatherZone( mins, maxs ); }
+bool R_SetTempGlobalFogColor( vec3_t color ) { return VK_SetTempGlobalFogColor( color ); }
 void RE_SetRangedFog( float dist ) { (void)dist; }
 
 void R_ScreenShotPNG_f( void );
