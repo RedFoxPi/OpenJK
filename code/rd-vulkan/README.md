@@ -2289,6 +2289,107 @@ itself (to confirm the Ghoul2 image-resolution fallback and the shader
 extension-stripping fix don't reintroduce that regression from a different
 angle) - no crashes, no new warnings, no regressions.
 
+## hoth2's overexposed terrain (vertex-lit surfaces wrongly double-brightened)
+
+A user directly compared `sp_hoth2_spawn`'s ground/sky against `rd-vanilla`
+and reported things looking "either too bright or not rendered" - a
+different symptom from this same level's earlier "missing terrain" bug
+above (that one was about surfaces not appearing at all; this one is about
+surfaces that *do* appear, but look wrong). The snow terrain filled most of
+the frame as flat, textureless solid white - no visible bumps, footprints,
+or any of the surface detail actually present in the source texture, and
+nothing like `rd-vanilla`'s own textured, snow-coloured (not white-clipped)
+ground for the same shot.
+
+Traced to `RE_LoadWorldMap`'s handling of `dsurface_t.lightmapNum`: this
+renderer already knew about surfaces with no real baked lightmap (comment
+on `s_whiteLightmap`, tr_world.cpp) and correctly binds a plain white 1x1
+image as a no-op stand-in for their missing lightmap slot - but every world
+surface, regardless of whether it actually had a real lightmap, was drawn
+through the same `camPos.w = 2.0` overbright factor (the multiply that
+approximates Quake3's real "overbright bits" compensation, correct *only*
+for genuine baked-and-compensated lightmaps - see the Ghoul2/sky overbright
+fix above, which already made this exact distinction for Ghoul2 and sky,
+but missed this third case). Confirmed directly against the real BSP data:
+parsed hoth2.bsp's own `LUMP_SURFACES`, found every ground/terrain surface
+near the camera position has `lightmapNum[0] == -3`
+(`LIGHTMAP_BY_VERTEX` - rd-vanilla's own convention, `rd-vanilla/tr_local.h`)
+- confirmed against `shaders/hoth.shader`'s real content for exactly these
+surfaces: `q3map_nolightmap`, `q3map_onlyvertexlighting`, `rgbGen vertex` -
+genuinely vertex-lit, no lightmap ever baked for them at all, real
+`rd-vanilla` never overbright-doubles these either. Multiplying an
+already-appropriately-bright diffuse texture by the white "lightmap" *and*
+then by 2.0 doesn't leave it alone (a true no-op would) - it doubles it,
+with nothing to compensate for since there's no real lightmap's darkening
+to counteract. With no tone-mapping curve to compress the excess back down,
+the result hard-clips to solid white, erasing the texture's own detail
+entirely - exactly the flat, textureless ground reported.
+
+Fixed by tracking which loaded case each surface batch actually is
+(`WorldSurfaceBatch::vertexLit`, set from the same `lightmapNum < 0` check
+already used to pick the white lightmap fallback) and picking the overbright
+factor per-batch at draw time in `RE_RenderScene` - `1.0` (no doubling,
+same value Ghoul2/sky already use and for the identical reason: no
+baked-and-compensated lightmap) for vertex-lit batches, the existing `2.0`
+default for real lightmapped ones. Re-issues the push constant only when a
+batch's category actually differs from the previous one drawn, not
+unconditionally per-batch, to avoid one push-constant call per surface
+across a 7000+-batch level like hoth2.
+
+**Not a complete fix**: this only removes the incorrect doubling - it does
+not add real per-vertex `rgbGen vertex` colour support. `drawVert_t::color`
+(the actual baked ambient/directional colour Quake3 map compilers write per
+vertex for exactly these surfaces) still isn't read or applied anywhere;
+`WorldVertex` has no colour attribute at all. The visible result after this
+fix is the diffuse texture's own colour and detail, undoubled and
+unclipped, not `rd-vanilla`'s exact per-vertex-shaded result - closely
+matching in practice for hoth2's snow (a mostly-flat, evenly-lit outdoor
+surface where per-vertex colour varies little), but not a general solution
+for a vertex-lit surface with strong per-vertex shading variation (e.g.
+sharp cast shadows baked into the vertices). Left for a future pass if a
+real case surfaces where the difference is visible - would need a new
+per-vertex colour attribute end-to-end (`WorldVertex`, `world.vert`,
+`world.frag`) similar in shape to `PolyVertex`'s existing colour field.
+
+**Also investigated, not a rendering bug**: two wampa creatures visible in
+`rd-vanilla`'s screenshot are absent from `rd-vulkan`'s for this same scene.
+Confirmed `models/players/wampa/model.glm` loads successfully (a real
+skeleton and 11 drawable surfaces, same load-time log line every other
+working Ghoul2 model gets) and this renderer's own per-frame debug log
+(`VK_DrawGhoul2Entities`) shows every Ghoul2 entity actually queued in the
+scene that frame drew successfully (3/3, no failures) - so if the wampa is
+one of those three, it rendered somewhere, just not inside this particular
+camera framing. Unlike the cutscene cameras and NPCs examined in earlier
+sections of this document, a wampa here is a roaming, AI-controlled
+creature with no scripted position - exactly the kind of entity most
+exposed to this project's previously-established ICARUS/simulation-timing
+divergence category (two renderers landing on a fixed capture point after a
+slightly different number of effective simulation ticks), not a rendering
+defect. Not chased further given no rendering-side failure was found.
+
+**Also investigated, a known, unimplemented gap, not a new bug**:
+`rd-vanilla`'s screenshot shows visible falling-snow particles and an
+overall soft, hazy blizzard look across the whole frame (sky included);
+`rd-vulkan`'s sky is a flat, sharply-bounded solid colour with no particle
+effects at all. Confirmed hoth2 ships no real skybox texture files at all
+under `textures/skies/hoth*` (checked every game .pk3 directly) - `hoth.shader`'s
+own `skyParms textures/skies/hoth 512 -` names a basename nothing on disk
+actually provides, so `rd-vanilla` itself isn't drawing a textured skybox
+for this level either; whatever soft haze it shows is coming from its real
+snow-weather particle system (`fx_weather`/`R_AddWeatherZone` in real
+Quake3-derived engines) compositing over the sky and world alike - a whole
+particle subsystem this renderer has never implemented (see "What's not
+implemented yet" below), not something this pass's overbright/lightmap fix
+could plausibly touch. Confirmed as a distinct, already-scoped-out gap
+rather than investigated as a new bug.
+
+**Verified**: `sp_hoth2_spawn`'s terrain now shows real texture
+detail - visible surface variation, no longer a flat white wash - closely
+matching `rd-vanilla`'s snow-coloured ground for the same shot. Full SP
+scene suite (menu/academy1/hoth2/yavin1/vjun1) re-verified clean on both
+renderers, including vjun1 and academy1 (both exercise the same world
+overbright push-constant path this fix touches) to confirm no regression.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render

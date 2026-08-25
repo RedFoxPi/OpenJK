@@ -61,6 +61,24 @@ struct WorldSurfaceBatch
 	// RE_RenderScene.
 	float mins[3];
 	float maxs[3];
+	// True if this surface's dsurface_t.lightmapNum was < 0 (LIGHTMAP_BY_
+	// VERTEX/no lightmap at all - see s_whiteLightmap's comment) - hoth2's
+	// snow/terrain shaders are the confirmed real case (shaders/hoth.shader:
+	// `q3map_nolightmap` + `rgbGen vertex`, dsurface_t.lightmapNum == -3 in
+	// the actual BSP). RE_RenderScene needs this per-batch, not just at load
+	// time, to pick the right overbright factor (world.frag's comment):
+	// real baked lightmaps are compensated for Quake3's overbright-bits
+	// doubling and need camPos.w=2.0, but a surface bound to s_whiteLightmap
+	// has no such compensation baked in anywhere - multiplying by 2.0 on top
+	// of that white "no-op" lightmap doubled the raw diffuse texture instead
+	// of leaving it alone, blowing every vertex-lit surface out to solid
+	// white and erasing its own texture detail. A real, confirmed bug (a
+	// user directly compared hoth2's terrain against rd-vanilla's textured,
+	// non-blown-out version of the same ground). Not a full fix - real
+	// per-vertex `rgbGen vertex` colour (drawVert_t::color) still isn't
+	// read or applied at all, only the erroneous doubling is removed - see
+	// README.md.
+	bool vertexLit;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -369,7 +387,10 @@ static void VK_LoadSky( const char *baseName )
 		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 2 ); cpuIndexes.push_back( vertBase + 3 );
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, faces[axis], s_whiteLightmap );
-		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 } } );
+		// vertexLit is meaningless here - the sky draw loop uses its own
+		// dedicated push constants (camPos.w=1.0), never s_worldSurfaces'
+		// per-batch value.
+		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 }, false } );
 	}
 
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
@@ -745,7 +766,7 @@ void RE_LoadWorldMap( const char *name )
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
-			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] } } );
+			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0 } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1018,6 +1039,9 @@ void RE_RenderScene( const refdef_t *fd )
 	worldPush.camPos[0] = fd->vieworg[0];
 	worldPush.camPos[1] = fd->vieworg[1];
 	worldPush.camPos[2] = fd->vieworg[2];
+	// Common-case default (real baked lightmaps) - overridden per-batch
+	// below for vertex-lit surfaces (WorldSurfaceBatch::vertexLit's
+	// comment).
 	worldPush.camPos[3] = 2.0f; // overbright factor - see world.frag's comment
 	if ( s_worldFogEnabled )
 	{
@@ -1039,12 +1063,26 @@ void RE_RenderScene( const refdef_t *fd )
 	static int s_debugCullLogsRemaining = 3;
 	int culledCount = 0;
 
+	// worldPush.camPos[3] (overbright factor) already holds the common case
+	// (2.0, real baked lightmaps) from the push issued above this loop -
+	// only re-issue it for the less common vertex-lit batches, and again
+	// when switching back, rather than pushing per-batch unconditionally.
+	// See WorldSurfaceBatch::vertexLit's comment for why they can't share
+	// that same factor.
+	bool currentPushIsVertexLit = false;
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
 		if ( VK_AABBOutsideFrustum( batch.mins, batch.maxs, frustumPlanes ) )
 		{
 			culledCount++;
 			continue;
+		}
+		if ( batch.vertexLit != currentPushIsVertexLit )
+		{
+			currentPushIsVertexLit = batch.vertexLit;
+			worldPush.camPos[3] = currentPushIsVertexLit ? 1.0f : 2.0f;
+			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+				0, sizeof( worldPush ), &worldPush );
 		}
 		vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.worldPipelineLayout,
 			0, 1, &batch.descriptorSet, 0, nullptr );
