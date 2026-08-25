@@ -544,6 +544,35 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 				shaderName = &skinOverride->second;
 			}
 			image_t *img = VK_FindImage( shaderName->c_str() );
+			if ( !img )
+			{
+				// Same fallback, same reasoning, as RE_LoadWorldMap's identical
+				// gap (tr_world.cpp) - confirmed here against a second, real
+				// case: vjun1's jedi_tf NPC (Ghoul2, not world BSP) has its
+				// torso skin-overridden to "models/players/jedi_tf/
+				// torso_01_clothes", which isn't a texture file at all (no
+				// matching .tga/.jpg/.png ships), only a .shader script -
+				// `models/players/jedi_tf/torso_01_clothes { { map .../
+				// torso_01 blendFunc GL_ONE GL_ZERO ... } }` (shaders/
+				// players.shader) - that resolves opaquely to the real
+				// torso_01 texture. Without this, VK_FindImage's direct
+				// lookup fails and the surface is silently dropped, which is
+				// exactly what made her torso (and a couple of other
+				// surfaces sharing this same indirection, e.g. "..._skin")
+				// invisible while her arms/hands/legs - skin-overridden to
+				// shaders that happen to share their file name directly,
+				// e.g. "torso_01_arms" - rendered fine. Gated on BLEND_OPAQUE
+				// for the same reason as the world-geometry fallback: not
+				// safe to assume for a shader that's actually translucent.
+				if ( VK_GetShaderBlendMode( shaderName->c_str() ) == BLEND_OPAQUE )
+				{
+					const char *mapImage = VK_GetShaderMapImage( shaderName->c_str() );
+					if ( mapImage )
+					{
+						img = VK_FindImage( mapImage );
+					}
+				}
+			}
 			if ( img )
 			{
 				const mdxmVertex_t *verts = (const mdxmVertex_t *)( (const byte *)surf + surf->ofsVerts );
@@ -661,6 +690,162 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 
 	ri.Printf( PRINT_ALL, "rd-vulkan: loaded Ghoul2 model %s (skin %d): %d surfaces, %d verts, %d indexes\n",
 		fileName, skinHandle, (int)s_ghoul2Models[index].surfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size() );
+
+	return index;
+}
+
+// Non-Ghoul2 static models (.md3) - map set pieces (misc_model_static),
+// weapon world models, gibs/props. Confirmed real-world motivation: vjun1's
+// opening cutscene camera sits inside a cockpit interior
+// (models/map_objects/cinematics/raven_cockpit.md3) that isn't Ghoul2 and
+// isn't world BSP geometry either - the nearest real BSP surfaces to that
+// camera position are ~1300 units away (the level's sky shader), so before
+// this, the scene rendered as a flat gray/sky background with the seated
+// NPCs (real Ghoul2 entities, drawn correctly) floating in open air and no
+// visible cabin at all. Reuses tr_world.cpp's WorldVertex layout/pipeline/
+// descriptor-set helper wholesale, same as Ghoul2 (see this file's header
+// comment) - here paired with vk.whiteImage in the lightmap slot exactly
+// like Ghoul2, for the same reason (no baked lightmap of its own).
+//
+// Deliberately simpler than Ghoul2: single LOD (MD3's ofsSurfaces already
+// points at LOD 0, the first and highest-detail one - MD3 LODs are whole
+// separate model chunks the game selects between, not something this
+// renderer implements) and single frame (frame 0's XyzNormals entry only -
+// an MD3 with real vertex animation, e.g. an old-style weapon muzzle flash
+// model, would freeze on its bind pose instead of animating, needing
+// something like VK_SkinGhoul2Model's per-frame reskin to fix - not
+// implemented since raven_cockpit.md3, the confirmed real case this was
+// built for, is a single static set piece with exactly one frame). Static,
+// device-local geometry, uploaded once - unlike Ghoul2, nothing here ever
+// changes per-instance, so every entity referencing the same cached model
+// just draws the one shared vertex/index buffer with its own entity model
+// matrix (VK_DrawGhoul2Entities), no per-slot vertexBuffer needed.
+struct VulkanStaticModel
+{
+	std::vector<GhoulSurfaceDraw> surfaces;
+	VkBuffer vertexBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
+	VkBuffer indexBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
+};
+// Index 0 reserved/invalid, same convention as s_ghoul2Models.
+static std::vector<VulkanStaticModel> s_staticModels;
+static std::unordered_map<std::string, int> s_staticModelsByName;
+
+int VK_LoadMD3Model( const char *fileName )
+{
+	auto cached = s_staticModelsByName.find( fileName );
+	if ( cached != s_staticModelsByName.end() )
+	{
+		return cached->second;
+	}
+
+	void *buffer = nullptr;
+	long len = ri.FS_ReadFile( fileName, &buffer );
+	if ( !buffer || len <= 0 )
+	{
+		ri.Printf( PRINT_WARNING, "rd-vulkan: VK_LoadMD3Model: %s not found\n", fileName );
+		return 0;
+	}
+
+	const byte *base = (const byte *)buffer;
+	const md3Header_t *hdr = (const md3Header_t *)buffer;
+	if ( hdr->ident != MD3_IDENT || hdr->version != MD3_VERSION )
+	{
+		ri.Printf( PRINT_WARNING, "rd-vulkan: VK_LoadMD3Model: %s is not a supported MD3 (ident/version mismatch)\n", fileName );
+		ri.FS_FreeFile( buffer );
+		return 0;
+	}
+
+	std::vector<WorldVertex> cpuVerts;
+	std::vector<uint32_t> cpuIndexes;
+	std::vector<GhoulSurfaceDraw> drawSurfaces;
+
+	const md3Surface_t *surf = (const md3Surface_t *)( base + hdr->ofsSurfaces );
+	for ( int i = 0; i < hdr->numSurfaces; i++ )
+	{
+		if ( surf->numVerts > 0 && surf->numTriangles > 0 && surf->numShaders > 0 )
+		{
+			// First shader only - the same "one texture per surface" scope this
+			// renderer already applies to world/Ghoul2 geometry (no multi-stage
+			// compositing). Unlike a .shader script's own name (RE_LoadWorldMap's
+			// VK_GetShaderMapImage fallback, tr_world.cpp), an MD3 surface's
+			// shader name is overwhelmingly already a direct texture path in
+			// practice - not worth threading that fallback through here too
+			// until a real model turns up that actually needs it.
+			const md3Shader_t *shaders = (const md3Shader_t *)( (const byte *)surf + surf->ofsShaders );
+			image_t *img = VK_FindImage( shaders[0].name );
+			if ( img )
+			{
+				const md3St_t *st = (const md3St_t *)( (const byte *)surf + surf->ofsSt );
+				// Frame 0 only - see this cache's own comment. XyzNormals is
+				// laid out [numFrames][numVerts]; frame 0 is just its first
+				// numVerts entries, no extra offset needed.
+				const md3XyzNormal_t *xyz = (const md3XyzNormal_t *)( (const byte *)surf + surf->ofsXyzNormals );
+
+				uint32_t vertBase = (uint32_t)cpuVerts.size();
+				for ( int v = 0; v < surf->numVerts; v++ )
+				{
+					WorldVertex wv = {};
+					wv.pos[0] = xyz[v].xyz[0] * (float)MD3_XYZ_SCALE;
+					wv.pos[1] = xyz[v].xyz[1] * (float)MD3_XYZ_SCALE;
+					wv.pos[2] = xyz[v].xyz[2] * (float)MD3_XYZ_SCALE;
+					wv.uv[0] = st[v].st[0];
+					wv.uv[1] = st[v].st[1];
+					wv.lightmapUV[0] = 0.0f;
+					wv.lightmapUV[1] = 0.0f;
+					cpuVerts.push_back( wv );
+				}
+
+				const md3Triangle_t *tris = (const md3Triangle_t *)( (const byte *)surf + surf->ofsTriangles );
+				uint32_t firstIndex = (uint32_t)cpuIndexes.size();
+				for ( int t = 0; t < surf->numTriangles; t++ )
+				{
+					cpuIndexes.push_back( vertBase + (uint32_t)tris[t].indexes[0] );
+					cpuIndexes.push_back( vertBase + (uint32_t)tris[t].indexes[1] );
+					cpuIndexes.push_back( vertBase + (uint32_t)tris[t].indexes[2] );
+				}
+
+				// Same pool/white-lightmap reasoning as Ghoul2's identical call
+				// (see vkGlobals_t::ghoul2DescriptorPool's comment) - a static
+				// model is cached by filename and expected to survive a world
+				// reload exactly like a Ghoul2 model does.
+				VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.ghoul2DescriptorPool, img, vk.whiteImage );
+				drawSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf->numTriangles * 3 } );
+			}
+			// No image resolved - skip rather than draw an opaque white quad,
+			// same call as tr_world.cpp's RE_LoadWorldMap and VK_LoadGhoul2Model
+			// above.
+		}
+
+		surf = (const md3Surface_t *)( (const byte *)surf + surf->ofsEnd );
+	}
+
+	ri.FS_FreeFile( buffer );
+
+	if ( cpuVerts.empty() || cpuIndexes.empty() )
+	{
+		ri.Printf( PRINT_WARNING, "rd-vulkan: VK_LoadMD3Model: %s has no drawable surfaces\n", fileName );
+		return 0;
+	}
+
+	VulkanStaticModel model;
+	model.surfaces = std::move( drawSurfaces );
+	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &model.vertexBuffer, &model.vertexBufferMemory );
+	VK_UploadDeviceLocalBuffer( cpuIndexes.data(), cpuIndexes.size() * sizeof( uint32_t ),
+		VK_BUFFER_USAGE_INDEX_BUFFER_BIT, &model.indexBuffer, &model.indexBufferMemory );
+
+	if ( s_staticModels.empty() )
+	{
+		s_staticModels.emplace_back(); // burn index 0, same convention as s_ghoul2Models
+	}
+	s_staticModels.push_back( std::move( model ) );
+	int index = (int)s_staticModels.size() - 1;
+	s_staticModelsByName[fileName] = index;
+
+	ri.Printf( PRINT_ALL, "rd-vulkan: loaded static model %s: %d surfaces, %d verts, %d indexes\n",
+		fileName, (int)s_staticModels[index].surfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size() );
 
 	return index;
 }
@@ -1497,6 +1682,18 @@ void VK_ShutdownGhoul2Models( void )
 	}
 	s_ghoul2Models.clear();
 	s_ghoul2ModelsByKey.clear();
+	// Static (.md3) models - see VulkanStaticModel's comment for why these
+	// share vk.ghoul2DescriptorPool and this same shutdown/lifetime with
+	// Ghoul2 models rather than getting their own.
+	for ( VulkanStaticModel &model : s_staticModels )
+	{
+		if ( model.vertexBuffer ) vkDestroyBuffer( vk.device, model.vertexBuffer, nullptr );
+		if ( model.vertexBufferMemory ) vkFreeMemory( vk.device, model.vertexBufferMemory, nullptr );
+		if ( model.indexBuffer ) vkDestroyBuffer( vk.device, model.indexBuffer, nullptr );
+		if ( model.indexBufferMemory ) vkFreeMemory( vk.device, model.indexBufferMemory, nullptr );
+	}
+	s_staticModels.clear();
+	s_staticModelsByName.clear();
 	s_sceneEntities.clear();
 	// Stale CGhoul2Info* keys (game-owned instances this renderer never
 	// allocated, freed on the game side across a map load) could otherwise
@@ -2947,13 +3144,62 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 	// visually obvious in any one screenshot (e.g. the player's own weapon
 	// viewmodel isn't drawn every frame of every scene).
 	static int s_debugEntityLogsRemaining = 3;
-	int drawnEntityCount = 0, drawnSubModelCount = 0;
+	int drawnEntityCount = 0, drawnSubModelCount = 0, drawnStaticModelCount = 0;
 	int rtModelCount = 0;
 
 	for ( const refEntity_t &ent : s_sceneEntities )
 	{
-		if ( ent.reType != RT_MODEL || !ent.ghoul2 || ent.ghoul2->size() <= 0 )
+		if ( ent.reType != RT_MODEL )
 		{
+			continue;
+		}
+		if ( !ent.ghoul2 || ent.ghoul2->size() <= 0 )
+		{
+			// Static (.md3) model entity - see VulkanStaticModel's comment
+			// (this file) for what this is and the confirmed real-world case
+			// it fixes (vjun1's cockpit interior). Reuses the exact same
+			// entity-matrix/push-constant/world-pipeline draw shape the
+			// Ghoul2 branch below uses, just against one shared vertex/index
+			// buffer instead of a per-instance skin slot - see
+			// VK_LoadMD3Model's comment for why no skinning is needed here.
+			int modelIndex = ent.hModel - VK_STATIC_MODEL_HANDLE_BASE;
+			if ( modelIndex <= 0 || (size_t)modelIndex >= s_staticModels.size() )
+			{
+				continue;
+			}
+			VulkanStaticModel &model = s_staticModels[modelIndex];
+			if ( model.surfaces.empty() )
+			{
+				continue;
+			}
+
+			float staticModel_[16] = {};
+			staticModel_[0] = ent.axis[0][0]; staticModel_[4] = ent.axis[1][0]; staticModel_[8] = ent.axis[2][0]; staticModel_[12] = ent.origin[0];
+			staticModel_[1] = ent.axis[0][1]; staticModel_[5] = ent.axis[1][1]; staticModel_[9] = ent.axis[2][1]; staticModel_[13] = ent.origin[1];
+			staticModel_[2] = ent.axis[0][2]; staticModel_[6] = ent.axis[1][2]; staticModel_[10] = ent.axis[2][2]; staticModel_[14] = ent.origin[2];
+			staticModel_[15] = 1.0f;
+			float staticEntityMvp[16];
+			VK_MultiplyMatrix( staticModel_, mvp, staticEntityMvp );
+
+			// Same push-constant shape/reasoning as the Ghoul2 branch below
+			// (no baked lightmap, so camPos.w=1.0 not world geometry's 2.0;
+			// not fogged, so fogColor.a stays 0).
+			vkWorldPushConstants_t staticPush = {};
+			memcpy( staticPush.mvp, staticEntityMvp, sizeof( staticEntityMvp ) );
+			staticPush.camPos[3] = 1.0f;
+			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+				0, sizeof( staticPush ), &staticPush );
+
+			VkDeviceSize vertexOffset = 0;
+			vkCmdBindVertexBuffers( cmd, 0, 1, &model.vertexBuffer, &vertexOffset );
+			vkCmdBindIndexBuffer( cmd, model.indexBuffer, 0, VK_INDEX_TYPE_UINT32 );
+			for ( const GhoulSurfaceDraw &surface : model.surfaces )
+			{
+				vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.worldPipelineLayout,
+					0, 1, &surface.descriptorSet, 0, nullptr );
+				vkCmdDrawIndexed( cmd, surface.indexCount, 1, surface.firstIndex, 0, 0 );
+			}
+			drawnStaticModelCount++;
 			continue;
 		}
 		rtModelCount++;
@@ -3055,7 +3301,7 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 	if ( s_debugEntityLogsRemaining > 0 )
 	{
 		s_debugEntityLogsRemaining--;
-		ri.Printf( PRINT_ALL, "rd-vulkan: ghoul2: %d/%d scene entities drew %d sub-model(s)\n",
-			drawnEntityCount, rtModelCount, drawnSubModelCount );
+		ri.Printf( PRINT_ALL, "rd-vulkan: ghoul2: %d/%d scene entities drew %d sub-model(s), %d static model(s)\n",
+			drawnEntityCount, rtModelCount, drawnSubModelCount, drawnStaticModelCount );
 	}
 }

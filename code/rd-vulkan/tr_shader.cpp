@@ -177,25 +177,45 @@ static void ParseShaderFile( const char *text )
 
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "blendFunc" ) )
 			{
-				const char *a = COM_ParseExt( &p, qfalse );
-				if ( !Q_stricmp( a, "add" ) )
+				// COM_ParseExt returns a pointer into its own single static
+				// buffer (com_token) - reused on every call. Copying the
+				// first token into a local std::string before parsing the
+				// second is not just tidiness: without it, parsing `b`
+				// silently overwrites the very buffer `a` still points at,
+				// so BlendFactorsToMode ends up comparing (b, b) instead of
+				// (a, b). Confirmed the hard way - this exact aliasing bug
+				// classified every explicit two-token `blendFunc GL_ONE
+				// GL_ZERO` shader (the standard "opaque" spelling, used
+				// throughout shaders/players.shader) as BLEND_ALPHA instead
+				// of BLEND_OPAQUE, which silently defeated
+				// RE_LoadWorldMap's/VK_LoadGhoul2Model's BLEND_OPAQUE-gated
+				// shader-script fallback for every shader that took this
+				// branch - e.g. vjun1's jedi_tf NPC, whose torso skin
+				// resolves through exactly such a shader (models/players/
+				// jedi_tf/torso_01_clothes) and rendered invisible as a
+				// result. A shader with no blendFunc keyword at all (the
+				// default-OPAQUE path just below, never entering this
+				// block) was never affected, which is why this went
+				// unnoticed through hoth2's earlier, similar-looking fix.
+				std::string a = COM_ParseExt( &p, qfalse );
+				if ( !Q_stricmp( a.c_str(), "add" ) )
 				{
 					blendMode = BLEND_ADDITIVE;
 				}
-				else if ( !Q_stricmp( a, "blend" ) )
+				else if ( !Q_stricmp( a.c_str(), "blend" ) )
 				{
 					blendMode = BLEND_ALPHA;
 				}
-				else if ( !Q_stricmp( a, "filter" ) )
+				else if ( !Q_stricmp( a.c_str(), "filter" ) )
 				{
 					// GL_DST_COLOR/GL_ZERO (multiply) - no matching pipeline
 					// yet, alpha blend is the closest approximation we have.
 					blendMode = BLEND_ALPHA;
 				}
-				else if ( a[0] )
+				else if ( !a.empty() )
 				{
 					const char *b = COM_ParseExt( &p, qfalse );
-					blendMode = BlendFactorsToMode( a, b );
+					blendMode = BlendFactorsToMode( a.c_str(), b );
 				}
 			}
 		}
@@ -266,11 +286,34 @@ void VK_LoadShaderScripts( void )
 		numShaderFiles, (int)s_shaderBlendModes.size() );
 }
 
+// A .shader block's own name never carries a file extension, but callers
+// routinely look one up by a name that does - most commonly a .skin file's
+// own surface-override lines, which are free to write a shader reference
+// exactly like a texture path complete with extension (e.g. jedi_tf's real
+// torso_a1.skin: `torsoa,models/players/jedi_tf/torso_01_clothes.tga`) even
+// when that "shader" is actually a .shader script block named without one
+// (`models/players/jedi_tf/torso_01_clothes { ... }`, shaders/
+// players.shader). rd-vanilla's real R_FindShader/R_FindShaderByName both
+// unconditionally COM_StripExtension the incoming name before comparing
+// against defined shader names for exactly this reason - confirmed the hard
+// way here: without this, VK_GetShaderBlendMode/VK_GetShaderMapImage below
+// looked up "...torso_01_clothes.tga" against a map keyed by
+// "...torso_01_clothes", missed every time, and silently dropped that NPC's
+// torso (and every other surface sharing this same extension-on-a-shader-
+// name skin convention) - not a hoth2-style missing-fallback gap, this one
+// had the right fallback already, just never actually matched anything.
+static std::string VK_StripShaderNameExtension( const char *name )
+{
+	char stripped[MAX_QPATH];
+	COM_StripExtension( name, stripped, sizeof( stripped ) );
+	return stripped;
+}
+
 vkBlendMode_t VK_GetShaderBlendMode( const char *name )
 {
 	VK_LoadShaderScripts();
 
-	auto it = s_shaderBlendModes.find( name );
+	auto it = s_shaderBlendModes.find( VK_StripShaderNameExtension( name ) );
 	if ( it != s_shaderBlendModes.end() )
 	{
 		return it->second;
@@ -286,7 +329,7 @@ bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist )
 {
 	VK_LoadShaderScripts();
 
-	auto it = s_shaderFogParms.find( name );
+	auto it = s_shaderFogParms.find( VK_StripShaderNameExtension( name ) );
 	if ( it == s_shaderFogParms.end() )
 	{
 		return false;
@@ -323,7 +366,7 @@ const char *VK_GetShaderMapImage( const char *name )
 {
 	VK_LoadShaderScripts();
 
-	auto it = s_shaderMapImage.find( name );
+	auto it = s_shaderMapImage.find( VK_StripShaderNameExtension( name ) );
 	if ( it == s_shaderMapImage.end() )
 	{
 		return nullptr;

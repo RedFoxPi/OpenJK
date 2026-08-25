@@ -780,11 +780,16 @@ static void VK_CreateWorldPipeline( void )
 	dslInfo.pBindings = bindings;
 	VK_Check( vkCreateDescriptorSetLayout( vk.device, &dslInfo, nullptr, &vk.worldDescriptorSetLayout ), "vkCreateDescriptorSetLayout (world)" );
 
-	VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_VK_IMAGES * 2 };
+	// maxSets is MAX_VK_WORLD_DESCRIPTOR_SETS, NOT MAX_VK_IMAGES - see that
+	// constant's own comment (tr_local.h) for why reusing the UI pool's
+	// "number of unique images" cap here silently broke large levels
+	// (one set per surface *batch*, not per unique image - a real map can
+	// have far more batches than distinct textures).
+	VkDescriptorPoolSize poolSize = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_VK_WORLD_DESCRIPTOR_SETS * 2 };
 	VkDescriptorPoolCreateInfo dpInfo = { VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
 	dpInfo.poolSizeCount = 1;
 	dpInfo.pPoolSizes = &poolSize;
-	dpInfo.maxSets = MAX_VK_IMAGES;
+	dpInfo.maxSets = MAX_VK_WORLD_DESCRIPTOR_SETS;
 	VK_Check( vkCreateDescriptorPool( vk.device, &dpInfo, nullptr, &vk.worldDescriptorPool ), "vkCreateDescriptorPool (world)" );
 
 	// Ghoul2 models' own pool - see vkGlobals_t::ghoul2DescriptorPool's
@@ -1258,11 +1263,33 @@ void RE_BeginRegistration( glconfig_t *config )
 // some game-side code (e.g. cg_main.cpp's misc_model_static spawning) treats
 // a failed model registration as fatal (Com_Error(ERR_DROP, ...)), which
 // aborts map loading entirely before RE_RenderScene ever gets a chance to
-// draw the world. Non-Ghoul2 models (misc_model_static, MD3s) still don't
-// render - only Ghoul2 (G2API_InitGhoul2Model below) does - but registration
-// itself succeeding, with a fake non-zero handle nothing ever dereferences,
-// is enough to let map loading past that check.
-qhandle_t RE_RegisterModel( const char *name ) { (void)name; return 1; }
+// draw the world. So a .md3 that fails to actually load (VK_LoadMD3Model
+// returns 0 - bad ident/version, unreadable file, no drawable surfaces)
+// still falls through to the same fake non-zero handle every other model
+// kind gets, rather than propagating that failure - "never renders" is an
+// acceptable outcome here, aborting map load over it is not.
+//
+// Real .md3 loading (VK_LoadMD3Model, tr_model.cpp) was added after this
+// always-fake-handle stub turned out to be hiding an actual, confirmed
+// rendering bug rather than just an intentionally-unimplemented one: vjun1's
+// opening cutscene cockpit interior
+// (models/map_objects/cinematics/raven_cockpit.md3) is exactly this kind of
+// entity, and with every non-Ghoul2 RT_MODEL entity unconditionally skipped
+// at draw time (see VK_DrawGhoul2Entities, tr_model.cpp), it silently never
+// rendered at all - see README.md. Other non-Ghoul2 model kinds this engine
+// doesn't otherwise use for anything real (no other extension shows up in
+// practice) still get the harmless fake handle unchanged.
+qhandle_t RE_RegisterModel( const char *name ) {
+	if ( name && COM_CompareExtension( name, ".md3" ) )
+	{
+		int idx = VK_LoadMD3Model( name );
+		if ( idx > 0 )
+		{
+			return VK_STATIC_MODEL_HANDLE_BASE + idx;
+		}
+	}
+	return 1;
+}
 // Real implementation (tr_model.cpp: VK_RegisterSkin) - Ghoul2 humanoid
 // models need it to resolve any texture at all, see G2API_InitGhoul2Model
 // below and VulkanSkin's comment in tr_model.cpp.

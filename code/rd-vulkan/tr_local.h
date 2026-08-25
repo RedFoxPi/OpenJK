@@ -66,6 +66,32 @@ extern cvar_t *r_lodbias;
 extern cvar_t *r_ghoul2AnimDebug;
 
 #define MAX_VK_IMAGES 4096
+// vk.worldDescriptorPool/vk.ghoul2DescriptorPool's maxSets - deliberately a
+// separate, much larger constant from MAX_VK_IMAGES, not a reuse of it: the
+// UI descriptor pool allocates one set per unique *image* (bounded by how
+// many distinct textures ever get loaded, comfortably under 4096), but the
+// world/Ghoul2 pools allocate one set per *surface batch* - a completely
+// different scale. A real, complex level's world geometry alone can vastly
+// exceed 4096 batches (vjun1: 12833, confirmed via its own "N draw batches"
+// load-time log line) - reusing MAX_VK_IMAGES here would silently run out
+// of pool capacity partway through the surface list on any map exceeding
+// it, and vkAllocateDescriptorSets failing doesn't produce a clean, loud
+// error either (VK_Check's ri.Error(ERR_FATAL, ...) would have made this
+// obvious immediately) - some Vulkan implementations (Mesa's lavapipe,
+// used to develop and test this renderer, among them) don't strictly
+// enforce a pool's nominal maxSets/poolSize at allocation time, so an
+// exhausted pool can keep "succeeding" while corrupting other descriptor
+// sets' already-written image bindings instead. A real, independently
+// justified fix per the Vulkan spec regardless of any specific symptom -
+// found and fixed while chasing vjun1's missing-cockpit/orange-artifact
+// bugs (see README.md), and initially suspected as their cause, but
+// re-tested against them directly (rebuilt with only this fix applied) and
+// confirmed to make no visible difference to either: both turned out to
+// have their own, unrelated root causes (a never-loaded static MD3 model,
+// and real background BSP geometry visible through the cockpit's own
+// window, respectively - see README.md's "vjun1's missing cockpit and NPC
+// torso" section for the actual fixes). Kept anyway on its own merits.
+#define MAX_VK_WORLD_DESCRIPTOR_SETS 65536
 #define VK_FRAMES_IN_FLIGHT 2
 #define UI_VERTEX_BUFFER_CAPACITY 4096u // quads per frame
 // Fan-expanded triangle-list vertices per frame across every queued
@@ -359,6 +385,28 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime );
 // since it's already computed by the caller.
 void VK_DrawScenePolys( const float *mvp, const refdef_t *fd );
 void VK_ShutdownGhoul2Models( void );
+// Non-Ghoul2 static models (.md3) - map set pieces (misc_model_static),
+// weapon world models, gibs/props. Loads (or returns the cached index of)
+// the .md3 at fileName; single LOD, single frame (see VulkanStaticModel's
+// comment, tr_model.cpp, for exactly why that's enough for the confirmed
+// real-world case - vjun1's missing cockpit interior, see README.md). 0 on
+// failure, same convention as VK_LoadGhoul2Model. Called from
+// RE_RegisterModel (tr_init.cpp), which offsets a successful return by
+// VK_STATIC_MODEL_HANDLE_BASE before handing it back as a qhandle_t - see
+// that constant's own comment for why.
+int VK_LoadMD3Model( const char *fileName );
+// RE_RegisterModel's generic qhandle_t space previously meant nothing (every
+// call returned the same fake "1", see RE_RegisterModel's own comment) - now
+// that a real .md3 model cache index is sometimes returned instead, it needs
+// to be distinguishable from that fake handle and from every other qhandle_t
+// space (images, Ghoul2 models, skins - each already has its own, per this
+// file's existing convention) sharing the same C `int` type. Chosen larger
+// than any realistic model count so a real index i>0 is returned as
+// VK_STATIC_MODEL_HANDLE_BASE+i, never colliding with the fallback "1" or
+// with any other in-range handle. ent.hModel (refEntity_t) is otherwise
+// completely unused by this renderer - Ghoul2 entities are matched via
+// ent.ghoul2, not ent.hModel - so this is the only reader of it.
+#define VK_STATIC_MODEL_HANDLE_BASE 1000000
 // Loads (or returns the cached index of, if already loaded with the same
 // skinHandle) the .glm at fileName. skinHandle (from VK_RegisterSkin, or 0
 // for "no skin") selects per-surface texture overrides for models whose own

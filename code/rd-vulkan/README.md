@@ -2117,14 +2117,177 @@ changes, including specifically re-checking `sp_academy1_spawn` after the
 gate fixes, so it's the one most likely to reveal if the gate itself is
 wrong).
 
-**Left for another day, spotted but out of scope for this pass**:
-`sp_vjun1_spawn`'s cockpit-interior shot is missing its cabin walls/ceiling/
-dashboard geometry the same way hoth2's terrain was (confirmed present
-identically *before* this session's fixes too, so not a regression from
-anything above) - very plausibly the same category of shader-name-
-resolution bug hitting vjun1's ship-interior shaders, but not verified, and
-a real orange rendering artifact behind the Twi'lek NPC in that same shot
-that hasn't been looked at at all.
+**Left for another day at the time, since fixed** - see "vjun1's missing
+cockpit and NPC torso" below: `sp_vjun1_spawn`'s cockpit-interior shot was
+missing its cabin walls/ceiling/dashboard geometry the same way hoth2's
+terrain was, plus a real orange rendering artifact behind the Twi'lek NPC in
+that same shot. Neither turned out to be the same shader-name-resolution
+category guessed here - the cockpit is a static (non-Ghoul2, non-BSP) model
+this renderer never drew at all, and the orange artifact was never a bug in
+the first place.
+
+## vjun1's missing cockpit and NPC torso (two unrelated real bugs)
+
+`sp_vjun1_spawn`'s opening cutscene puts the camera inside a ship cockpit
+(Kyle and a Twi'lek NPC seated at the controls). Before this pass it
+rendered as a flat sky-grey background, a blocky orange silhouette, and the
+two NPCs seemingly floating in open air - no cabin at all. A user directly
+compared it against `rd-vanilla`'s full, detailed cockpit interior and asked
+for this fixed.
+
+**First ruled out - an ICARUS-timing camera-cut divergence, not a rendering
+bug at all**: this project's history has at least one earlier case where
+`rd-vanilla` and `rd-vulkan` ended up rendering genuinely *different*
+scripted camera cuts at the harness's fixed `wait_ms` capture point, purely
+from a per-renderer animation-completion-signal timing difference - not a
+rendering bug at all. Directly tested that possibility here rather than
+assuming it: added a temporary print of `fd->vieworg`/`fd->viewaxis[0]` to
+both renderers' `RE_RenderScene`, ran `sp_vjun1_spawn` on both, and compared
+the *last* line each logged before its screenshot. Both landed on the exact
+same position and orientation (`org=(-5173.0,8230.0,1787.0)
+axis0=(0.999,0.000,0.052)`) - conclusively the same camera, so whatever was
+different was a real rendering gap, not a script-timing race.
+
+**Bug 1 - the cockpit is a static model, not Ghoul2 and not world BSP
+geometry, and this renderer only ever drew the first two**: parsed vjun1's
+BSP directly (LUMP_SURFACES/LUMP_DRAWVERTS) to find every real world surface
+within any plausible distance of that exact camera position - the nearest
+is ~1300 units away and is the level's sky shader. There is no wall, seat,
+or dashboard brush anywhere near the camera in the map's own geometry, in
+either renderer - so hoth2's "shader name doesn't match a texture file"
+category was never going to be the answer here, however plausible it looked
+from the outside. Cross-referencing the scene's actual `RE_AddRefEntityToScene`
+entities against the camera position turned up a non-Ghoul2 `RT_MODEL`
+entity 98 units away, registered as
+`models/map_objects/cinematics/raven_cockpit.md3` - a real file, a real MD3.
+`RE_RegisterModel` has always been a documented stub (see "Everything below
+this point is 3D world/model rendering" in `tr_init.cpp`) that returns a
+fake non-zero handle for every model regardless of name, specifically so
+game code that treats a failed registration as fatal doesn't abort map
+loading - and `VK_DrawGhoul2Entities`'s entity loop has always
+unconditionally skipped any `RT_MODEL` entity without Ghoul2 data. Both are
+correct, deliberate, and were re-confirmed with an earlier (now-reverted)
+diagnostic pass in this same investigation that found the ~19 other
+non-Ghoul2 entities scattered around vjun1 are all generic precached
+props/gibs - not the cockpit. This one just happened to matter visibly,
+because unlike a gib in a corner, it's the entire set piece the whole shot
+takes place inside.
+
+Fixed by actually implementing static MD3 loading rather than documenting
+around it further: `VK_LoadMD3Model` (`tr_model.cpp`) parses a `.md3`
+(single LOD - `ofsSurfaces` already points at LOD 0, MD3 LODs are whole
+separate model chunks this renderer doesn't select between; single frame -
+frame 0 of `XyzNormals` only, sufficient for a static set piece with no
+vertex animation) into the same `WorldVertex` layout/pipeline/descriptor-set
+shape Ghoul2 models already reuse (see this file's header comment), so
+nothing new was needed on the GPU side. `RE_RegisterModel` now calls it for
+any `.md3` name (matched via `COM_CompareExtension`, same real function
+`rd-vanilla` uses) and, on success, returns the cache index offset by a new
+`VK_STATIC_MODEL_HANDLE_BASE` constant (`tr_local.h`) - large enough that a
+real index can never collide with the existing fake "1" handle every other
+model kind still gets, since `ent.hModel` is a single shared field with no
+other tag for which handle space it belongs to. A `.md3` that fails to
+parse still falls through to the old fake handle rather than propagating
+failure, preserving the exact "never abort map load over this" behavior the
+stub existed for. `VK_DrawGhoul2Entities`'s entity loop now branches on
+`ent.ghoul2` being empty to also handle a static-model entity, reusing the
+identical entity-matrix/push-constant/world-pipeline draw shape the Ghoul2
+branch already uses (`camPos[3]=1.0` - no baked lightmap here either, same
+reasoning as Ghoul2's own overbright fix above), just against one shared,
+static, device-local vertex/index buffer instead of a per-instance skin
+slot, since nothing about a static prop changes per draw.
+
+**Verified**: the cockpit interior - side walls, ceiling ribbing, dashboard
+with its screens and buttons, both seats - now renders, closely matching
+`rd-vanilla`'s composition for the same shot.
+
+**Bug 2 - a real, previously-unverified parser bug in the .shader
+`blendFunc` two-token path, discovered chasing a second, unrelated symptom
+in the same shot**: fixing the cockpit revealed the Twi'lek NPC's torso was
+still invisible (arms, hands, legs, head/hair all rendered correctly - only
+the torso region was missing), a *different* bug from the cockpit and from
+hoth2's original torso-shaped symptom. Traced it by instrumenting
+`VK_LoadGhoul2Model`'s per-surface image resolution: her torso surfaces
+correctly skin-override (via the real three-part composite skin path -
+`models/players/jedi_tf/|head_a1|torso_a1|lower_a1`, `VK_RegisterSkin`,
+verified working) to `models/players/jedi_tf/torso_01_clothes` and
+`..._skin`, both of which are pure indirection `.shader` scripts
+(`shaders/players.shader`: `{ map models/players/jedi_tf/torso_01
+blendFunc GL_ONE GL_ZERO ... }`, no matching `.tga`/`.jpg`/`.png` of their
+own) - exactly hoth2's category of bug, so the existing
+`VK_GetShaderBlendMode(...) == BLEND_OPAQUE` gated fallback was applied here
+too (`VK_LoadGhoul2Model`, mirroring `RE_LoadWorldMap`'s identical check).
+It didn't work. Direct instrumentation of `VK_GetShaderBlendMode` itself
+showed why: `models/players/jedi_tf/torso_01_clothes` was resolving to
+`BLEND_ALPHA`, not `BLEND_OPAQUE`, despite its `.shader` block reading
+`blendFunc GL_ONE GL_ZERO` in plain text - and so was *every other* explicit
+two-token `blendFunc` in the entire file, including ones on surfaces that
+happened to render fine anyway (because they had a real texture file
+`VK_FindImage` could find directly, never needing this fallback at all).
+
+The actual bug, in `ParseShaderFile` (`tr_shader.cpp`): `COM_ParseExt`
+returns a pointer into its own single shared static buffer (`com_token`),
+reused on every call - not a fresh allocation. The two-token `blendFunc`
+handling called it once for the first factor (`a`) and, in the same
+expression's evaluation, once more for the second (`b`), then passed both
+to `BlendFactorsToMode( a, b )` - but by the time that call happened, the
+second `COM_ParseExt` had already silently overwritten the buffer `a` still
+pointed at, so the comparison was really `BlendFactorsToMode( b, b )`.
+`GL_ZERO`+`GL_ZERO` matches neither the `GL_ONE`+`GL_ONE` (additive) nor
+`GL_ONE`+`GL_ZERO` (opaque) special case, so it fell through to the
+alpha-blend default every time - for any shader using this common
+`blendFunc <src> <dst>` two-argument form, regardless of what `<src>`/`<dst>`
+actually were. A shader with no `blendFunc` keyword at all (the
+default-opaque path, never entering this branch) was correctly unaffected -
+which is exactly why hoth2's earlier, similar-looking fix never exposed
+this: `textures/hoth/metal_lg_lt_vertex` (the shader that motivated it) has
+no `blendFunc` line at all. Fixed by copying the first token into a
+`std::string` before parsing the second, so it survives the aliasing.
+
+A second, smaller bug compounded this one for this specific case: the
+`.skin` file's own override line reads
+`torsoa,models/players/jedi_tf/torso_01_clothes.tga` - a `.tga` extension
+tacked onto what is actually a `.shader` block name, not a texture path.
+Real shader names never carry an extension, but `.skin` files are free to
+write one as if it were a plain texture reference, and real engines account
+for this: `rd-vanilla`'s actual `R_FindShader`/`R_FindShaderByName`
+(`tr_shader.cpp`) unconditionally `COM_StripExtension` the incoming name
+before comparing against defined shader names. This renderer's
+`VK_GetShaderBlendMode`/`VK_GetShaderFogParms`/`VK_GetShaderMapImage` did
+not, so they were being looked up by a name variant that never matched
+anything the parser had recorded. Fixed by adding
+`VK_StripShaderNameExtension` (a thin `COM_StripExtension` wrapper) and
+routing all three lookups through it before their map `find()`.
+
+**Verified**: the Twi'lek's torso now renders correctly in both
+`sp_vjun1_spawn` and `sp_hoth2_spawn` (the same `models/players/jedi_tf`
+model appears in both scenes - confirmed the fix isn't scene-specific).
+
+**The orange artifact - confirmed not a bug at all**: already established
+during the original hoth2-era investigation that it's real world BSP
+geometry, not a Ghoul2 rendering defect (disabling all Ghoul2 drawing
+entirely left it pixel-identical) - re-confirmed here rather than assumed.
+With the cockpit's own geometry now actually drawn and correctly occluding
+most of the background, what was previously a fullscreen wash is now a
+small sliver visible only through the cockpit's own side window: real
+distant terrain/rock texture (`textures/vjun/rocky_phong` and similar,
+confirmed the closest real BSP surfaces to that exact camera position
+besides the sky) showing through actual glass, the same way it would in any
+renderer, not a rendering defect. Not chased further as a separate issue.
+
+**Also retained in this same pass**: the `MAX_VK_WORLD_DESCRIPTOR_SETS` fix
+described in the investigation above - independently correct per the Vulkan
+spec (vjun1 alone needs 12833 world-surface-batch descriptor sets, far past
+the old `MAX_VK_IMAGES`-sized pool), even though it turned out not to be
+what was causing either of the two bugs actually found and fixed here.
+
+**Verified overall**: full SP scene suite
+(menu/academy1/hoth2/yavin1/vjun1) re-verified clean on both renderers after
+every change in this pass, including re-checking academy1 (the scene that
+previously caught the hoth2-era `BLEND_OPAQUE`-gate regression) and hoth2
+itself (to confirm the Ghoul2 image-resolution fallback and the shader
+extension-stripping fix don't reintroduce that regression from a different
+angle) - no crashes, no new warnings, no regressions.
 
 ## What's actually implemented
 
