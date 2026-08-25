@@ -193,13 +193,20 @@ struct PolyVertex
 };
 
 // Layout must match world.vert/world.frag's `layout(push_constant) uniform
-// PushConstants { mat4 mvp; vec4 camPos; vec4 fogColor; }`. A plain
-// column-major float[16] matches GLSL's mat4 layout directly (16-byte-
-// aligned columns); camPos/fogColor are already vec4-sized/aligned so no
-// padding trap there either. fogColor[3] doubles as the fog's "opaque"
+// PushConstants { mat4 mvp; vec4 camPos; vec4 fogColor; vec4 fogStart; }`. A
+// plain column-major float[16] matches GLSL's mat4 layout directly (16-byte-
+// aligned columns); camPos/fogColor/fogStart are already vec4-sized/aligned
+// so no padding trap there either. fogColor[3] doubles as the fog's "opaque"
 // distance (see VK_LoadWorldFog in tr_world.cpp) - 0 disables fog entirely
 // (the sky draw always passes 0 here; see RE_RenderScene), matching
-// world.frag's `if (fogColor.a > 0.0)` gate. camPos[3] similarly doubles as
+// world.frag's `if (fogColor.a > 0.0)` gate. fogStart[0] is the world-space
+// distance before which no fog applies at all (0 for the common case - fog
+// ramps in starting right at the camera, same behaviour as before this
+// field existed) - only nonzero when this batch's fog is the map's single
+// global one AND "ranged fog" is active (VK_SetRangedFog/a worldspawn
+// `linFogStart` key - see tr_world.cpp's own comment on s_rangedFog for
+// what that's for and why it's unverified against this renderer's own test
+// maps). fogStart[1..3] are unused padding. camPos[3] similarly doubles as
 // a per-draw overbright factor (world.frag's comment): 2.0 for real BSP
 // lightmapped world/sky geometry (baked assuming this doubling - Quake3's
 // "overbright bits"), 1.0 for Ghoul2 draws (tr_model.cpp), which are paired
@@ -215,6 +222,7 @@ struct vkWorldPushConstants_t
 	float mvp[16];
 	float camPos[4];
 	float fogColor[4];
+	float fogStart[4];
 };
 
 typedef struct
@@ -396,6 +404,13 @@ void VK_MultiplyMatrix( const float *a, const float *b, float *out );
 bool VK_HasWorldFog( void );
 void VK_GetWorldFogColor( float outColor[3] );
 void VK_SetWorldFogColor( const float color[3] );
+// Real implementation of the "ranged fog" API (RE_SetRangedFog, tr_init.cpp)
+// - see tr_world.cpp's own comment on s_rangedFog for the full picture
+// (a sniper-scope-style widening of the map's single global fog's near/far
+// transition, ported from rd-vanilla's real RE_SetRangedFog/
+// RB_IterateStagesGeneric) and why it's implemented but unverified against
+// any of this renderer's own test maps.
+void VK_SetRangedFog( float dist );
 
 // tr_model.cpp
 //

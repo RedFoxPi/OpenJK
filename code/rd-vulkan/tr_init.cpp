@@ -1448,7 +1448,10 @@ float R_GetChanceOfSaberFizz( void ) { return VK_GetChanceOfSaberFizz(); }
 bool R_IsShaking( vec3_t pos ) { return VK_IsShaking( pos ); }
 void R_AddWeatherZone( vec3_t mins, vec3_t maxs ) { VK_AddWeatherZone( mins, maxs ); }
 bool R_SetTempGlobalFogColor( vec3_t color ) { return VK_SetTempGlobalFogColor( color ); }
-void RE_SetRangedFog( float dist ) { (void)dist; }
+// Real implementation - tr_world.cpp's VK_SetRangedFog. See that function's
+// own declaration comment (tr_local.h) for what "ranged fog" is and why
+// it's implemented but unverified against this renderer's own test maps.
+void RE_SetRangedFog( float dist ) { VK_SetRangedFog( dist ); }
 
 void R_ScreenShotPNG_f( void );
 

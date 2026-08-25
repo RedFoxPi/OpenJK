@@ -220,13 +220,15 @@ frames:
   unchanged screenshot; vjun1 (one local + one global fog) correctly picks
   only the global one (`textures/fogs/vjun1`, not `fog_black`) and loads/
   runs/screenshots with no crash; a full clean rebuild is warning-free.
+  (Local fog volumes like vjun1's `fog_black` are no longer ignored - see
+  "Local fog volumes and ranged fog" below.)
   `RE_SetRangedFog`/`R_SetTempGlobalFogColor` (the *dynamic* fog API, used
   for scripted fog changes mid-level, e.g. weather-effect entities in
   `g_fx.cpp`) were still no-ops at the time of this fix - only the BSP's
   static, load-time global fog was implemented here.
-  (`R_SetTempGlobalFogColor` is real now - see "World weather/particle
-  effects" below; `RE_SetRangedFog`, a separate ranged/distance-scaling API
-  used by other callers, is still a stub.)
+  (Both are real now - `R_SetTempGlobalFogColor` since "World weather/
+  particle effects", `RE_SetRangedFog` since "Local fog volumes and ranged
+  fog", both below.)
 - A pixel diff against an `rd-vanilla` reference (same map, same camera, no
   special cvars now that lighting is real) is still a **`MAJOR_DIFF`, ~40%
   mean pixel difference**, and that's expected, not a regression to chase
@@ -2522,6 +2524,102 @@ ahead of time, and this port has no such cache to prime - every "is this
 point outside" query already goes straight to the live collision system
 regardless, so there's nothing left for the command to do.
 
+## Local fog volumes and ranged fog
+
+Following up on "World fog is now rendered" above, which only read a map's
+single *global* fog (BSP `LUMP_FOGS` entry with `brushNum == -1`) and
+applied it uniformly to every world surface regardless of what that surface
+actually compiled into - a real, if minor, inaccuracy: vjun1 ships a second,
+*local* fog (`textures/fogs/fog_black`, bound to brush 6685, a small
+interior region) that was being silently ignored, with every one of its
+surfaces incorrectly painted with the map's own tan/brown exterior global
+fog colour instead.
+
+**Root cause and fix**: `dsurface_t.fogNum` (an existing field this
+renderer had never read) already tells you, per-surface, exactly which
+`LUMP_FOGS` entry - global or local, or none at all - the map's own BSP
+compiler assigned that surface to. `VK_LoadWorldFog` (tr_world.cpp) now
+loads *every* `LUMP_FOGS` entry (previously it stopped at the first
+`brushNum == -1` one) into `s_worldFogs`, indexed exactly as the BSP itself
+indexes them, and `RE_LoadWorldMap`'s per-surface loop records each
+surface's own `fogNum` into a new `WorldSurfaceBatch::fogIndex`.
+`RE_RenderScene`'s draw loop then switches the push constant's fog colour/
+distance per-batch (the same "only re-issue when the value actually
+changes" pattern already used for `vertexLit`'s overbright factor, see
+"hoth2's overexposed terrain" above) instead of pushing one fog colour once
+for the whole scene. Verified this is a strict correctness improvement, not
+a rewrite of unrelated behaviour, by checking real BSP data directly:
+hoth2's *entire* 7421-surface map has every single surface's `fogNum`
+pointing at its one global fog - so per-surface lookup there is
+mathematically identical to the old blanket-apply behaviour, confirmed by
+byte-identical output on rebuild. vjun1's 13610 surfaces split
+13565/42/3 across its global fog / local `fog_black` / no fog at all - so
+this map is where the fix actually changes anything.
+
+**Deliberately does not re-derive a local fog's world-space bounds from its
+brush's planes** the way rd-vanilla's real `R_LoadFogs` does (reading the
+first 6 - always axial-first, by BSP convention - sides of the named brush
+to build an AABB, `tr_bsp.cpp`): since this renderer's fog is already a
+simplified per-vertex distance-from-camera ramp rather than a real signed-
+distance-to-boundary-plane test (see "World fog is now rendered" above), it
+never needs to ask "is this point inside the volume" at render time at all
+- trusting the compiler's own per-surface `fogNum` assignment is both
+sufficient and exactly what determines which surfaces get which fog's
+colour in real Quake3 too. Re-deriving brush geometry at load time would
+have been redundant work, not a more correct result.
+
+**Ranged fog** (`RE_SetRangedFog`, `tr_public.h`'s `refexport_t::
+SetRangedFog` - a real, separate cgame-called API, `cl_cgame.cpp:
+re.SetRangedFog(VMF(1))`, used for a sniper-scope-style widening of the
+fog's near/far transition) is wired to a real implementation too
+(`VK_SetRangedFog`, tr_world.cpp), an exact port of rd-vanilla's own
+`RE_SetRangedFog`/the `fStart`/`fEnd` half of `RB_IterateStagesGeneric`
+(`tr_shade.cpp`) - including its `g_oldRangedFog` save/restore quirk and a
+worldspawn `linFogStart` key (parsed once at map load, matching
+`tr_bsp.cpp`'s own key name and sign convention) as the other way real
+Quake3 sets it, a per-map "designer override" rather than a runtime call.
+A worldspawn `distanceCull` key is also parsed now (`s_distanceCull`,
+default 12000 - rd-vanilla's own real default), but **only** to feed this
+one formula - unlike rd-vanilla, it does not also change this renderer's
+own fixed projection `zFar` or view-frustum culling distance
+(`VK_BuildProjectionMatrix`'s 65536 constant is untouched, still documented
+separately) - a deliberately narrower scope than the real field's full
+reach. The world push constant gained a fourth `vec4` (`fogStart`, only
+`.x` used) so a batch's fog ramp can start somewhere other than distance 0
+from the camera without changing anything for the (default, common) case
+where it doesn't - `world.vert`/`world.frag` and `vkWorldPushConstants_t`
+all updated in lockstep, still comfortably under Vulkan's guaranteed
+minimum 128-byte push constant size (112 bytes used).
+
+**Verified real local-fog data loads correctly**: confirmed via this
+renderer's own load-time log line, not assumed - vjun1 logs both entries
+exactly matching `shaders/fogs.shader`'s real text: `loaded local fog
+'textures/fogs/fog_black' (brush 6685) colour (0.00 0.00 0.00) opaque dist
+3456` and `loaded global fog 'textures/fogs/vjun1' colour (0.74 0.59 0.39)
+opaque dist 5190`. Full SP scene suite (menu/academy1/hoth2/yavin1/vjun1)
+re-ran clean, no crashes, full rebuild warning-free. Pixel-diffed a build
+with this fix against one without it (same fresh binaries, same homepath
+setup, only `rd-vulkan_x86_64.so` swapped) rather than eyeballing a single
+run: academy1 and the main menu (no fog data at all) came back byte-
+identical, exactly as predicted; hoth2, yavin1, and vjun1 showed small
+(<0.6% mean) differences, but every one of them is fully accounted for by
+this renderer's own already-known sources of run-to-run noise, confirmed by
+looking at *where* the diff images actually highlight pixels, not just
+their percentage - randomly-scattered snow/rain particle positions
+(`tr_weather.cpp`'s unseeded `rand()`, see "World weather/particle
+effects" above) and sub-pixel NPC animation-timing edges, not a solid
+region taking on a new colour anywhere. **Not independently confirmed**:
+neither this project's four test maps' spawn-point camera framings happens
+to have vjun1's specific 42 `fog_black`-tagged surfaces in view, so the
+local-fog *colour* itself (as opposed to it loading correctly and the
+surrounding refactor being provably regression-free) hasn't been directly
+eyeballed. Ranged fog is implemented but **entirely unverified against real
+data** - confirmed by direct BSP entity-string parsing that none of the
+four test maps declare a `linFogStart` or `distanceCull` worldspawn key,
+and none of this renderer's static spawn-point screenshots would exercise
+a live `RE_SetRangedFog` call either - same honesty-over-false-confidence
+standard as `spacedust`/`sand` above.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -2654,13 +2752,16 @@ regardless, so there's nothing left for the command to do.
   bind-pose-only regardless of what the mesh is doing). See "Ghoul2 is not
   reused from rd-vanilla" below for why the animation system was a separate,
   larger task than the rest of this renderer.
-- `RE_SetRangedFog` (a separate ranged/distance-scaling fog API from the
-  weather system's own fog color override - see "World weather/particle
-  effects" below for that one, which *is* implemented) is still a stub.
-  Per-brush *local* fog volumes (a `LUMP_FOGS` entry with a real
-  `brushNum`, bounded to one convex region) are also still unimplemented -
-  only a map's single static *global* fog (see "3D world geometry" above)
-  is.
+- `RE_SetRangedFog`, `R_SetTempGlobalFogColor`, and per-brush *local* fog
+  volumes (a `LUMP_FOGS` entry with a real `brushNum`, bounded to one
+  convex region, e.g. vjun1's `fog_black`) are all real now - see "World
+  weather/particle effects" and "Local fog volumes and ranged fog" below.
+  Still missing: real per-brush volume bounds testing (this renderer trusts
+  the BSP compiler's own per-surface `fogNum` assignment instead - see that
+  section's own comment for why that's sufficient here) and the exact
+  EXP2/gradient-texture falloff curve rd-vanilla's real fog uses (a linear
+  distance ramp approximates it instead, same simplification as the base
+  global-fog work).
 - Dynamic lighting for world geometry (`AddLightToScene` is a stub) and
   vertex lighting/colors - only the map's precomputed, baked lightmap
   applies (see "3D world geometry" above). No shadows other than what's

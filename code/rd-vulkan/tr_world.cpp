@@ -43,6 +43,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "tr_local.h"
 #include <cmath>
 #include <cstring>
+#include <string>
 #include <vector>
 
 struct WorldSurfaceBatch
@@ -79,6 +80,19 @@ struct WorldSurfaceBatch
 	// read or applied at all, only the erroneous doubling is removed - see
 	// README.md.
 	bool vertexLit;
+	// This surface's own dsurface_t.fogNum (see VK_LoadWorldFog), or -1 for
+	// "not in any fog volume" - an index into s_worldFogs, not a bool/single
+	// shared flag, since a map can carry more than one fog (a global one
+	// plus any number of local per-brush ones, e.g. vjun1's ship-interior
+	// `fog_black`) and different surfaces can each be in a different one,
+	// or none at all. Matches rd-vanilla's own per-surface fogIndex exactly
+	// - see VK_LoadWorldFog's comment for why trusting the BSP compiler's
+	// own assignment here (rather than re-deriving "which fog volume is
+	// this surface in" at runtime) is both simpler and more correct than
+	// this renderer's previous behaviour of blanket-applying one global fog
+	// to literally every surface regardless of what it was actually
+	// compiled to be in.
+	int fogIndex;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -109,15 +123,61 @@ static VkBuffer s_skyIndexBuffer = VK_NULL_HANDLE;
 static VkDeviceMemory s_skyIndexBufferMemory = VK_NULL_HANDLE;
 static bool s_skyLoaded = false;
 
-// World fog (see VK_LoadWorldFog) - this renderer only supports one global
-// fog volume per map (BSP LUMP_FOGS entries with brushNum == -1, matching
+// World fog (see VK_LoadWorldFog) - one entry per BSP LUMP_FOGS record,
+// indexed directly by dsurface_t.fogNum (WorldSurfaceBatch::fogIndex),
+// covering both the map's single global fog (a brushNum == -1 entry,
 // rd-vanilla's own R_LoadFogs/worldData.globalFog convention - see
-// tr_bsp.cpp), applied uniformly to all world geometry. Per-brush local fog
-// volumes (a fog entry with a real brushNum) are not implemented - see
+// tr_bsp.cpp) and any number of per-brush local fog volumes. opaqueDist of
+// 0 means this entry's shader had no real `fogparms` (or wasn't found) -
+// treated as "no fog" for any surface that references it, same as an
+// unassigned (-1) fogIndex.
+struct WorldFogEntry
+{
+	float color[3];
+	float opaqueDist;
+};
+static std::vector<WorldFogEntry> s_worldFogs;
+// Index into s_worldFogs for this map's single global fog, or -1 if it has
+// none - kept separately since VK_HasWorldFog/GetWorldFogColor/
+// SetWorldFogColor (tr_weather.cpp's fog-colour-override API) and "ranged
+// fog" (VK_SetRangedFog below) both only ever apply to the map's own single
+// global fog specifically, never a local one, matching rd-vanilla's real
+// tr.world->globalFog-scoped behaviour exactly.
+static int s_globalFogIndex = -1;
+
+// "Ranged fog" - a sniper-scope-style widening of the global fog's near/far
+// transition distance, ported from rd-vanilla's real RE_SetRangedFog
+// (tr_init.cpp) and the fStart/fEnd computation inside
+// RB_IterateStagesGeneric (tr_shade.cpp) that consumes it. Real Quake3 fogs
+// with an EXP2 (exponential-squared) curve by default and only switches to
+// this LINEAR fStart/fEnd model while ranged fog is active - this renderer
+// already uses a simplified linear ramp unconditionally (see world.vert's
+// own comment), so "ranged fog" here just means shifting that ramp's start
+// point away from 0 rather than switching curve shape. Two ways this gets
+// set, both ported faithfully: a worldspawn `linFogStart` key (parsed once
+// at map load, VK_LoadWorldspawnFogKeys - stored negated, matching
+// rd-vanilla's own sign convention for "this specific value is a mapper
+// override" vs. a positive value from the API call below) and
+// VK_SetRangedFog itself (a real caller: cgame's zoom/scope code via
+// RE_SetRangedFog, tr_init.cpp). Confirmed by direct BSP entity-string
+// parsing that none of this renderer's four test maps declare a
+// `linFogStart` key, and none of the static spawn-point screenshots this
+// renderer is verified against would exercise a live call to
+// VK_SetRangedFog either - implemented by reading rd-vanilla's real source
+// faithfully, but genuinely unverified against real map/gameplay data. See
 // README.md.
-static bool s_worldFogEnabled = false;
-static float s_worldFogColor[3];
-static float s_worldFogOpaqueDist;
+static float s_rangedFog = 0.0f;
+static float s_oldRangedFog = 0.0f; // exact port of rd-vanilla's g_oldRangedFog save/restore quirk
+// rd-vanilla's own real default (tr_bsp.cpp) before any worldspawn
+// `distanceCull` key is read - used here only by the ranged-fog formula
+// above, NOT to also change this renderer's own fixed projection zFar or
+// view-frustum culling distance the way rd-vanilla's real tr.distanceCull
+// does elsewhere (VK_BuildProjectionMatrix's zFar is a separate, already-
+// documented constant - see that function's own comment) - a narrower
+// scope than the real field, deliberately: this pass only implements
+// distanceCull's effect on ranged fog, not the (much larger, unrelated)
+// change to expand it into this renderer's culling/projection code too.
+static float s_distanceCull = 12000.0f;
 
 static void VK_DestroyWorldImage( image_t *img )
 {
@@ -144,7 +204,11 @@ void VK_ShutdownWorld( void )
 	if ( s_skyIndexBufferMemory ) { vkFreeMemory( vk.device, s_skyIndexBufferMemory, nullptr ); s_skyIndexBufferMemory = VK_NULL_HANDLE; }
 	s_skyFaces.clear();
 	s_skyLoaded = false;
-	s_worldFogEnabled = false;
+	s_worldFogs.clear();
+	s_globalFogIndex = -1;
+	s_rangedFog = 0.0f;
+	s_oldRangedFog = 0.0f;
+	s_distanceCull = 12000.0f;
 	// Descriptor sets allocated per-batch below come from this pool, not
 	// individually tracked - reclaim them all at once rather than freeing
 	// one by one (vk.worldDescriptorPool wasn't created with
@@ -387,10 +451,10 @@ static void VK_LoadSky( const char *baseName )
 		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 2 ); cpuIndexes.push_back( vertBase + 3 );
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, faces[axis], s_whiteLightmap );
-		// vertexLit is meaningless here - the sky draw loop uses its own
-		// dedicated push constants (camPos.w=1.0), never s_worldSurfaces'
-		// per-batch value.
-		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 }, false } );
+		// vertexLit/fogIndex are meaningless here - the sky draw loop uses its
+		// own dedicated push constants (camPos.w=1.0, fogColor.a=0), never
+		// s_worldSurfaces' per-batch values.
+		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 }, false, -1 } );
 	}
 
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
@@ -403,42 +467,155 @@ static void VK_LoadSky( const char *baseName )
 		allFacesFound ? "" : " (using flat fallback colour, real faces not found)" );
 }
 
-// Loads this map's global fog volume, if any - the BSP's LUMP_FOGS entry
-// with brushNum == -1 (rd-vanilla's own R_LoadFogs/tr_bsp.cpp convention for
-// "not bounded to a specific brush, covers the whole map" - confirmed by
-// reading that function directly, not guessed), naming a shader whose
-// fogparms line gives the actual colour/opaque distance (see
-// VK_GetShaderFogParms, tr_shader.cpp). Per-brush local fog volumes (a fog
-// entry with a real brushNum, bounded to one convex region) are not
-// implemented - see README.md; this renderer only supports one fog, applied
-// uniformly to the whole world, which is the common case for outdoor/
-// weather levels like hoth2 that wrap the entire map in one fog brush.
+// Loads every one of this map's BSP LUMP_FOGS entries - both its single
+// global fog (brushNum == -1, rd-vanilla's own R_LoadFogs/tr_bsp.cpp
+// convention for "not bounded to a specific brush, covers the whole map" -
+// confirmed by reading that function directly, not guessed) and any number
+// of per-brush local fog volumes (a real brushNum, bounded to one convex
+// region - e.g. vjun1's ship-interior `textures/fogs/fog_black`) - into
+// s_worldFogs, indexed exactly as the BSP itself indexes them so
+// dsurface_t.fogNum (WorldSurfaceBatch::fogIndex, set per-surface below in
+// RE_LoadWorldMap) can look an entry up directly with no remapping needed.
+//
+// Deliberately does NOT re-derive a local fog's world-space bounds from its
+// brush's planes the way rd-vanilla's real R_LoadFogs does (bounds[0]/
+// bounds[1], read off the brush's first 6 - always axial-first by
+// convention - sides): this renderer's fog is a simplified per-vertex
+// distance-from-camera ramp (see world.vert's own comment), not a
+// signed-distance-to-boundary-plane test, so it never needs to ask "is this
+// point inside the volume" at draw time at all - trusting the BSP
+// compiler's own per-surface fogNum assignment (confirmed by direct BSP
+// parsing: every one of a map's surfaces already carries the fogNum of
+// whichever single fog volume, local or global, it was compiled into) is
+// both sufficient and exactly what determines which surfaces get fogged
+// with which fog's colour in real Quake3 too - re-deriving that from brush
+// geometry at load time would be redundant, not more correct.
 static void VK_LoadWorldFog( const byte *fogData, int fogDataLen )
 {
 	int numFogs = fogDataLen / (int)sizeof( dfog_t );
 	const dfog_t *fogs = (const dfog_t *)fogData;
 
+	s_worldFogs.assign( (size_t)numFogs, WorldFogEntry{ { 0.0f, 0.0f, 0.0f }, 0.0f } );
+
 	for ( int i = 0; i < numFogs; i++ )
 	{
-		if ( fogs[i].brushNum != -1 )
+		float color[3];
+		float opaqueDist;
+		if ( !VK_GetShaderFogParms( fogs[i].shader, color, &opaqueDist ) )
 		{
 			continue;
 		}
+		s_worldFogs[i].color[0] = color[0];
+		s_worldFogs[i].color[1] = color[1];
+		s_worldFogs[i].color[2] = color[2];
+		s_worldFogs[i].opaqueDist = opaqueDist;
 
-		float color[3];
-		float opaqueDist;
-		if ( VK_GetShaderFogParms( fogs[i].shader, color, &opaqueDist ) )
+		if ( fogs[i].brushNum == -1 )
 		{
-			s_worldFogColor[0] = color[0];
-			s_worldFogColor[1] = color[1];
-			s_worldFogColor[2] = color[2];
-			s_worldFogOpaqueDist = opaqueDist;
-			s_worldFogEnabled = true;
+			s_globalFogIndex = i;
 			ri.Printf( PRINT_ALL, "rd-vulkan: loaded global fog '%s' colour (%.2f %.2f %.2f) opaque dist %.0f\n",
 				fogs[i].shader, color[0], color[1], color[2], opaqueDist );
 		}
-		return; // rd-vanilla's own R_LoadFogs only allows one global fog per map
+		else
+		{
+			ri.Printf( PRINT_ALL, "rd-vulkan: loaded local fog '%s' (brush %d) colour (%.2f %.2f %.2f) opaque dist %.0f\n",
+				fogs[i].shader, fogs[i].brushNum, color[0], color[1], color[2], opaqueDist );
+		}
 	}
+}
+
+// Parses the map's worldspawn entity (BSP LUMP_ENTITIES's first entity
+// block is always worldspawn - same convention rd-vanilla's own
+// R_LoadEntities/tr_bsp.cpp relies on) for the two keys that feed this
+// renderer's "ranged fog" - see s_rangedFog's own comment above for what
+// that is and why it's implemented but unverified. `entityString` must be
+// null-terminated - callers should NOT hand this the raw BSP lump pointer
+// directly (the file continues past the lump's end with unrelated binary
+// data, not guaranteed to be null-terminated at the boundary).
+static void VK_LoadWorldspawnFogKeys( const char *entityString )
+{
+	s_distanceCull = 12000.0f;
+	s_rangedFog = 0.0f;
+	s_oldRangedFog = 0.0f;
+
+	const char *text = entityString;
+	COM_BeginParseSession();
+	const char *token = COM_ParseExt( &text, qtrue );
+	if ( strcmp( token, "{" ) != 0 )
+	{
+		COM_EndParseSession();
+		return;
+	}
+	for ( ;; )
+	{
+		token = COM_ParseExt( &text, qtrue );
+		if ( !token[0] || !strcmp( token, "}" ) )
+		{
+			break;
+		}
+		char key[MAX_QPATH];
+		Q_strncpyz( key, token, sizeof( key ) );
+		token = COM_ParseExt( &text, qtrue );
+		if ( !token[0] )
+		{
+			break;
+		}
+		if ( !Q_stricmp( key, "distanceCull" ) )
+		{
+			s_distanceCull = (float)atof( token );
+		}
+		else if ( !Q_stricmp( key, "linFogStart" ) )
+		{
+			s_rangedFog = -(float)atof( token );
+		}
+	}
+	COM_EndParseSession();
+}
+
+void VK_SetRangedFog( float dist )
+{
+	if ( s_rangedFog <= 0.0f )
+	{
+		s_oldRangedFog = s_rangedFog;
+	}
+	s_rangedFog = dist;
+	if ( s_rangedFog == 0.0f && s_oldRangedFog )
+	{
+		s_rangedFog = s_oldRangedFog;
+	}
+}
+
+// Returns the world-space distance before which fog should not apply yet
+// (world.frag's fogStart.x) for one batch's fog - 0 (the common case, ramp
+// starts right at the camera) unless this batch is in the map's single
+// global fog AND ranged fog is active, exact port of the fStart half of
+// rd-vanilla's real RB_IterateStagesGeneric (tr_shade.cpp) - see
+// s_rangedFog's own comment for the full picture and why it's unverified.
+static float VK_ComputeRangedFogStart( int fogIndex, float opaqueDist )
+{
+	if ( fogIndex != s_globalFogIndex || s_rangedFog == 0.0f )
+	{
+		return 0.0f;
+	}
+	float fStart = opaqueDist;
+	if ( s_rangedFog < 0.0f )
+	{
+		fStart = -s_rangedFog;
+		float fEnd = opaqueDist;
+		if ( fStart >= fEnd )
+		{
+			fStart = fEnd - 1.0f;
+		}
+	}
+	else if ( ( s_distanceCull - fStart ) < s_rangedFog )
+	{
+		fStart = s_distanceCull - s_rangedFog;
+		if ( fStart < 16.0f )
+		{
+			fStart = 16.0f;
+		}
+	}
+	return fStart;
 }
 
 // Fixed subdivision level for MST_PATCH tessellation (see VK_TessellatePatchQuad
@@ -568,6 +745,11 @@ void RE_LoadWorldMap( const char *name )
 
 	VK_LoadLightmaps( lumpData( LUMP_LIGHTMAPS ), header->lumps[LUMP_LIGHTMAPS].filelen );
 	VK_LoadWorldFog( lumpData( LUMP_FOGS ), header->lumps[LUMP_FOGS].filelen );
+	// std::string, not the raw lump pointer directly - see
+	// VK_LoadWorldspawnFogKeys' own comment on why it needs a guaranteed
+	// null terminator.
+	std::string entityLumpStr( (const char *)lumpData( LUMP_ENTITIES ), (size_t)header->lumps[LUMP_ENTITIES].filelen );
+	VK_LoadWorldspawnFogKeys( entityLumpStr.c_str() );
 
 	// This renderer doesn't parse .shader `skyparms` (see README.md's notes
 	// on .shader script scope), so it uses the sky-flagged shader's own name
@@ -704,6 +886,16 @@ void RE_LoadWorldMap( const char *name )
 			lightmap = s_lightmapImages[lightmapNum];
 		}
 
+		// dsurface_t.fogNum directly indexes s_worldFogs (see VK_LoadWorldFog's
+		// comment) - -1 means "not in any fog volume", and an out-of-range or
+		// opaqueDist==0 entry (shader had no real fogparms) is treated the
+		// same way, so RE_RenderScene only ever needs to check fogIndex >= 0.
+		int fogIndex = -1;
+		if ( surf.fogNum >= 0 && (size_t)surf.fogNum < s_worldFogs.size() && s_worldFogs[surf.fogNum].opaqueDist > 0.0f )
+		{
+			fogIndex = surf.fogNum;
+		}
+
 		uint32_t firstIndex = (uint32_t)cpuIndexes.size();
 		// AABB from the generated/surface vertex range, for view-frustum
 		// culling in RE_RenderScene - cheap to compute once here vs.
@@ -766,7 +958,7 @@ void RE_LoadWorldMap( const char *name )
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
-			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0 } );
+			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1043,13 +1235,12 @@ void RE_RenderScene( const refdef_t *fd )
 	// below for vertex-lit surfaces (WorldSurfaceBatch::vertexLit's
 	// comment).
 	worldPush.camPos[3] = 2.0f; // overbright factor - see world.frag's comment
-	if ( s_worldFogEnabled )
-	{
-		worldPush.fogColor[0] = s_worldFogColor[0];
-		worldPush.fogColor[1] = s_worldFogColor[1];
-		worldPush.fogColor[2] = s_worldFogColor[2];
-		worldPush.fogColor[3] = s_worldFogOpaqueDist;
-	}
+	// fogColor/fogStart left zeroed (no fog) here - each batch's own fog
+	// assignment, or lack of one, is applied per-batch in the draw loop
+	// below via batch.fogIndex, matching real Quake3's per-surface
+	// dsurface_t.fogNum rather than blanket-applying one fog to the whole
+	// world regardless of what each surface actually compiled into (see
+	// WorldSurfaceBatch::fogIndex's comment).
 	vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		0, sizeof( worldPush ), &worldPush );
 
@@ -1064,12 +1255,14 @@ void RE_RenderScene( const refdef_t *fd )
 	int culledCount = 0;
 
 	// worldPush.camPos[3] (overbright factor) already holds the common case
-	// (2.0, real baked lightmaps) from the push issued above this loop -
-	// only re-issue it for the less common vertex-lit batches, and again
-	// when switching back, rather than pushing per-batch unconditionally.
-	// See WorldSurfaceBatch::vertexLit's comment for why they can't share
-	// that same factor.
+	// (2.0, real baked lightmaps) from the push issued above this loop, and
+	// fogColor/fogStart already hold "no fog" (all zero) - only re-issue the
+	// push when a batch's vertexLit or fogIndex actually differs from the
+	// last one drawn, rather than unconditionally per-batch. See
+	// WorldSurfaceBatch::vertexLit/fogIndex's own comments for why they
+	// can't just share one fixed value across the whole draw.
 	bool currentPushIsVertexLit = false;
+	int currentFogIndex = -1;
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
 		if ( VK_AABBOutsideFrustum( batch.mins, batch.maxs, frustumPlanes ) )
@@ -1077,10 +1270,25 @@ void RE_RenderScene( const refdef_t *fd )
 			culledCount++;
 			continue;
 		}
-		if ( batch.vertexLit != currentPushIsVertexLit )
+		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex )
 		{
 			currentPushIsVertexLit = batch.vertexLit;
+			currentFogIndex = batch.fogIndex;
 			worldPush.camPos[3] = currentPushIsVertexLit ? 1.0f : 2.0f;
+			if ( currentFogIndex >= 0 )
+			{
+				const WorldFogEntry &fog = s_worldFogs[currentFogIndex];
+				worldPush.fogColor[0] = fog.color[0];
+				worldPush.fogColor[1] = fog.color[1];
+				worldPush.fogColor[2] = fog.color[2];
+				worldPush.fogColor[3] = fog.opaqueDist;
+				worldPush.fogStart[0] = VK_ComputeRangedFogStart( currentFogIndex, fog.opaqueDist );
+			}
+			else
+			{
+				worldPush.fogColor[0] = worldPush.fogColor[1] = worldPush.fogColor[2] = worldPush.fogColor[3] = 0.0f;
+				worldPush.fogStart[0] = 0.0f;
+			}
 			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				0, sizeof( worldPush ), &worldPush );
 		}
@@ -1128,23 +1336,33 @@ void RE_RenderScene( const refdef_t *fd )
 
 // Used only by tr_weather.cpp's VK_SetTempGlobalFogColor - see that
 // function's own comment (tr_local.h) for why weather needs to reach into
-// this file's fog state via accessors instead of touching s_worldFogColor/
-// s_worldFogEnabled directly.
+// this file's fog state via accessors instead of touching s_worldFogs
+// directly. All three only ever look at the map's single global fog
+// (s_globalFogIndex), matching rd-vanilla's own tr.world->globalFog-scoped
+// behaviour - a local fog volume's colour is never overridden by this.
 bool VK_HasWorldFog( void )
 {
-	return s_worldFogEnabled;
+	return s_globalFogIndex >= 0;
 }
 
 void VK_GetWorldFogColor( float outColor[3] )
 {
-	outColor[0] = s_worldFogColor[0];
-	outColor[1] = s_worldFogColor[1];
-	outColor[2] = s_worldFogColor[2];
+	if ( s_globalFogIndex < 0 )
+	{
+		return;
+	}
+	outColor[0] = s_worldFogs[s_globalFogIndex].color[0];
+	outColor[1] = s_worldFogs[s_globalFogIndex].color[1];
+	outColor[2] = s_worldFogs[s_globalFogIndex].color[2];
 }
 
 void VK_SetWorldFogColor( const float color[3] )
 {
-	s_worldFogColor[0] = color[0];
-	s_worldFogColor[1] = color[1];
-	s_worldFogColor[2] = color[2];
+	if ( s_globalFogIndex < 0 )
+	{
+		return;
+	}
+	s_worldFogs[s_globalFogIndex].color[0] = color[0];
+	s_worldFogs[s_globalFogIndex].color[1] = color[1];
+	s_worldFogs[s_globalFogIndex].color[2] = color[2];
 }

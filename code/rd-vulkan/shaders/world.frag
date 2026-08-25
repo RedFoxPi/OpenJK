@@ -12,6 +12,7 @@ layout(push_constant) uniform PushConstants {
     mat4 mvp;
     vec4 camPos;
     vec4 fogColor; // rgb = fog colour, a = opaque distance (0 = no fog)
+    vec4 fogStart; // x = distance before which no fog applies (see below)
 } pc;
 
 void main() {
@@ -35,13 +36,20 @@ void main() {
     vec3 shaded = diffuse.rgb * lightmap.rgb * pc.camPos.w;
 
     // World fog (see VK_LoadWorldFog, tr_world.cpp) - a simplified linear
-    // distance ramp toward the BSP's global fogparms colour, see world.vert
-    // for why this isn't rd-vanilla's exact falloff curve. fogColor.a == 0
-    // means no fog volume in this map (or this is the sky draw, which
+    // distance ramp toward this batch's own assigned fog's colour (global
+    // or local, see WorldSurfaceBatch::fogIndex), see world.vert for why
+    // this isn't rd-vanilla's exact falloff curve. fogColor.a == 0 means
+    // this batch isn't in any fog volume (or this is the sky draw, which
     // always passes 0 - see RE_RenderScene) - skip the mix entirely rather
-    // than mixing by a meaningless factor of 0.
+    // than mixing by a meaningless factor of 0. fogStart.x shifts where the
+    // ramp begins away from the camera (0 in the common case - see
+    // VK_ComputeRangedFogStart, tr_world.cpp); guard the divide since a
+    // pathological fogStart.x >= fogColor.a would otherwise divide by a
+    // non-positive span (CPU side already clamps this, this is just
+    // defense in depth against a mismatched push).
     if (pc.fogColor.a > 0.0) {
-        float fogFactor = clamp(fragFogDist / pc.fogColor.a, 0.0, 1.0);
+        float span = max(pc.fogColor.a - pc.fogStart.x, 1.0);
+        float fogFactor = clamp((fragFogDist - pc.fogStart.x) / span, 0.0, 1.0);
         shaded = mix(shaded, pc.fogColor.rgb, fogFactor);
     }
 
