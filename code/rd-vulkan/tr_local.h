@@ -309,6 +309,21 @@ typedef struct
 	// by anything; ordinary depth-tested world geometry drawn afterward
 	// naturally overdraws it wherever real geometry exists.
 	VkPipeline skyPipeline = VK_NULL_HANDLE;
+	// Same layout/vertex format/shaders as worldPipeline - only the blend
+	// state and depth-write differ, matching vk.polyPipeline/
+	// polyPipelineAdditive's reasoning exactly: Vulkan bakes blend factors
+	// into the pipeline, so a per-surface .shader blendFunc (see
+	// WorldSurfaceBatch::blendMode, tr_world.cpp) needs a distinct
+	// VkPipeline, selected per-batch in RE_RenderScene the same way
+	// vertexLit/fogIndex/scroll already are. Depth-tested against opaque
+	// geometry (so a translucent surface is still occluded by a wall in
+	// front of it) but doesn't write depth itself - the common, simple
+	// approximation for translucent geometry this renderer already uses
+	// for runtime polys (vk.polyPipeline's own comment), not per-shader
+	// real depth-write control or back-to-front sorting between
+	// translucent surfaces.
+	VkPipeline worldPipelineAlpha = VK_NULL_HANDLE;    // BLEND_ALPHA
+	VkPipeline worldPipelineAdditive = VK_NULL_HANDLE; // BLEND_ADDITIVE
 	VkSampler worldSampler = VK_NULL_HANDLE;
 	// Separate pool, same vk.worldDescriptorSetLayout/vk.worldSampler -
 	// Ghoul2 model descriptor sets (tr_model.cpp) must NOT come from
@@ -558,7 +573,13 @@ bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex );
 // README.md. Does NOT implement multi-stage compositing, any other tcMod
 // type, rgbGen/alphaGen waves, sky, or anything beyond that.
 void VK_LoadShaderScripts( void );
-vkBlendMode_t VK_GetShaderBlendMode( const char *name );
+// notFoundDefault only applies when `name` has no `.shader` script block at
+// all (a bare texture reference, the common case for ordinary wall/floor
+// textures) - see this function's own comment (tr_shader.cpp) for why the
+// 2D UI path (RE_StretchPic, its default caller) and 3D world geometry
+// (RE_LoadWorldMap, tr_world.cpp) need genuinely different defaults for
+// that specific case, not just different callers of the same answer.
+vkBlendMode_t VK_GetShaderBlendMode( const char *name, vkBlendMode_t notFoundDefault = BLEND_ALPHA );
 bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist );
 // See this function's own comment (tr_shader.cpp) for what's actually
 // supported (just `scroll`) and the real test case that motivated it.

@@ -41,6 +41,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "../server/exe_headers.h"
 
 #include "tr_local.h"
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -75,10 +76,11 @@ struct WorldSurfaceBatch
 	// of leaving it alone, blowing every vertex-lit surface out to solid
 	// white and erasing its own texture detail. A real, confirmed bug (a
 	// user directly compared hoth2's terrain against rd-vanilla's textured,
-	// non-blown-out version of the same ground). Not a full fix - real
-	// per-vertex `rgbGen vertex` colour (drawVert_t::color) still isn't
-	// read or applied at all, only the erroneous doubling is removed - see
-	// README.md.
+	// non-blown-out version of the same ground). Real per-vertex `rgbGen
+	// vertex` colour (drawVert_t::color) is applied now too, for these same
+	// vertex-lit surfaces specifically - see "Real per-vertex colour for
+	// vertex-lit surfaces" in README.md and WorldVertex::color's own
+	// comment (tr_local.h).
 	bool vertexLit;
 	// This surface's own dsurface_t.fogNum (see VK_LoadWorldFog), or -1 for
 	// "not in any fog volume" - an index into s_worldFogs, not a bool/single
@@ -103,6 +105,19 @@ struct WorldSurfaceBatch
 	// batches sharing the same speed still share one push-constant update
 	// per frame (same pattern as vertexLit/fogIndex above).
 	float scrollS, scrollT;
+	// This surface's shader's first-stage blend mode (VK_GetShaderBlendMode,
+	// tr_shader.cpp) - determines which of vk.worldPipeline/
+	// worldPipelineAlpha/worldPipelineAdditive draws this batch (see
+	// RE_RenderScene). Confirmed against real map data, not assumed: many
+	// real, currently-visible surfaces across all four test maps declare a
+	// non-opaque first stage (hoth2's `textures/flares/solid_blue`, 283
+	// surfaces; yavin1's `textures/yavin/tree1` foliage, 24 surfaces; and
+	// others) but were previously drawn through the single opaque pipeline
+	// regardless, since this field didn't exist to tell RE_RenderScene
+	// otherwise. s_worldSurfaces is sorted by this field after loading
+	// (opaque batches first, so translucent ones draw depth-tested against
+	// them) - see RE_LoadWorldMap's own sort call.
+	vkBlendMode_t blendMode;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -466,10 +481,11 @@ static void VK_LoadSky( const char *baseName )
 		cpuIndexes.push_back( vertBase + 0 ); cpuIndexes.push_back( vertBase + 2 ); cpuIndexes.push_back( vertBase + 3 );
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, faces[axis], s_whiteLightmap );
-		// vertexLit/fogIndex/scroll are meaningless here - the sky draw loop
-		// uses its own dedicated push constants (camPos.w=1.0, fogColor.a=0,
-		// no scroll), never s_worldSurfaces' per-batch values.
-		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 }, false, -1, 0.0f, 0.0f } );
+		// vertexLit/fogIndex/scroll/blendMode are meaningless here - the sky
+		// draw loop uses its own dedicated push constants (camPos.w=1.0,
+		// fogColor.a=0, no scroll) and always vk.skyPipeline, never
+		// s_worldSurfaces' per-batch values.
+		s_skyFaces.push_back( { descriptorSet, firstIndex, 6u, { 0, 0, 0 }, { 0, 0, 0 }, false, -1, 0.0f, 0.0f, BLEND_OPAQUE } );
 	}
 
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
@@ -884,12 +900,21 @@ void RE_LoadWorldMap( const char *name )
 			// stages-only effect shader (fog/dust volumes, decals) built
 			// entirely from its stages' own `map` references in a way this
 			// renderer doesn't parse for world geometry (see README.md).
-			// Those are usually explicitly translucent (surfaceparm trans/
-			// nonopaque) and this renderer has no blend pipeline for world
-			// geometry yet (see VK_CreateWorldPipeline), so drawing them as
-			// an *opaque* quad is actively wrong, not just imprecise. Skip
-			// the surface instead, same "invisible beats wrong" call as the
-			// RE_RegisterShaderNoMip videologo fix in tr_image.cpp.
+			// This renderer DOES have real blend pipelines for world
+			// geometry now (see WorldSurfaceBatch::blendMode,
+			// VK_CreateWorldPipeline) - the OPAQUE-only gate here stayed
+			// deliberately narrower than that even so, after checking real
+			// shaders that would otherwise take this path: several
+			// (`textures/common/env_glass`, `.../glass_security_hex`) use
+			// `tcGen environment` on their first stage - a reflection-vector
+			// UV generation mode this renderer doesn't implement at all - so
+			// resolving their fallback `map` and sampling it with the
+			// surface's own baked UV would render an actively wrong static
+			// texture, not a translucent glass look. Left unresolved rather
+			// than drawn wrong, same "invisible beats wrong" call as the
+			// RE_RegisterShaderNoMip videologo fix in tr_image.cpp - a
+			// distinct, still-open gap from the "no blend pipeline at all"
+			// one this comment used to describe.
 			if ( VK_GetShaderBlendMode( shaders[surf.shaderNum].shader ) == BLEND_OPAQUE )
 			{
 				const char *mapImage = VK_GetShaderMapImage( shaders[surf.shaderNum].shader );
@@ -946,6 +971,15 @@ void RE_LoadWorldMap( const char *name )
 		// never declare a tcMod scroll at all.
 		float scrollS = 0.0f, scrollT = 0.0f;
 		VK_GetShaderTcModScroll( shaders[surf.shaderNum].shader, &scrollS, &scrollT );
+
+		// BLEND_OPAQUE, not VK_GetShaderBlendMode's own default
+		// (BLEND_ALPHA, correct for the 2D UI path's bare-image case) - a
+		// shader with no `.shader` script at all is the common case for an
+		// ordinary wall/floor texture and must stay opaque, matching real
+		// Quake3's own implicit-shader behaviour for world geometry. See
+		// WorldSurfaceBatch::blendMode's own comment for the real surfaces
+		// this affects.
+		vkBlendMode_t blendMode = VK_GetShaderBlendMode( shaders[surf.shaderNum].shader, BLEND_OPAQUE );
 
 		uint32_t firstIndex = (uint32_t)cpuIndexes.size();
 		// AABB from the generated/surface vertex range, for view-frustum
@@ -1010,7 +1044,7 @@ void RE_LoadWorldMap( const char *name )
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
-			scrollS, scrollT } );
+			scrollS, scrollT, blendMode } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1020,6 +1054,25 @@ void RE_LoadWorldMap( const char *name )
 		ri.Printf( PRINT_WARNING, "rd-vulkan: RE_LoadWorldMap: %s has no drawable static surfaces\n", name );
 		return;
 	}
+
+	// Opaque batches first, then alpha, then additive - so RE_RenderScene's
+	// single pass over s_worldSurfaces naturally draws all opaque geometry
+	// (depth write on) before any translucent batch is depth-tested against
+	// it, switching vk.worldPipeline/worldPipelineAlpha/worldPipelineAdditive
+	// at most twice per frame rather than per-batch. A stable sort, not a
+	// full depth sort between translucent surfaces themselves - see
+	// vkGlobals_t::worldPipelineAlpha's own comment (tr_local.h) for why
+	// that's an accepted simplification here, same as this renderer's
+	// existing runtime-poly rendering. Reordering s_worldSurfaces itself is
+	// safe: each batch's firstIndex/indexCount are offsets into the shared
+	// vertex/index buffers uploaded below, independent of this vector's own
+	// order.
+	std::stable_sort( s_worldSurfaces.begin(), s_worldSurfaces.end(),
+		[]( const WorldSurfaceBatch &a, const WorldSurfaceBatch &b )
+		{
+			auto rank = []( vkBlendMode_t m ) { return m == BLEND_OPAQUE ? 0 : ( m == BLEND_ALPHA ? 1 : 2 ); };
+			return rank( a.blendMode ) < rank( b.blendMode );
+		} );
 
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
 		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &s_worldVertexBuffer, &s_worldVertexBufferMemory );
@@ -1327,6 +1380,16 @@ void RE_RenderScene( const refdef_t *fd )
 		{
 			culledCount++;
 			continue;
+		}
+		// s_worldSurfaces is sorted by blend mode (RE_LoadWorldMap), so this
+		// switches at most twice per frame in practice, not per-batch - see
+		// WorldSurfaceBatch::blendMode's own comment.
+		VkPipeline pipeline = ( batch.blendMode == BLEND_ALPHA ) ? vk.worldPipelineAlpha
+			: ( batch.blendMode == BLEND_ADDITIVE ) ? vk.worldPipelineAdditive : vk.worldPipeline;
+		if ( pipeline != vk.lastBoundPipeline )
+		{
+			vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline );
+			vk.lastBoundPipeline = pipeline;
 		}
 		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex ||
 			batch.scrollS != currentScrollS || batch.scrollT != currentScrollT )

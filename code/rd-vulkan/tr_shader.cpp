@@ -350,7 +350,7 @@ static std::string VK_StripShaderNameExtension( const char *name )
 	return stripped;
 }
 
-vkBlendMode_t VK_GetShaderBlendMode( const char *name )
+vkBlendMode_t VK_GetShaderBlendMode( const char *name, vkBlendMode_t notFoundDefault )
 {
 	VK_LoadShaderScripts();
 
@@ -359,7 +359,7 @@ vkBlendMode_t VK_GetShaderBlendMode( const char *name )
 	{
 		return it->second;
 	}
-	return BLEND_ALPHA;
+	return notFoundDefault;
 }
 
 // Looks up a fog shader's `fogparms` (see VK_LoadWorldFog, tr_world.cpp,

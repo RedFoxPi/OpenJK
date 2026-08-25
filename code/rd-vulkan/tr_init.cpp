@@ -886,16 +886,49 @@ static void VK_CreateWorldPipeline( void )
 	blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
 		| VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
+	// Alpha/additive variants for WorldSurfaceBatch::blendMode - same
+	// factors as vk.polyPipeline/polyPipelineAdditive and
+	// vk.uiPipeline/uiPipelineAdditive, kept consistent across every blend
+	// pipeline this renderer has rather than re-deriving them.
+	VkPipelineColorBlendAttachmentState blendAttachmentAlpha = blendAttachment;
+	blendAttachmentAlpha.blendEnable = VK_TRUE;
+	blendAttachmentAlpha.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+	blendAttachmentAlpha.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+	blendAttachmentAlpha.colorBlendOp = VK_BLEND_OP_ADD;
+	blendAttachmentAlpha.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachmentAlpha.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+	blendAttachmentAlpha.alphaBlendOp = VK_BLEND_OP_ADD;
+
+	VkPipelineColorBlendAttachmentState blendAttachmentAdditive = blendAttachmentAlpha;
+	blendAttachmentAdditive.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachmentAdditive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachmentAdditive.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+	blendAttachmentAdditive.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+
 	VkPipelineColorBlendStateCreateInfo colorBlend = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
 	colorBlend.attachmentCount = 1;
 	colorBlend.pAttachments = &blendAttachment;
+
+	VkPipelineColorBlendStateCreateInfo colorBlendAlpha = colorBlend;
+	colorBlendAlpha.pAttachments = &blendAttachmentAlpha;
+
+	VkPipelineColorBlendStateCreateInfo colorBlendAdditive = colorBlend;
+	colorBlendAdditive.pAttachments = &blendAttachmentAdditive;
+
+	// Translucent world geometry depth-tests against opaque geometry (so a
+	// wall in front of it still occludes it) but doesn't write depth itself
+	// - see vkGlobals_t::worldPipelineAlpha's own comment for why that's an
+	// accepted simplification rather than real per-shader depth-write
+	// control or a full translucency sort.
+	VkPipelineDepthStencilStateCreateInfo blendDepthStencil = depthStencil;
+	blendDepthStencil.depthWriteEnable = VK_FALSE;
 
 	VkDynamicState dynStates[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
 	VkPipelineDynamicStateCreateInfo dynState = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
 	dynState.dynamicStateCount = 2;
 	dynState.pDynamicStates = dynStates;
 
-	VkGraphicsPipelineCreateInfo pipeInfos[2] = {};
+	VkGraphicsPipelineCreateInfo pipeInfos[4] = {};
 	pipeInfos[0] = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 	pipeInfos[0].stageCount = 2;
 	pipeInfos[0].pStages = stages;
@@ -914,10 +947,20 @@ static void VK_CreateWorldPipeline( void )
 	pipeInfos[1] = pipeInfos[0];
 	pipeInfos[1].pDepthStencilState = &skyDepthStencil;
 
-	VkPipeline pipelines[2] = {};
-	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 2, pipeInfos, nullptr, pipelines ), "vkCreateGraphicsPipelines (world)" );
+	pipeInfos[2] = pipeInfos[0];
+	pipeInfos[2].pDepthStencilState = &blendDepthStencil;
+	pipeInfos[2].pColorBlendState = &colorBlendAlpha;
+
+	pipeInfos[3] = pipeInfos[0];
+	pipeInfos[3].pDepthStencilState = &blendDepthStencil;
+	pipeInfos[3].pColorBlendState = &colorBlendAdditive;
+
+	VkPipeline pipelines[4] = {};
+	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 4, pipeInfos, nullptr, pipelines ), "vkCreateGraphicsPipelines (world)" );
 	vk.worldPipeline = pipelines[0];
 	vk.skyPipeline = pipelines[1];
+	vk.worldPipelineAlpha = pipelines[2];
+	vk.worldPipelineAdditive = pipelines[3];
 
 	vkDestroyShaderModule( vk.device, vertModule, nullptr );
 	vkDestroyShaderModule( vk.device, fragModule, nullptr );
@@ -1193,6 +1236,8 @@ void VK_Shutdown( qboolean destroyWindow )
 
 	if ( vk.worldPipeline ) vkDestroyPipeline( vk.device, vk.worldPipeline, nullptr );
 	if ( vk.skyPipeline ) vkDestroyPipeline( vk.device, vk.skyPipeline, nullptr );
+	if ( vk.worldPipelineAlpha ) vkDestroyPipeline( vk.device, vk.worldPipelineAlpha, nullptr );
+	if ( vk.worldPipelineAdditive ) vkDestroyPipeline( vk.device, vk.worldPipelineAdditive, nullptr );
 	if ( vk.worldPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.worldPipelineLayout, nullptr );
 	if ( vk.worldSampler ) vkDestroySampler( vk.device, vk.worldSampler, nullptr );
 	if ( vk.ghoul2DescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.ghoul2DescriptorPool, nullptr );

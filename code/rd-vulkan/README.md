@@ -2761,6 +2761,96 @@ tint - a real, visible move toward matching the reference, confirmed by
 eye against an actual side-by-side, not assumed from the diff percentage
 alone.
 
+## World geometry blend modes (alpha/additive, not just opaque)
+
+Closes another explicitly-flagged gap: world geometry was drawn through a
+single opaque `VkPipeline` regardless of its shader's own `blendFunc` -
+"World geometry doesn't even get the 2D path's blend-mode selection yet"
+(this file's own "not implemented" list, now out of date). Real map data
+shows this wasn't a theoretical gap: parsed every one of the four test
+maps' real, currently-drawn (non-`SURF_NODRAW`/`SURF_SKY`/flare) world
+surfaces against all 68 `shaders/*.shader` files' first-stage `blendFunc`.
+Hoth2 alone has 544 surfaces whose shader is additive
+(`textures/flares/solid_blue`, 283; `textures/common/dark_dust`, 199;
+`textures/common/env_glass`, 57; several others); vjun1 has 461
+(`textures/common/dark_dust`, 259; several real `glass_security_*` window
+shaders); yavin1 has 81 (`textures/yavin/tree1` foliage, 24; decals,
+grating, a ship prop); academy1 has 71 (`dark_dust` again).
+
+**Two genuinely different bugs were hiding under one symptom**, found by
+checking, not assuming, whether each shader's own name also happens to
+resolve directly to a real texture file (`VK_FindImage`):
+
+- **Wrongly opaque**: a shader whose name doubles as its own real texture
+  file (`textures/flares/solid_blue`, `textures/hoth/ion_screen_01`/`_02`,
+  `textures/impdetention/screen1`, `textures/vjun/tech`,
+  `textures/yavin/tree1`, `textures/decals/slashmark1`,
+  `textures/common/gradient2` - confirmed by checking the real .pk3
+  contents directly, not guessed) resolved on the very first `VK_FindImage`
+  call, before any blend-mode check ever ran, and was drawn fully opaque
+  regardless of its shader's real `blendFunc`.
+- **Wrongly invisible**: a shader whose name does *not* directly resolve
+  (`textures/common/dark_dust`, `env_glass`, every `glass_security_*`,
+  `dark_orange`, `tan_gradient`) falls into `RE_LoadWorldMap`'s existing
+  map-image fallback (see "hoth2's missing terrain" above) - which was
+  deliberately gated to `BLEND_OPAQUE` shaders only, specifically *because*
+  this renderer had no blend pipeline to safely draw the result with yet
+  (see that fallback's own comment, tr_world.cpp). Non-opaque shaders hit
+  the fallback, failed the gate, and were skipped outright - real vjun1
+  windows (`glass_security_hex`/`_chain`/`_tris`/`_thex`) and dust-haze
+  effects on every map were never drawn at all, not drawn wrong.
+
+**Fixed the first category, deliberately left the second one alone**:
+`WorldSurfaceBatch` gained a `blendMode` field (`VK_GetShaderBlendMode`,
+already existed for the 2D UI path), and `vk.worldPipeline` gained two
+siblings - `worldPipelineAlpha`/`worldPipelineAdditive` (same shaders/
+vertex layout/pipeline layout, only the blend state and depth-write
+differ, same relationship `vk.polyPipelineAdditive` already has to
+`vk.polyPipeline`) - selected per-batch in `RE_RenderScene` exactly like
+`vertexLit`/`fogIndex`/the tcMod scroll speed already are.
+`VK_GetShaderBlendMode` needed a second parameter first
+(`notFoundDefault`): its existing default (`BLEND_ALPHA`) is correct for
+the 2D UI path's "bare image, no `.shader` script" case, but wrong for
+world geometry, where the overwhelmingly common case - an ordinary wall or
+floor texture with no `.shader` script at all - must default to
+`BLEND_OPAQUE` instead, matching real Quake3's own implicit-shader
+behaviour; reusing the UI path's default here would have made every one of
+those ordinary textures translucent. `s_worldSurfaces` is sorted by blend
+category after loading (opaque, then alpha, then additive) so the single
+draw loop still only switches pipelines a handful of times per frame, not
+per-batch, the same reasoning as the existing per-batch push-constant
+switches.
+
+The second category (the map-image-fallback gate) was deliberately **not**
+loosened in this pass, after checking what would actually happen if it
+were: `env_glass` and `glass_security_hex`'s first stage use `tcGen
+environment` (reflection-vector UV generation, not a mapping this renderer
+implements at all) - resolving their fallback image and sampling it with
+the surface's own baked UV would render an actively wrong static texture
+smeared across the glass, not a translucent look, the same "invisible
+beats wrong" reasoning that gated the fallback in the first place, just
+for a more specific, now-confirmed reason than "no blend pipeline exists
+yet". `dark_dust`/`tan_gradient`/`dark_orange` would render closer to
+correct (a plain `clampmap`, no `tcGen`) but use `rgbGen const` (a fixed
+per-shader tint) this renderer doesn't parse, so left alone too rather
+than mixing "some fallback shaders now render, others still don't" for a
+partial win. A real candidate for a future, narrower pass.
+
+**Verified**: full SP scene suite (menu/academy1/hoth2/yavin1/vjun1) clean,
+no crashes, full rebuild warning-free. Pixel-diffed a build with this fix
+against one without it (same binaries otherwise): academy1/menu came back
+at baseline noise levels (<0.02% mean); hoth2/yavin1/vjun1 showed small
+real differences (0.12-0.28% mean) consistent with, but not conclusively
+isolated from, this renderer's already-documented per-run noise floor
+(unseeded weather particles, animation-timing jitter) - **not
+independently confirmed by eye** that a specific now-blended surface
+(e.g. hoth2's `solid_blue` flares, yavin1's `tree1` foliage) is actually
+visible and correctly blended from any of the four test maps' spawn-point
+camera framings, the same honesty standard already applied to tcMod
+scroll and local fog's colour above. The mechanism itself - which shaders
+get which pipeline, and why - is verified by direct BSP/`.shader` data and
+code review, not by assuming a diff percentage alone means success.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -2806,10 +2896,11 @@ alone.
   see "3D world geometry" above) but there's still no BSP visibility
   culling or back-face culling (see the "no culling" comment on
   `VK_CreateWorldPipeline` in `tr_init.cpp` for why not even back-face
-  culling is safe to turn on yet) and every surface uses one opaque
-  pipeline (not even the `.shader`-driven blend-mode selection the 2D path
-  has); drawn with a real per-frame camera built from `refdef_t` (see
-  `VK_BuildViewMatrix`/`VK_BuildProjectionMatrix` in `tr_world.cpp`).
+  culling is safe to turn on yet); each surface's own `.shader`-driven
+  blend mode picks one of three pipelines (opaque/alpha/additive - see
+  "World geometry blend modes" above), the same selection the 2D path has
+  had all along; drawn with a real per-frame camera built from `refdef_t`
+  (see `VK_BuildViewMatrix`/`VK_BuildProjectionMatrix` in `tr_world.cpp`).
 - Skybox rendering (`tr_world.cpp`: `VK_LoadSky`) - see "3D world geometry"
   above for what was verified. A flat (non-subdivided, non-warped) 6-face
   box using the sky shader's own name as its basename, always camera-
@@ -2930,9 +3021,15 @@ alone.
   for that last one), and (for fog shaders specifically, see "3D world
   geometry" above) a top-level `fogparms` line, are read - later stages,
   every other `tcMod` type (`rotate`/`scale`/`stretch`/`turb`/`transform`/
-  `entityTranslate`), `rgbGen`/`alphaGen` waves, and `skyparms` are still
-  ignored. World geometry doesn't even get the 2D path's blend-mode
-  selection yet (see above) - everything is one opaque pipeline.
+  `entityTranslate`), `tcGen` (UV generation modes other than the implicit
+  baked-UV default - e.g. `tcGen environment` for reflective glass/chrome),
+  `rgbGen const`/`rgbGen wave`/`alphaGen` waves, and `skyparms` are still
+  ignored. World geometry does now get real blend-mode selection (see
+  "World geometry blend modes" above) - but only for a shader whose own
+  name directly resolves to a texture file; a shader that needs the
+  map-image fallback (see "hoth2's missing terrain" above) still only
+  takes that path if it's opaque, for the specific, checked reasons that
+  section's own comment gives.
 - Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, dissolves,
   model bounds/tag queries.
 - Window resize / swapchain recreation - a resize will currently just log a
