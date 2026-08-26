@@ -3108,6 +3108,27 @@ evaluation either).
   but every surface potentially in view is still submitted regardless of
   whether the level's BVH/PVS data would say it's actually occluded by
   other geometry, and both triangle winding directions still draw.
+  Back-face culling specifically was investigated, not just left alone:
+  empirically determined the real winding sign under this pipeline's
+  negative-viewport-height Y-flip (temporarily culled one direction and
+  confirmed the world - walls, floor, terrain, a vjun1 cockpit interior -
+  rendered pixel-identical to the no-culling baseline on 3 of the 4 test
+  maps, meaning that direction only ever removed genuinely-invisible real
+  backfaces), and separately confirmed the sky box's own faces (wound the
+  opposite way, facing inward toward the camera) need their own
+  unconditionally-uncontrolled raster state rather than sharing the world
+  one. Reverted anyway: hoth2 (the 4th map) showed a real, if small
+  (~1% of the frame), hole - a distant background structure's silhouette
+  changed shape, exposing different underlying geometry rather than
+  just losing an invisible backface - meaning at least one real prop's
+  triangle winding isn't consistent with the rest of that map's data
+  (plausible for complex/rotated brushwork; not investigated further).
+  Per this file's own long-standing reasoning for leaving this off in the
+  first place - "a wrong cull direction silently drops geometry rather
+  than erroring, worse than the minor overdraw cost of drawing both
+  faces" - one confirmed real counter-example on real map data is enough
+  to keep this disabled rather than ship a mostly-safe-but-not-fully-
+  verified optimization.
 - Flares (`MST_FLARE`) *are* drawn now (see "Static flares" above), but
   without rd-vanilla's real `RB_TestZFlare` occlusion pre-test specifically
   (a real per-pixel depth test is a side effect of the pipeline state reused
