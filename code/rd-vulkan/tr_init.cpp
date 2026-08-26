@@ -1125,6 +1125,14 @@ static void VK_CreatePolyPipeline( void )
 		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
 		&vk.weatherVertexBuffer, &vk.weatherVertexBufferMemory );
 	vkMapMemory( vk.device, vk.weatherVertexBufferMemory, 0, VK_WHOLE_SIZE, 0, &vk.weatherVertexBufferMapped );
+
+	// Static-geometry flares (tr_world.cpp's VK_DrawWorldFlares) - own
+	// buffer, same reasoning as weather's above.
+	VK_CreateBuffer( sizeof( PolyVertex ) * FLARE_VERTEX_BUFFER_CAPACITY,
+		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+		VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+		&vk.flareVertexBuffer, &vk.flareVertexBufferMemory );
+	vkMapMemory( vk.device, vk.flareVertexBufferMemory, 0, VK_WHOLE_SIZE, 0, &vk.flareVertexBufferMapped );
 }
 
 // ============================================================================
@@ -1254,6 +1262,9 @@ void VK_Shutdown( qboolean destroyWindow )
 	if ( vk.weatherVertexBufferMemory ) vkUnmapMemory( vk.device, vk.weatherVertexBufferMemory );
 	if ( vk.weatherVertexBuffer ) vkDestroyBuffer( vk.device, vk.weatherVertexBuffer, nullptr );
 	if ( vk.weatherVertexBufferMemory ) vkFreeMemory( vk.device, vk.weatherVertexBufferMemory, nullptr );
+	if ( vk.flareVertexBufferMemory ) vkUnmapMemory( vk.device, vk.flareVertexBufferMemory );
+	if ( vk.flareVertexBuffer ) vkDestroyBuffer( vk.device, vk.flareVertexBuffer, nullptr );
+	if ( vk.flareVertexBufferMemory ) vkFreeMemory( vk.device, vk.flareVertexBufferMemory, nullptr );
 
 	if ( vk.depthImageView ) vkDestroyImageView( vk.device, vk.depthImageView, nullptr );
 	if ( vk.depthImage ) vkDestroyImage( vk.device, vk.depthImage, nullptr );

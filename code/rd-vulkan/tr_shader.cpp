@@ -52,6 +52,15 @@ struct vkShaderTcModScroll_t
 };
 static std::unordered_map<std::string, vkShaderTcModScroll_t> s_shaderTcModScroll;
 
+// First stage's `alphaGen portal <range>` numeric argument, keyed by shader
+// name - the only alphaGen this renderer reads. It exists purely to drive
+// VK_GetShaderPortalRange's flare-quad radius (see that function's comment
+// and RB_SurfaceFlare in rd-vanilla's real tr_surface.cpp, which this
+// mirrors: `radius = tess.shader->portalRange ? tess.shader->portalRange :
+// 30`) - every other alphaGen type (`vertex`, `wave`, `lightingSpecular`,
+// plain `portal` with no numeric argument, ...) is still unread.
+static std::unordered_map<std::string, float> s_shaderPortalRange;
+
 // First stage's `map <path>` argument, keyed by shader name - see
 // VK_GetShaderMapImage's comment for why this exists: a shader's own name is
 // NOT reliably the same path as its actual base texture (e.g. hoth2's
@@ -118,6 +127,8 @@ static void ParseShaderFile( const char *text )
 		vkShaderFogParms_t fogParms = {};
 		bool haveTcModScroll = false;
 		vkShaderTcModScroll_t tcModScroll = {};
+		bool havePortalRange = false;
+		float portalRange = 0.0f;
 		std::string mapImage;
 
 		while ( depth > 0 )
@@ -212,6 +223,25 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
+			// `alphaGen portal <range>` - only the numeric range argument is
+			// recorded (see s_shaderPortalRange's own comment); every other
+			// alphaGen keyword/argument falls through unconsumed like any
+			// other unrecognized token.
+			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "alphaGen" ) )
+			{
+				std::string a = COM_ParseExt( &p, qfalse );
+				if ( !Q_stricmp( a.c_str(), "portal" ) )
+				{
+					const char *rangeTok = COM_ParseExt( &p, qfalse );
+					if ( rangeTok[0] )
+					{
+						portalRange = (float)atof( rangeTok );
+						havePortalRange = true;
+					}
+				}
+				continue;
+			}
+
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "blendFunc" ) )
 			{
 				// COM_ParseExt returns a pointer into its own single static
@@ -275,6 +305,10 @@ static void ParseShaderFile( const char *text )
 		if ( haveTcModScroll && s_shaderTcModScroll.find( name ) == s_shaderTcModScroll.end() )
 		{
 			s_shaderTcModScroll[name] = tcModScroll;
+		}
+		if ( havePortalRange && s_shaderPortalRange.find( name ) == s_shaderPortalRange.end() )
+		{
+			s_shaderPortalRange[name] = portalRange;
 		}
 	}
 
@@ -402,6 +436,24 @@ bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed )
 	*sSpeed = it->second.sSpeed;
 	*tSpeed = it->second.tSpeed;
 	return true;
+}
+
+// Looks up a flare shader's `alphaGen portal <range>` numeric argument (see
+// RE_LoadWorldMap's MST_FLARE handling, tr_world.cpp, the only caller).
+// Returns rd-vanilla's own RB_SurfaceFlare default (30) if the shader wasn't
+// found or never declared it - exactly matching real behavior for a flare
+// shader with no alphaGen at all (the common case: only flare_blue_pulse of
+// this checkout's 3 real flare shaders declares one, at 50).
+float VK_GetShaderPortalRange( const char *name )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderPortalRange.find( VK_StripShaderNameExtension( name ) );
+	if ( it == s_shaderPortalRange.end() )
+	{
+		return 30.0f;
+	}
+	return it->second;
 }
 
 // Looks up a shader's first stage's `map`/`clampmap` path - the only

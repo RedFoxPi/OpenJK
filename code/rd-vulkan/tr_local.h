@@ -112,6 +112,14 @@ extern cvar_t *r_ghoul2AnimDebug;
 // same spirit as MAX_SCENE_ENTITIES/MAX_SCENE_POLYS elsewhere in this
 // renderer (a sane bound, not a measured hard engine limit).
 #define MAX_WEATHER_PARTICLES_PER_CLOUD 4096
+// Fan-expanded triangle-list vertices per frame across every static
+// MST_FLARE surface actually drawn this frame (tr_world.cpp's
+// VK_DrawWorldFlares) - a per-map load-time-fixed count, not a per-frame
+// varying one like weather's, but sized the same way: comfortable headroom
+// above the real numbers seen in this checkout's own test maps (hoth2: 98,
+// vjun1: 45 - see rd-vulkan/README.md). 512 flares' worth
+// (FLARE_VERTEX_BUFFER_CAPACITY / 6 verts-per-quad).
+#define FLARE_VERTEX_BUFFER_CAPACITY 3072u
 
 // Blend mode a UI draw needs, taken from the first stage of the image's
 // matching .shader script (see tr_shader.cpp). Vulkan bakes blend factors
@@ -376,6 +384,19 @@ typedef struct
 	VkDeviceMemory weatherVertexBufferMemory = VK_NULL_HANDLE;
 	void *weatherVertexBufferMapped = nullptr;
 
+	// Static-geometry flares (MST_FLARE, tr_world.cpp's VK_DrawWorldFlares) -
+	// same PolyVertex layout, per-frame-scratch-buffer pattern, and reused
+	// vk.polyPipeline/polyPipelineAdditive/polyPipelineLayout as weather
+	// above, own buffer for the same "independent write cursor" reason.
+	// Depth-test-on/depth-write-off (already true of polyPipeline) is what
+	// gives flares real per-pixel occlusion against whatever world/Ghoul2
+	// geometry the depth buffer already holds by the time this draws - no
+	// separate depth-readback pass needed, unlike rd-vanilla's real
+	// RB_TestZFlare (see VK_DrawWorldFlares' own comment).
+	VkBuffer flareVertexBuffer = VK_NULL_HANDLE;
+	VkDeviceMemory flareVertexBufferMemory = VK_NULL_HANDLE;
+	void *flareVertexBufferMapped = nullptr;
+
 	// Shared across tr_cmds.cpp's and tr_world.cpp's draw calls (both bind
 	// pipelines into the same per-frame command buffer) so a pipeline bound
 	// by one never gets silently assumed still-bound by the other. Reset to
@@ -424,6 +445,10 @@ void VK_EndOneShotCommands( VkCommandBuffer cmd );
 void RE_LoadWorldMap( const char *name );
 void RE_RenderScene( const refdef_t *fd );
 void VK_ShutdownWorld( void );
+// Static MST_FLARE surfaces parsed by RE_LoadWorldMap - see this function's
+// own comment (tr_world.cpp) for the full picture; RE_RenderScene is the
+// only caller.
+void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd );
 // Small helpers implemented in tr_world.cpp but reused by tr_model.cpp
 // (Ghoul2 models are just more indexed triangle batches drawn through the
 // same pipeline/descriptor-set shape as world surfaces - see tr_model.cpp's
@@ -589,6 +614,11 @@ bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed );
 // (tr_world.cpp) needs this as a fallback when a shader's own name isn't
 // directly a texture file.
 const char *VK_GetShaderMapImage( const char *name );
+// First stage's `alphaGen portal <range>` numeric argument, or rd-vanilla's
+// own RB_SurfaceFlare default (30) if absent - see this function's own
+// comment (tr_shader.cpp) and RE_LoadWorldMap's MST_FLARE handling
+// (tr_world.cpp), the only caller.
+float VK_GetShaderPortalRange( const char *name );
 
 // tr_weather.cpp
 //

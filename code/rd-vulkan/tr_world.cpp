@@ -170,6 +170,26 @@ static std::vector<WorldFogEntry> s_worldFogs;
 // tr.world->globalFog-scoped behaviour exactly.
 static int s_globalFogIndex = -1;
 
+// Static flares (MST_FLARE surfaces - light-source glow sprites like
+// hoth2's landing-beacon lights or vjun1's console/warning lights, not a
+// dynamic light system) - see RE_LoadWorldMap's MST_FLARE branch for how
+// this is populated from real BSP dsurface_t data (origin/normal - the
+// third field ParseFlare reads, a precomputed colour tint, is deliberately
+// not carried here; see the parsing site's own comment for why) and
+// VK_DrawWorldFlares for how it's drawn every frame. image is never null in
+// a stored entry - VK_FindImage failing is a reason not to store one, not
+// something the draw loop needs to re-check.
+// Always drawn additive (VK_DrawWorldFlares) - see the parsing site's own
+// comment (RE_LoadWorldMap) for why no per-shader blend mode is stored here.
+struct WorldFlare
+{
+	float origin[3];
+	float normal[3];
+	image_t *image;
+	float radius;
+};
+static std::vector<WorldFlare> s_worldFlares;
+
 // "Ranged fog" - a sniper-scope-style widening of the global fog's near/far
 // transition distance, ported from rd-vanilla's real RE_SetRangedFog
 // (tr_init.cpp) and the fStart/fEnd computation inside
@@ -229,6 +249,7 @@ void VK_ShutdownWorld( void )
 	if ( s_skyIndexBufferMemory ) { vkFreeMemory( vk.device, s_skyIndexBufferMemory, nullptr ); s_skyIndexBufferMemory = VK_NULL_HANDLE; }
 	s_skyFaces.clear();
 	s_skyLoaded = false;
+	s_worldFlares.clear();
 	s_worldFogs.clear();
 	s_globalFogIndex = -1;
 	s_rangedFog = 0.0f;
@@ -828,10 +849,94 @@ void RE_LoadWorldMap( const char *name )
 	for ( int i = 0; i < numSurfaces; i++ )
 	{
 		const dsurface_t &surf = surfaces[i];
-		// Flares (MST_FLARE) need their own draw path, not implemented yet -
-		// skip rather than draw garbage geometry from their raw data. Patches
-		// (MST_PATCH, curved surfaces) ARE handled below, tessellated via
-		// VK_TessellatePatchQuad - see that function's comment.
+		// Flares (MST_FLARE) have their own data shape - lightmapOrigin/
+		// lightmapVecs[2] hold a world-space point+normal, not real vertex/
+		// index geometry - so they're parsed into s_worldFlares here rather
+		// than falling into the shared vertex/index path below (which every
+		// other branch of this loop feeds). See VK_DrawWorldFlares
+		// (RE_RenderScene's caller) for how they're actually drawn - real
+		// per-pixel depth-tested camera-facing quads, ported from
+		// rd-vanilla's real RB_SurfaceFlare (tr_surface.cpp), not a copy of
+		// its own single-point RB_TestZFlare pre-test (see that function's
+		// own comment for why this renderer doesn't need an equivalent).
+		// ParseFlare's real third field (lightmapVecs[0], a precomputed
+		// colour tint) is deliberately not read: rd-vanilla's own
+		// RB_SurfaceFlare never uses it as an actual draw colour either - it
+		// only overwrites color[]/[3] with its own view-angle fade
+		// (`color[0]=color[1]=color[2]=d*255`) before ever considering
+		// per-vertex colour, and that only matters for a shader explicitly
+		// using `rgbGen exact_vertex` (or `alphaGen vertex` for alpha) -
+		// neither appears on any of this checkout's 3 real flare shaders
+		// (flares.shader/gfx.shader - see rd-vulkan/README.md).
+		if ( surf.surfaceType == MST_FLARE )
+		{
+			if ( surf.shaderNum >= 0 && surf.shaderNum < numShaders &&
+				!( shaders[surf.shaderNum].surfaceFlags & SURF_NODRAW ) )
+			{
+				image_t *flareImg = VK_FindImage( shaders[surf.shaderNum].shader );
+				if ( !flareImg )
+				{
+					// Confirmed real and non-rare, not a hypothetical: of
+					// this checkout's 3 real flare shaders, only
+					// gfx/misc/flare's own name is directly a texture file -
+					// textures/flares/flare_blue_pulse (hoth2) and
+					// flare_bluehue (vjun1) both only resolve through their
+					// first stage's own `map` (flares.shader), and are the
+					// majority of real flare surfaces on both maps (55/98 on
+					// hoth2, 29/45 on vjun1 - see rd-vulkan/README.md).
+					// Unlike RE_LoadWorldMap's opaque-world-surface fallback
+					// just below (gated to BLEND_OPAQUE specifically, see
+					// its own comment for why), this one is unconditional:
+					// a flare quad always draws through this renderer's own
+					// dedicated alpha/additive poly pipeline, never the
+					// opaque world one, so there's no equivalent "silently
+					// wrong opaque wash" failure mode to gate against here.
+					const char *mapImage = VK_GetShaderMapImage( shaders[surf.shaderNum].shader );
+					if ( mapImage )
+					{
+						flareImg = VK_FindImage( mapImage );
+					}
+				}
+				if ( flareImg )
+				{
+					WorldFlare flare;
+					flare.origin[0] = surf.lightmapOrigin[0];
+					flare.origin[1] = surf.lightmapOrigin[1];
+					flare.origin[2] = surf.lightmapOrigin[2];
+					flare.normal[0] = surf.lightmapVecs[2][0];
+					flare.normal[1] = surf.lightmapVecs[2][1];
+					flare.normal[2] = surf.lightmapVecs[2][2];
+					flare.image = flareImg;
+					// Always additive, regardless of what VK_GetShaderBlendMode
+					// would classify this shader's own blendFunc as - not just
+					// a default for the "no blendFunc keyword" case (unlike
+					// ordinary world geometry's BLEND_OPAQUE default). Checked
+					// against real data first: hoth2's flare_blue_pulse (55 of
+					// its 98 real flare surfaces) declares `blendFunc GL_ONE
+					// GL_ONE_MINUS_SRC_COLOR` - a softer "screen"-style
+					// additive our binary blend-mode classifier can't
+					// represent, so BlendFactorsToMode's fallback maps it to
+					// BLEND_ALPHA instead. Tried that classified value first
+					// and it was actively wrong, not just imprecise: standard
+					// src-alpha blending an opaque-alpha glow texture whose
+					// RGB has been faded near-black by this flare's own view-
+					// angle fade (d, below) paints a solid black square over
+					// the sky rather than a dim glow - confirmed directly in
+					// a real hoth2 capture (rows of solid black boxes along
+					// the horizon where the beacon flares are). Additive can't
+					// produce that failure mode at any fade value (it only
+					// ever brightens, never overwrites), and every one of
+					// this checkout's 3 real flare shaders (flares.shader/
+					// gfx.shader) is visually a glow effect - so additive is
+					// the strictly-safer approximation for all of them, not
+					// just the one (gfx/misc/flare) whose own blendFunc
+					// already says so.
+					flare.radius = VK_GetShaderPortalRange( shaders[surf.shaderNum].shader );
+					s_worldFlares.push_back( flare );
+				}
+			}
+			continue;
+		}
 		bool isPatch = surf.surfaceType == MST_PATCH;
 		if ( !isPatch && surf.surfaceType != MST_PLANAR && surf.surfaceType != MST_TRIANGLE_SOUP )
 		{
@@ -1081,8 +1186,9 @@ void RE_LoadWorldMap( const char *name )
 
 	s_worldLoaded = true;
 
-	ri.Printf( PRINT_ALL, "rd-vulkan: loaded %s: %d draw batches, %d verts, %d indexes, %d lightmaps (skipped flares)\n",
-		name, (int)s_worldSurfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size(), (int)s_lightmapImages.size() );
+	ri.Printf( PRINT_ALL, "rd-vulkan: loaded %s: %d draw batches, %d verts, %d indexes, %d lightmaps, %d flares\n",
+		name, (int)s_worldSurfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size(), (int)s_lightmapImages.size(),
+		(int)s_worldFlares.size() );
 }
 
 // Byte-for-byte copy of rd-vanilla's tr_main.cpp myGlMultMatrix (not
@@ -1238,6 +1344,146 @@ static bool VK_AABBOutsideFrustum( const float mins[3], const float maxs[3], con
 		}
 	}
 	return false;
+}
+
+// Draws every static MST_FLARE surface loaded by RE_LoadWorldMap - camera-
+// facing quads, one draw call per contiguous same-image run
+// (s_worldFlares isn't sorted for this, but real maps only ever use 1-2
+// distinct flare shaders - see rd-vulkan/README.md - so this rarely batches
+// worse than a full sort would buy). Ported from rd-vanilla's real
+// RB_SurfaceFlare (tr_surface.cpp): same "push 3 units off the surface along
+// its normal", same view-angle intensity fade
+// (`d = -DotProduct(dir, normal)`), same distance-scaled radius clamped to a
+// 5-unit floor. What's NOT ported is RB_TestZFlare, real rd-vanilla's own
+// single-point glReadPixels-against-the-depth-buffer pre-test - deliberately
+// so, not just skipped: vk.polyPipeline/polyPipelineAdditive (reused here
+// wholesale, like tr_weather.cpp's particles) already render with depth-test
+// on and depth-write off, so a flare occluded by a wall already fails the
+// real per-pixel depth test the GPU performs anyway - a strictly
+// finer-grained equivalent (whole-quad partial occlusion falls out for
+// free) of what RB_TestZFlare's single sample point approximates, without
+// needing a CPU-side readback at all. Not independently confirmed by eye
+// against a real occluded flare in this checkout's own captures (none of
+// the 4 test maps' fixed spawn cameras happens to frame a flare from behind
+// an intervening wall) - the depth-test mechanism itself is standard Vulkan
+// pipeline state already exercised correctly by every other draw call in
+// this renderer, not new or flare-specific.
+void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd )
+{
+	if ( s_worldFlares.empty() || !vk.frameActive )
+	{
+		return;
+	}
+
+	VkCommandBuffer cmd = vk.activeCommandBuffer;
+
+	static const float cornerUv[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+	static const int winding[6] = { 0, 1, 2, 0, 2, 3 };
+
+	uint32_t cursor = 0;
+	image_t *lastImage = nullptr;
+	uint32_t drawStart = 0;
+
+	auto flushDraw = [&]( uint32_t drawEnd )
+	{
+		if ( drawEnd <= drawStart || !lastImage )
+		{
+			return;
+		}
+		// Always additive - see WorldFlare's own comment for why every
+		// flare uses this one pipeline regardless of its real shader's
+		// blendFunc.
+		if ( vk.polyPipelineAdditive != vk.lastBoundPipeline )
+		{
+			vkCmdBindPipeline( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.polyPipelineAdditive );
+			vk.lastBoundPipeline = vk.polyPipelineAdditive;
+		}
+		vkCmdPushConstants( cmd, vk.polyPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof( float ) * 16, mvp );
+		vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.polyPipelineLayout,
+			0, 1, &lastImage->descriptorSet, 0, nullptr );
+		VkDeviceSize offset = (VkDeviceSize)drawStart * sizeof( PolyVertex );
+		vkCmdBindVertexBuffers( cmd, 0, 1, &vk.flareVertexBuffer, &offset );
+		vkCmdDraw( cmd, drawEnd - drawStart, 1, 0, 0 );
+	};
+
+	for ( const WorldFlare &flare : s_worldFlares )
+	{
+		if ( cursor + 6 > FLARE_VERTEX_BUFFER_CAPACITY )
+		{
+			break;
+		}
+
+		float origin[3] = {
+			flare.origin[0] + flare.normal[0] * 3.0f,
+			flare.origin[1] + flare.normal[1] * 3.0f,
+			flare.origin[2] + flare.normal[2] * 3.0f,
+		};
+		float dir[3] = { origin[0] - fd->vieworg[0], origin[1] - fd->vieworg[1], origin[2] - fd->vieworg[2] };
+		float dist = sqrtf( dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2] );
+		if ( dist > 0.0f )
+		{
+			dir[0] /= dist; dir[1] /= dist; dir[2] /= dist;
+		}
+
+		float d = -( dir[0] * flare.normal[0] + dir[1] * flare.normal[1] + dir[2] * flare.normal[2] );
+		if ( d < 0.0f )
+		{
+			d = -d;
+		}
+
+		float radius = flare.radius;
+		if ( dist < 512.0f )
+		{
+			radius = radius * dist / 512.0f;
+		}
+		if ( radius < 5.0f )
+		{
+			radius = 5.0f;
+		}
+
+		if ( flare.image != lastImage )
+		{
+			flushDraw( cursor );
+			drawStart = cursor;
+			lastImage = flare.image;
+		}
+
+		float left[3] = { fd->viewaxis[1][0] * radius, fd->viewaxis[1][1] * radius, fd->viewaxis[1][2] * radius };
+		float up[3] = { fd->viewaxis[2][0] * radius, fd->viewaxis[2][1] * radius, fd->viewaxis[2][2] * radius };
+		float leftPlusUp[3] = { left[0] - up[0], left[1] - up[1], left[2] - up[2] };
+		float leftMinusUp[3] = { left[0] + up[0], left[1] + up[1], left[2] + up[2] };
+
+		float corners[4][3];
+		for ( int i = 0; i < 3; i++ )
+		{
+			corners[0][i] = origin[i] - leftMinusUp[i];
+			corners[1][i] = origin[i] - leftPlusUp[i];
+			corners[2][i] = origin[i] + leftMinusUp[i];
+			corners[3][i] = origin[i] + leftPlusUp[i];
+		}
+
+		PolyVertex *out = (PolyVertex *)vk.flareVertexBufferMapped + cursor;
+		for ( int i = 0; i < 6; i++ )
+		{
+			int c = winding[i];
+			out[i].pos[0] = corners[c][0];
+			out[i].pos[1] = corners[c][1];
+			out[i].pos[2] = corners[c][2];
+			out[i].uv[0] = cornerUv[c][0];
+			out[i].uv[1] = cornerUv[c][1];
+			// alphaGen/rgbGen aren't applied (see s_worldFlares' own
+			// comment) - just the view-angle fade, in all 3 colour channels,
+			// with alpha left at 1.0 so the texture's own alpha (a flare
+			// glow's real falloff shape) survives the poly.frag modulate
+			// untouched.
+			out[i].color[0] = d;
+			out[i].color[1] = d;
+			out[i].color[2] = d;
+			out[i].color[3] = 1.0f;
+		}
+		cursor += 6;
+	}
+	flushDraw( cursor );
 }
 
 void RE_RenderScene( const refdef_t *fd )
@@ -1442,6 +1688,14 @@ void RE_RenderScene( const refdef_t *fd )
 	// camera-facing RT_SPRITE entities need. See VK_DrawScenePolys
 	// (tr_model.cpp).
 	VK_DrawScenePolys( mvp, fd );
+
+	// Static world flares (MST_FLARE, this file's own VK_DrawWorldFlares) -
+	// drawn after Ghoul2/scene polys, same reasoning as rd-vanilla's real
+	// sort order (flares' SF_FLARE surface type sorts near the very end of a
+	// frame's draw list) - so they layer on top of everything solid the
+	// depth buffer already holds, which is exactly what their own depth-
+	// tested-but-not-depth-writing draw state needs already present.
+	VK_DrawWorldFlares( mvp, fd );
 
 	// World weather/particle effects (tr_weather.cpp) - same call-site
 	// convention as rd-vanilla's real RE_RenderWorldEffects (tr_scene.cpp:

@@ -2851,6 +2851,109 @@ scroll and local fog's colour above. The mechanism itself - which shaders
 get which pipeline, and why - is verified by direct BSP/`.shader` data and
 code review, not by assuming a diff percentage alone means success.
 
+## Static flares (MST_FLARE)
+
+Closes the last explicitly-flagged "skipped entirely" gap in
+`RE_LoadWorldMap`'s surface loop: BSP `MST_FLARE` surfaces (light-source
+glow sprites - landing-beacon lights, console/warning lights - not a
+dynamic light system) were previously dropped with a comment explaining why
+("need their own draw path, not implemented yet"), not drawn wrong. Checked
+real data before implementing: parsed `LUMP_SURFACES`/`LUMP_SHADERS`
+directly for all four test maps. academy1 and yavin1 have zero real flare
+surfaces; hoth2 has 98 (`textures/flares/flare_blue_pulse`: 55,
+`gfx/misc/flare`: 43); vjun1 has 45 (`textures/flares/flare_bluehue`: 29,
+`gfx/misc/flare`: 16) - a real, non-trivial feature on half the test maps,
+not a hypothetical one.
+
+**Parsing**: `dsurface_t`'s `MST_FLARE` fields aren't a vertex/index range
+like every other surface type - `lightmapOrigin` is the flare's world-space
+point, `lightmapVecs[2]` its normal (confirmed against rd-vanilla's real
+`ParseFlare`, tr_bsp.cpp: `flare->origin = ds->lightmapOrigin`,
+`flare->normal = ds->lightmapVecs[2]`) - so `RE_LoadWorldMap` parses them
+into a separate `s_worldFlares` list rather than feeding the shared vertex/
+index buffers every other branch does. Each entry also records its
+image (`VK_FindImage`, with the same real, now-shared map-image fallback
+the opaque-world-surface path already uses when a shader's own name isn't
+directly a texture file - unconditionally here, not gated to
+`BLEND_OPAQUE`, since a flare quad never draws through the opaque world
+pipeline in the first place; without this fallback, hoth2's
+`flare_blue_pulse` and vjun1's `flare_bluehue` - the majority of both
+maps' real flare surfaces, 55/98 and 29/45 - silently failed to load at
+all) and its `alphaGen portal <range>` value (a new, minimal addition to
+tr_shader.cpp's shader-script scanner - `VK_GetShaderPortalRange` - mirroring
+`VK_GetShaderTcModScroll`'s existing shape; only `flare_blue_pulse` of this
+checkout's 3 real flare shaders declares one, at 50, everything else falls
+back to rd-vanilla's own default of 30).
+
+**Rendering**: `VK_DrawWorldFlares` (tr_world.cpp), called once per scene
+from `RE_RenderScene` alongside `VK_DrawScenePolys`/`VK_DrawWeatherEffects`.
+Ported from rd-vanilla's real `RB_SurfaceFlare` (tr_surface.cpp): push the
+flare's origin 3 units off the surface along its normal, fade its intensity
+by view angle (`d = -DotProduct(dir, normal)`, `dir` = camera-to-flare),
+scale its radius by distance (clamped to a 5-unit floor) below 512 units.
+Reuses the existing `PolyVertex`/`vk.polyPipelineAdditive` runtime-poly
+infrastructure wholesale (own dedicated `vk.flareVertexBuffer`, same
+reasoning tr_weather.cpp's particles already have their own buffer) rather
+than inventing new vertex format or pipeline state for what is, mechanically,
+the same "camera-facing quad, additive blend" primitive weather particles
+already are.
+
+**Not a port of `RB_TestZFlare`** - rd-vanilla's own single-point
+`glReadPixels`-against-the-depth-buffer occlusion pre-test - and
+deliberately so, not just skipped: `vk.polyPipelineAdditive` already renders
+with depth-test-on/depth-write-off (real per-poly occlusion runtime polys
+already need against walls), so a flare behind a wall already fails the
+GPU's own real per-pixel depth test by the time this draws (called after
+all opaque/Ghoul2/sky geometry in `RE_RenderScene`) - a strictly finer-
+grained equivalent of what `RB_TestZFlare`'s single sample point
+approximates (a partially-occluded quad fades in from the visible edge
+rather than blinking fully on/off), without a CPU-side readback at all.
+**Not independently confirmed by eye** against a real occluded flare,
+though - none of the four test maps' fixed spawn cameras happens to frame
+a flare from behind an intervening wall; the depth-test mechanism itself is
+standard Vulkan pipeline state already exercised correctly by every other
+draw call in this renderer, not new or flare-specific.
+
+**Always additive, not per-shader blend mode** - tried the classified value
+first and it was actively wrong, not just imprecise. hoth2's
+`flare_blue_pulse` (55 of its 98 real flare surfaces) declares `blendFunc
+GL_ONE GL_ONE_MINUS_SRC_COLOR`, a softer "screen"-style additive this
+renderer's binary blend-mode classifier can't represent and falls back to
+classifying as `BLEND_ALPHA`. Standard src-alpha-blending an opaque-alpha
+glow texture whose RGB has been faded near-black by the view-angle fade
+above paints a **solid black square over the sky**, not a dim glow -
+caught directly in a real hoth2 capture (rows of solid black boxes along
+the horizon where the beacon lights are) before this was corrected to
+unconditional additive. Additive can't produce that failure at any fade
+value (it only ever brightens); every one of this checkout's 3 real flare
+shaders is visually a glow effect, so additive is the strictly-safer
+approximation for all of them, not just the one (`gfx/misc/flare`) whose
+own `blendFunc` already says so.
+
+**Verified**: full SP scene suite (menu/academy1/hoth2/yavin1/vjun1) clean,
+no crashes, full rebuild warning-free. `rd-vulkan: loaded <map>: ... N
+flares` now logs 98 for hoth2 and 45 for vjun1 - an exact match against the
+real BSP surface counts parsed independently above, confirming every real
+flare surface resolves an image and gets stored, not just some of them.
+Pixel-diffed a build with this feature against one without it (same
+binaries otherwise, after the black-square bug above was already fixed):
+academy1/menu (0 real flares) came back at baseline noise (<0.01% mean);
+hoth2 crossed this harness's own MINOR_DIFF threshold (0.61% mean, up from
+a same-build noise-floor rerun's 0.42-0.46%) with soft glow-shaped blobs
+along the horizon in the diff image - visually distinct in shape from the
+renderer's already-documented per-run noise (small round weather-particle
+dots) - and vjun1 showed a real, structured change concentrated at the
+cockpit window frame (a console/warning light location), also distinct
+from the NPC-silhouette-outline jitter yavin1's own diff shows as its
+(unrelated, pre-existing, already-documented) noise floor. Not
+independently confirmed by eye as a specific recognizable glow sprite
+sitting on a specific in-game light fixture - the diff evidence establishes
+"something new and flare-shaped appeared exactly where real flare data
+says it should," not a side-by-side visual match against rd-vanilla's own
+flare rendering (out of scope here, since this renderer doesn't attempt to
+match RB_TestZFlare's exact occlusion timing or `rgbGen`/`alphaGen` stage
+evaluation either).
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -2885,8 +2988,9 @@ code review, not by assuming a diff percentage alone means success.
   (shared, GL-agnostic structs from `qcommon/qfiles.h`) are parsed; only
   `MST_PLANAR`/`MST_TRIANGLE_SOUP` surfaces are kept, and `MST_PATCH`
   (curved surfaces) are tessellated at a fixed subdivision level - see "3D
-  world geometry" above; `MST_FLARE` is still skipped, not drawn;
-  `SURF_NODRAW`/`SURF_SKY`
+  world geometry" above; `MST_FLARE` surfaces are parsed into their own
+  list and drawn as camera-facing additive quads - see "Static flares"
+  above; `SURF_NODRAW`/`SURF_SKY`
   surfaces are skipped; each surface's diffuse texture is resolved through
   the same first-stage-only `.shader` lookup the 2D path uses, multiplied by
   its baked lightmap (or a white 1x1 fallback for surfaces with none); a
@@ -3004,7 +3108,13 @@ code review, not by assuming a diff percentage alone means success.
   but every surface potentially in view is still submitted regardless of
   whether the level's BVH/PVS data would say it's actually occluded by
   other geometry, and both triangle winding directions still draw.
-- Flares (`MST_FLARE`) - skipped entirely at load time, not just unlit.
+- Flares (`MST_FLARE`) *are* drawn now (see "Static flares" above), but
+  without rd-vanilla's real `RB_TestZFlare` occlusion pre-test specifically
+  (a real per-pixel depth test is a side effect of the pipeline state reused
+  to draw them, not a port of that function) and without per-shader
+  `rgbGen`/`alphaGen` stage evaluation (always additive, always the same
+  view-angle fade formula, regardless of what a flare's own shader stages
+  declare).
   Curved surfaces (`MST_PATCH`) *are* tessellated now (see "3D world
   geometry" above), but only at a fixed subdivision level, not rd-vanilla's
   real adaptive one - large or nearly-flat patches get more triangles than
