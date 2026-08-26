@@ -1008,19 +1008,35 @@ void RE_LoadWorldMap( const char *name )
 			// This renderer DOES have real blend pipelines for world
 			// geometry now (see WorldSurfaceBatch::blendMode,
 			// VK_CreateWorldPipeline) - the OPAQUE-only gate here stayed
-			// deliberately narrower than that even so, after checking real
-			// shaders that would otherwise take this path: several
-			// (`textures/common/env_glass`, `.../glass_security_hex`) use
-			// `tcGen environment` on their first stage - a reflection-vector
-			// UV generation mode this renderer doesn't implement at all - so
-			// resolving their fallback `map` and sampling it with the
-			// surface's own baked UV would render an actively wrong static
-			// texture, not a translucent glass look. Left unresolved rather
-			// than drawn wrong, same "invisible beats wrong" call as the
-			// RE_RegisterShaderNoMip videologo fix in tr_image.cpp - a
-			// distinct, still-open gap from the "no blend pipeline at all"
-			// one this comment used to describe.
-			if ( VK_GetShaderBlendMode( shaders[surf.shaderNum].shader ) == BLEND_OPAQUE )
+			// deliberately narrower than that for a long time, after
+			// checking real shaders that would otherwise take this path:
+			// several (`textures/common/env_glass`, `.../glass_security_hex`)
+			// use `tcGen environment` on their first stage - a reflection-
+			// vector UV generation mode this renderer doesn't implement at
+			// all - so resolving their fallback `map` and sampling it with
+			// the surface's own baked UV would render an actively wrong
+			// static texture, not a translucent glass look. Left unresolved
+			// rather than drawn wrong, same "invisible beats wrong" call as
+			// the RE_RegisterShaderNoMip videologo fix in tr_image.cpp.
+			//
+			// Widened to also allow BLEND_ADDITIVE through, but ONLY when
+			// the shader has no `tcGen` at all (VK_ShaderHasTcGen) - env_glass/
+			// glass_security_* are ALSO additive-classified (their first
+			// stage really is `blendFunc GL_ONE GL_ONE`, checked directly
+			// against real shader data, not assumed different from the
+			// dust-cloud shaders below), so blend mode alone can't be the
+			// gate; tcGen presence is the actual root cause the comment
+			// above already identified. Confirmed real, safe targets before
+			// widening: `textures/common/dark_dust`/`tan_gradient`/
+			// `dark_orange`/`blue_gradient` (all `clampmap textures/common/
+			// gradient`, `blendFunc GL_ONE GL_ONE`, `rgbGen const (r g b)`,
+			// no tcGen at all) - 71 real surfaces on academy1 alone via
+			// dark_dust (see "World geometry blend modes" above), previously
+			// invisible outright rather than just wrongly-blended.
+			vkBlendMode_t fallbackBlendMode = VK_GetShaderBlendMode( shaders[surf.shaderNum].shader );
+			bool safeForMapImageFallback = fallbackBlendMode == BLEND_OPAQUE ||
+				( fallbackBlendMode == BLEND_ADDITIVE && !VK_ShaderHasTcGen( shaders[surf.shaderNum].shader ) );
+			if ( safeForMapImageFallback )
 			{
 				const char *mapImage = VK_GetShaderMapImage( shaders[surf.shaderNum].shader );
 				if ( mapImage )
@@ -1058,6 +1074,29 @@ void RE_LoadWorldMap( const char *name )
 				wv.color[1] = c[1] / 255.0f;
 				wv.color[2] = c[2] / 255.0f;
 				wv.color[3] = c[3] / 255.0f;
+			}
+		}
+
+		// `rgbGen const (r g b)` (see VK_GetShaderRgbGenConst's own comment,
+		// tr_shader.cpp) - a real shader-declared fixed tint, applied after
+		// (and overriding) whatever the vertex-lit block above just set:
+		// real rgbGen evaluation replaces the surface's colour source
+		// entirely rather than layering with it, and this checkout's only
+		// real users of `const` (the additive dust-cloud family the map-
+		// image fallback above was just widened for) are all
+		// `q3map_nolightmap` anyway, so there's no real baked colour this
+		// would ever incorrectly discard. Alpha is left alone (real
+		// `rgbGen const` only ever sets RGB) - the white-init default's 1.0
+		// stays correct for these opaque-alpha, additive-blended shaders.
+		float rgbConst[3];
+		if ( VK_GetShaderRgbGenConst( shaders[surf.shaderNum].shader, rgbConst ) )
+		{
+			for ( int v = 0; v < surf.numVerts; v++ )
+			{
+				WorldVertex &wv = cpuVerts[surf.firstVert + v];
+				wv.color[0] = rgbConst[0];
+				wv.color[1] = rgbConst[1];
+				wv.color[2] = rgbConst[2];
 			}
 		}
 

@@ -2834,7 +2834,10 @@ yet". `dark_dust`/`tan_gradient`/`dark_orange` would render closer to
 correct (a plain `clampmap`, no `tcGen`) but use `rgbGen const` (a fixed
 per-shader tint) this renderer doesn't parse, so left alone too rather
 than mixing "some fallback shaders now render, others still don't" for a
-partial win. A real candidate for a future, narrower pass.
+partial win. **Done in a later pass** - see "`rgbGen const` and a widened
+additive map-image fallback" below for the real `tcGen`-presence gate that
+made this safe to do without also letting `env_glass`/`glass_security_*`
+through.
 
 **Verified**: full SP scene suite (menu/academy1/hoth2/yavin1/vjun1) clean,
 no crashes, full rebuild warning-free. Pixel-diffed a build with this fix
@@ -3033,6 +3036,69 @@ diffs above. Real activation on real data is confirmed directly (the log
 line above); the *visual* effect specifically is not independently
 confirmed by eye in this checkout's own captures.
 
+## `rgbGen const` and a widened additive map-image fallback
+
+Closes a real, previously-invisible-outright gap identified but
+deliberately not fixed during "World geometry blend modes" above: real
+`textures/common/dark_dust`/`tan_gradient`/`dark_orange`/`blue_gradient`
+shaders (`clampmap textures/common/gradient`, `blendFunc GL_ONE GL_ONE`,
+`rgbGen const ( r g b )`, no `tcGen`) were still never drawn at all, even
+after that pass added real alpha/additive world pipelines - because their
+shader name (`textures/common/dark_dust`) doesn't directly resolve to a
+texture file (the real texture is `textures/common/gradient`, referenced
+only via the shader's own `clampmap`), and `RE_LoadWorldMap`'s map-image
+fallback that would normally catch that case was deliberately gated to
+`BLEND_OPAQUE` shaders only - `dark_dust` classifies as `BLEND_ADDITIVE`
+(a real, correctly-classified blendFunc), so it never took that path. Real
+scale confirmed before touching anything: 71 real `dark_dust` surfaces on
+academy1 alone (see the blend-modes section's own survey).
+
+**The `tcGen` risk, checked directly rather than assumed away**: the
+original opaque-only gate wasn't arbitrary - `textures/common/env_glass`
+and every `glass_security_*` variant are *also* real `blendFunc GL_ONE
+GL_ONE` shaders (checked their actual `.shader` blocks directly, not
+assumed from their surfaceparm/qer_trans lines), meaning blend mode alone
+can't distinguish them from the safe dust-cloud family. What actually
+distinguishes them is `tcGen environment` on that same first stage - a
+reflection-vector UV generation mode this renderer still doesn't
+implement, and the real reason resolving their fallback image would render
+an actively wrong static texture rather than a translucent glass look (see
+that section's own comment). So the fallback gate is widened along the
+*right* axis instead of the *convenient* one: `VK_ShaderHasTcGen`
+(tr_shader.cpp) records whether a shader's first stage declares any
+`tcGen` keyword at all (not which kind - none are implemented either way),
+and `RE_LoadWorldMap`'s gate becomes "`BLEND_OPAQUE`, OR `BLEND_ADDITIVE`
+with no `tcGen`" - `dark_dust` and siblings pass (additive, no `tcGen`);
+`env_glass`/`glass_security_*` still correctly don't (additive, but real
+`tcGen environment`).
+
+**`rgbGen const`**: a real, minimal addition to tr_shader.cpp's shader-
+script scanner (`VK_GetShaderRgbGenConst`, mirroring `VK_GetShaderTcModScroll`'s
+existing shape) - every one of this checkout's real `rgbGen const` shaders
+uses it as their *only* rgbGen (no `identityLighting`/`vertex`/wave
+animation to also model), so applying it is a straight per-vertex colour
+overwrite (`RE_LoadWorldMap`, right after - and overriding - the existing
+real-baked-vertex-colour block for vertex-lit surfaces, since these
+`q3map_nolightmap` dust shaders never have real baked vertex colour to
+lose anyway) reusing the exact mechanism "Real per-vertex colour for
+vertex-lit surfaces" above already built, not a new code path.
+
+**Verified**: full SP scene suite clean, no crashes, warning-free rebuild.
+Pixel-diffed a build with this fix against one without it: academy1 came
+back MAJOR_DIFF (65.7% of the frame, 13.2% mean) - large, but confirmed by
+eye to be exactly the right shape and nothing else: sharp, planar bands
+following the same diagonal window-light-shaft geometry the scene's real
+light beams already show, not a wash covering unrelated surfaces or an
+opaque blowout (the specific failure mode the original gate's own comment
+warned an unconditional fallback would cause) - genuinely new
+light-shaft-dust volumes appearing exactly where academy1's real BSP data
+places them, translucent and additively blended as their shader declares.
+The other three maps stayed within this renderer's already-documented
+per-run noise floor (hoth2 0.44%/0.14%, vjun1 0.18%/0.68%, yavin1
+0.04%/0.06% mean/changed-pixels) - consistent with those maps having far
+fewer or no real surfaces using these specific shaders in view from their
+fixed spawn cameras, not a sign the fix only partially worked.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3227,19 +3293,24 @@ confirmed by eye in this checkout's own captures.
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
 - Full `.shader` script parsing: only a defined shader's first stage's
-  `map`/`blendFunc`/`tcMod scroll` (see "World-geometry tcMod scroll" below
-  for that last one), and (for fog shaders specifically, see "3D world
-  geometry" above) a top-level `fogparms` line, are read - later stages,
-  every other `tcMod` type (`rotate`/`scale`/`stretch`/`turb`/`transform`/
-  `entityTranslate`), `tcGen` (UV generation modes other than the implicit
-  baked-UV default - e.g. `tcGen environment` for reflective glass/chrome),
-  `rgbGen const`/`rgbGen wave`/`alphaGen` waves, and `skyparms` are still
-  ignored. World geometry does now get real blend-mode selection (see
-  "World geometry blend modes" above) - but only for a shader whose own
-  name directly resolves to a texture file; a shader that needs the
-  map-image fallback (see "hoth2's missing terrain" above) still only
-  takes that path if it's opaque, for the specific, checked reasons that
-  section's own comment gives.
+  `map`/`blendFunc`/`tcMod scroll`/`rgbGen const`/`alphaGen portal <range>`
+  (see "World-geometry tcMod scroll"/"`rgbGen const` and a widened additive
+  map-image fallback"/"Static flares" above for those), whether it declares
+  any `tcGen` at all (not which kind - see the same `rgbGen const` section),
+  and (for fog shaders specifically, see "3D world geometry" above) a
+  top-level `fogparms` line, are read - later stages, every other `tcMod`
+  type (`rotate`/`scale`/`stretch`/`turb`/`transform`/`entityTranslate`),
+  actual `tcGen` UV generation (e.g. `tcGen environment` for reflective
+  glass/chrome - its *presence* is detected to gate the map-image fallback
+  safely, but no reflection mapping is ever computed), `rgbGen
+  identityLighting`/`vertex`/wave animation, `alphaGen` waves, and
+  `skyparms` are still ignored. World geometry does now get real blend-mode
+  selection (see "World geometry blend modes" above) for a shader whose own
+  name directly resolves to a texture file, and the map-image fallback (see
+  "hoth2's missing terrain" above) now also covers a `BLEND_ADDITIVE`
+  shader specifically when it has no `tcGen` (see the `rgbGen const`
+  section above for exactly why that's the safe line, not blend mode
+  alone) - a `BLEND_ALPHA` shader needing the fallback is still unresolved.
 - Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, dissolves,
   model bounds/tag queries.
 - Window resize / swapchain recreation - a resize will currently just log a

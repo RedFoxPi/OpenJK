@@ -61,6 +61,30 @@ static std::unordered_map<std::string, vkShaderTcModScroll_t> s_shaderTcModScrol
 // plain `portal` with no numeric argument, ...) is still unread.
 static std::unordered_map<std::string, float> s_shaderPortalRange;
 
+// First stage's `rgbGen const ( r g b )` colour, keyed by shader name - the
+// only rgbGen this renderer reads (every other type - `identityLighting`,
+// `vertex`, `wave`, ... - is still unread, matching whatever this renderer's
+// existing default colour path already does for that surface). Exists to
+// drive RE_LoadWorldMap's per-vertex colour overwrite (tr_world.cpp) for a
+// small, real, verified family of additive "dust cloud" decal shaders -
+// see VK_GetShaderRgbGenConst's own comment.
+struct vkShaderRgbConst_t
+{
+	float color[3];
+};
+static std::unordered_map<std::string, vkShaderRgbConst_t> s_shaderRgbConst;
+
+// Whether the first stage declares ANY `tcGen` keyword at all, keyed by
+// shader name - not which kind. Exists purely as a safety gate for
+// RE_LoadWorldMap's map-image fallback (tr_world.cpp): `tcGen environment`
+// (reflection-vector UV generation this renderer doesn't implement) would
+// render an actively wrong static texture if a shader using it were ever
+// allowed through that fallback, so the fallback needs to know "does this
+// shader use *some* non-default UV generation" without needing to actually
+// implement any of them - see that fallback's own comment for the real
+// env_glass/glass_security_* shaders this excludes.
+static std::unordered_map<std::string, bool> s_shaderHasTcGen;
+
 // First stage's `map <path>` argument, keyed by shader name - see
 // VK_GetShaderMapImage's comment for why this exists: a shader's own name is
 // NOT reliably the same path as its actual base texture (e.g. hoth2's
@@ -129,6 +153,9 @@ static void ParseShaderFile( const char *text )
 		vkShaderTcModScroll_t tcModScroll = {};
 		bool havePortalRange = false;
 		float portalRange = 0.0f;
+		bool haveRgbConst = false;
+		vkShaderRgbConst_t rgbConst = {};
+		bool hasTcGen = false;
 		std::string mapImage;
 
 		while ( depth > 0 )
@@ -242,6 +269,41 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
+			// `rgbGen const ( r g b )` - only this one rgbGen type is
+			// recorded (see s_shaderRgbConst's own comment); every other
+			// rgbGen keyword (`identityLighting`, `vertex`, `wave`, ...)
+			// falls through unconsumed like any other unrecognized token,
+			// same "not specifically intercepted" pattern as alphaGen above.
+			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "rgbGen" ) )
+			{
+				std::string a = COM_ParseExt( &p, qfalse );
+				if ( !Q_stricmp( a.c_str(), "const" ) )
+				{
+					const char *paren = COM_ParseExt( &p, qfalse );
+					if ( !strcmp( paren, "(" ) )
+					{
+						rgbConst.color[0] = (float)atof( COM_ParseExt( &p, qfalse ) );
+						rgbConst.color[1] = (float)atof( COM_ParseExt( &p, qfalse ) );
+						rgbConst.color[2] = (float)atof( COM_ParseExt( &p, qfalse ) );
+						COM_ParseExt( &p, qfalse ); // closing ")"
+						haveRgbConst = true;
+					}
+				}
+				continue;
+			}
+
+			// `tcGen <type>` - only whether the keyword appears at all is
+			// recorded (see s_shaderHasTcGen's own comment) - no UV
+			// generation mode is actually implemented, so the type itself
+			// and any following arguments (`tcGen vector` takes two extra
+			// vec3s) are deliberately left unconsumed, same as tcMod's own
+			// unhandled types above.
+			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "tcGen" ) )
+			{
+				hasTcGen = true;
+				continue;
+			}
+
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "blendFunc" ) )
 			{
 				// COM_ParseExt returns a pointer into its own single static
@@ -309,6 +371,14 @@ static void ParseShaderFile( const char *text )
 		if ( havePortalRange && s_shaderPortalRange.find( name ) == s_shaderPortalRange.end() )
 		{
 			s_shaderPortalRange[name] = portalRange;
+		}
+		if ( haveRgbConst && s_shaderRgbConst.find( name ) == s_shaderRgbConst.end() )
+		{
+			s_shaderRgbConst[name] = rgbConst;
+		}
+		if ( hasTcGen && s_shaderHasTcGen.find( name ) == s_shaderHasTcGen.end() )
+		{
+			s_shaderHasTcGen[name] = true;
 		}
 	}
 
@@ -454,6 +524,37 @@ float VK_GetShaderPortalRange( const char *name )
 		return 30.0f;
 	}
 	return it->second;
+}
+
+// Looks up a shader's first stage's `rgbGen const ( r g b )` colour (see
+// RE_LoadWorldMap's per-vertex colour overwrite, tr_world.cpp, the only
+// caller). Returns false (color left untouched) if the shader wasn't found
+// or never declared one - the common case, matching the caller's default
+// (whatever colour the surface already had - white, or real baked vertex
+// colour) exactly.
+bool VK_GetShaderRgbGenConst( const char *name, float color[3] )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderRgbConst.find( VK_StripShaderNameExtension( name ) );
+	if ( it == s_shaderRgbConst.end() )
+	{
+		return false;
+	}
+	color[0] = it->second.color[0];
+	color[1] = it->second.color[1];
+	color[2] = it->second.color[2];
+	return true;
+}
+
+// Whether a shader's first stage declares any `tcGen` keyword at all (see
+// RE_LoadWorldMap's map-image-fallback safety gate, tr_world.cpp, the only
+// caller, and s_shaderHasTcGen's own comment for why).
+bool VK_ShaderHasTcGen( const char *name )
+{
+	VK_LoadShaderScripts();
+
+	return s_shaderHasTcGen.find( VK_StripShaderNameExtension( name ) ) != s_shaderHasTcGen.end();
 }
 
 // Looks up a shader's first stage's `map`/`clampmap` path - the only

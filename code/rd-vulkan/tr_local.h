@@ -626,6 +626,14 @@ const char *VK_GetShaderMapImage( const char *name );
 // comment (tr_shader.cpp) and RE_LoadWorldMap's MST_FLARE handling
 // (tr_world.cpp), the only caller.
 float VK_GetShaderPortalRange( const char *name );
+// First stage's `rgbGen const ( r g b )` colour - see this function's own
+// comment (tr_shader.cpp) and RE_LoadWorldMap's per-vertex colour overwrite
+// (tr_world.cpp), the only caller.
+bool VK_GetShaderRgbGenConst( const char *name, float color[3] );
+// Whether a shader's first stage declares any `tcGen` keyword at all - see
+// this function's own comment (tr_shader.cpp) and RE_LoadWorldMap's map-
+// image-fallback safety gate (tr_world.cpp), the only caller.
+bool VK_ShaderHasTcGen( const char *name );
 
 // tr_weather.cpp
 //
