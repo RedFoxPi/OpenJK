@@ -2954,6 +2954,85 @@ flare rendering (out of scope here, since this renderer doesn't attempt to
 match RB_TestZFlare's exact occlusion timing or `rgbGen`/`alphaGen` stage
 evaluation either).
 
+## Ghoul2 per-surface on/off overrides (`G2API_SetSurfaceOnOff`)
+
+Closes a real API gap, not a cosmetic one: `G2API_SetSurfaceOnOff` was a
+complete no-op stub (`(void)ghlInfo; (void)surfaceName; (void)flags; return
+qfalse;`) despite being called by real, exercised game code on every single
+player/NPC spawn, not just some optional gameplay feature - `g_client.cpp`'s
+`G_SetG2PlayerModelInfo` parses an NPC's `.npc` file `surfOff`/`surfOn` keys
+and calls this for every token in each list, unconditionally, for every
+spawned player-model entity. Checked real `.npc` data before implementing,
+not assumed: extracted `ext_data/npcs/*.npc` from this checkout's own
+`assets*.pk3`s and found 14 real species declaring `surfOff`
+(`gran`/`human_merc`/`impcommander`/`imperial`/`impofficer`/`jedif`/
+`protocol_imp`/`rockettrooper`/`rodian`/`stcommander`/`stofficer`/
+`stofficeralt`/`ugnaught`/`weequay`) - e.g. `protocol_imp` (`surfOff head` +
+`surfOn head_off`, an alternate damaged-head-panel look for that skin) and
+plain `imperial` troopers (`surfOff l_arm_key` - a "carrying a key" sleeve
+patch, turned back on only for key-carrying NPCs via `g_client.cpp`'s own
+`CLASS_IMPERIAL`+`ent->message` special case).
+
+**Real semantics, adapted lookup**: ported from rd-vanilla's actual
+`G2_SetSurfaceOnOff`/`G2_IsSurfaceLegal` (`G2_surfaces.cpp`) - same
+`CGhoul2Info::mSlist` sparse-override-list data structure (a real, shared,
+cross-renderer field from `ghoul2_shared.h`, not something invented for
+this renderer), same "only the `G2SURFACEFLAG_OFF`/`_NODESCENDANTS` bits of
+the incoming flags are ever applied, everything else in a surface's baked
+flags is preserved" masking, same "only push a new override entry if it'd
+actually change something" optimization. What's adapted rather than copied
+verbatim: rd-vanilla resolves a surface name via `ghlInfo->currentModel-
+>mdxm`, a real `model_t` pointer this renderer's `CGhoul2Info` instances
+never populate (see `VK_LoadGhoul2Model`'s own comment on why models are
+tracked by this renderer's own cache index, `mModel`, instead) - so name
+resolution goes through a new `VK_FindGhoul2SurfaceIndex` (tr_model.cpp)
+against this renderer's own cached `VulkanGhoul2Model::surfaceNames`/
+`surfaceFlags` (populated at `VK_LoadGhoul2Model` load time, previously
+only used transiently to decide *load-time* skips, now also persisted for
+this runtime lookup) instead.
+
+**Applied without re-baking geometry**: `VulkanGhoul2Model`'s per-model
+vertex/index buffers are still baked once and shared across every entity
+using that model+skin (unchanged) - a per-*instance* runtime override can't
+change shared baked geometry, so `GhoulSurfaceDraw` (the per-surface draw-
+call list every `VulkanGhoul2Model` already had) gained a `surfIndex` field
+(the surface's original `thisSurfaceIndex`, `-1` for a plain `.md3` static
+model with no Ghoul2 surface hierarchy), and `VK_DrawGhoul2Entities`
+consults the *current entity's own* `mSlist` for a matching override right
+before each surface's `vkCmdDrawIndexed` call, skipping it if overridden
+off - real per-instance behaviour (two entities sharing one cached
+model+skin can independently show/hide the same named surface) without
+touching the shared cache at all, the same architectural trick this
+renderer's live per-bone animation already relies on (shared mesh, per-
+instance pose).
+
+**Not ported**: `G2SURFACEFLAG_NODESCENDANTS`'s real recursive "also hide
+every child surface in the hierarchy" behaviour (`G2_FindRecursiveSurface`)
+- the bit is still masked/stored faithfully in `mSlist` for forward
+compatibility, but the draw-time check only ever looks at
+`G2SURFACEFLAG_OFF` on the exact named surface, matching the scope this
+renderer's pre-existing *load-time* baked-flags skip check already had.
+No real test case in this checkout's `.npc` data was found using
+`NODESCENDANTS` to justify implementing the hierarchy walk now.
+
+**Verified**: full SP scene suite clean, no crashes, warning-free rebuild.
+Confirmed real activation on real data, not just that the code compiles:
+a temporary diagnostic print (removed before committing) showed
+`models/players/imperial/model.glm surface 52 'l_arm_key' -> flags 0x2
+(base 0x0)` while capturing vjun1 - an ordinary imperial trooper entity in
+that scene really did get its `l_arm_key` surface toggled off at spawn,
+exactly matching `imperial.npc`'s own `surfOff l_arm_key` and the base
+model's own default (surface normally on, `0x0`). Pixel-diffed a build
+with this fix against one without it: all 5 scenes stayed within this
+renderer's already-documented per-run noise floor (weather-particle
+scatter, animation-timing jitter) - the affected surface is a small sleeve
+patch on an NPC not currently framed close/large enough in any of the 4
+test maps' fixed spawn cameras for its removal to read as a distinct
+signal above that noise, unlike flares/vertex-colour/blend-modes' own
+diffs above. Real activation on real data is confirmed directly (the log
+line above); the *visual* effect specifically is not independently
+confirmed by eye in this checkout's own captures.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3021,9 +3100,10 @@ evaluation either).
   different animations at once, resolved via the real bone-hierarchy walk),
   real cross-fade blending between an old and new animation over a real
   `blendTime`, and real sub-frame interpolation between adjacent whole
-  frames - not a cruder single-whole-skeleton-track approximation. Still
-  missing: bone-angle overrides/ragdoll/IK, LOD selection, per-surface
-  on/off overrides, gore.
+  frames - not a cruder single-whole-skeleton-track approximation. Real
+  per-instance surface on/off overrides (`SetSurfaceOnOff`) now too - see
+  "Ghoul2 per-surface on/off overrides" above. Still missing: bone-angle
+  overrides/ragdoll/IK, LOD selection, gore.
 - Runtime polys (`RE_AddPolyToScene`, `tr_model.cpp`) - see "Runtime polys"
   above. Real per-scene queueing, CPU fan-to-triangle-list expansion, and a
   dedicated pipeline with the same three blend-mode variants (alpha/
@@ -3080,8 +3160,7 @@ evaluation either).
   `_humanoid_academy1.gla`) are still stubs; every model always uses
   whichever single `.gla` `VK_LoadGhoul2Skeleton` first resolved for it.
   Also still missing: bone-angle overrides (`SetBoneAngles*`), ragdoll, IK,
-  LOD selection, per-surface on/off overrides
-  (`SetSurfaceOnOff`), gore, tags, ragdoll, model-to-model attachment
+  LOD selection, gore, tags, ragdoll, model-to-model attachment
   (`AttachG2Model`/`AttachEnt`), and surface bolts (a bolt naming a
   *surface* rather than a bone - only bone bolts are implemented, see
   "Ghoul2 rendering" above for `AddBolt`/`GetBoltMatrix`, itself still

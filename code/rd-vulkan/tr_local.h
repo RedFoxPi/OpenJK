@@ -533,6 +533,13 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle );
 // VulkanSkin in tr_model.cpp), returns a handle usable as VK_LoadGhoul2Model's
 // skinHandle. Called from RE_RegisterSkin below.
 int VK_RegisterSkin( const char *name );
+// Resolves a Ghoul2 surface name to its original mdxmSurfHierarchy_t index
+// (case-insensitive, matching real G2_IsSurfaceLegal - tr_model.cpp for the
+// only caller, G2API_SetSurfaceOnOff, tr_init.cpp) and, if found, writes
+// that surface's baked-default G2SURFACEFLAG_* flags to *outBaseFlags.
+// Returns -1 if not found (unknown name, or modelCacheIndex isn't a real
+// Ghoul2 model - a VulkanStaticModel's empty surfaceNames always misses).
+int VK_FindGhoul2SurfaceIndex( int modelCacheIndex, const char *surfaceName, unsigned int *outBaseFlags );
 // Bolt support (see VulkanSkeleton's comment in tr_model.cpp) - used by
 // G2API_AddBolt/G2API_GetBoltMatrix below. modelCacheIndex is a
 // VK_LoadGhoul2Model return value (i.e. CGhoul2Info::mModel).

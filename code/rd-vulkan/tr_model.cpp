@@ -57,6 +57,13 @@ struct GhoulSurfaceDraw
 	VkDescriptorSet descriptorSet;
 	uint32_t firstIndex;
 	uint32_t indexCount;
+	// This surface's original mdxmSurfHierarchy_t index (thisSurfaceIndex) -
+	// -1 for VulkanStaticModel's surfaces (plain .md3, no Ghoul2 surface
+	// hierarchy to index into). Lets VK_DrawGhoul2Entities cross-reference a
+	// live CGhoul2Info::mSlist runtime on/off override (G2API_SetSurfaceOnOff,
+	// tr_init.cpp) against this baked draw-call list without needing to
+	// re-bake per-instance geometry - see that function's own comment.
+	int surfIndex;
 };
 
 // One vertex's CPU-side skinning inputs, parallel (same index) to the
@@ -124,6 +131,14 @@ struct VulkanGhoul2Model
 	// crash or corruption) - accepted as a rare-scene edge case rather than
 	// an unbounded dynamic allocation.
 	uint32_t nextSkinSlot = 0;
+	// Surface name (lowercased) and baked-default G2SURFACEFLAG_* flags,
+	// indexed by the same original mdxmSurfHierarchy_t index
+	// (thisSurfaceIndex) GhoulSurfaceDraw::surfIndex carries - lets
+	// G2API_SetSurfaceOnOff (tr_init.cpp) resolve a surface name to an
+	// index and read its baked default flags without re-parsing the .glm.
+	// Empty for a VulkanStaticModel (plain .md3, no surface hierarchy).
+	std::vector<std::string> surfaceNames;
+	std::vector<unsigned int> surfaceFlags;
 };
 
 // A bind-pose-only skeleton: just bone names and their bind-pose object-
@@ -640,7 +655,7 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 				// init, destroyed once at renderer shutdown, unaffected by
 				// world reloads (see tr_init.cpp).
 				VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.ghoul2DescriptorPool, img, vk.whiteImage );
-				drawSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf->numTriangles * 3 } );
+				drawSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf->numTriangles * 3, surfIndex } );
 			}
 			// No image resolved - same "skip rather than draw an opaque
 			// white quad" call as tr_world.cpp's RE_LoadWorldMap, and for
@@ -663,6 +678,8 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	model.surfaces = std::move( drawSurfaces );
 	model.skeletonIndex = skeletonIndex;
 	model.skinSource = std::move( skinSource );
+	model.surfaceNames = std::move( surfaceNames );
+	model.surfaceFlags = std::move( surfaceFlags );
 
 	// Sized for GHOUL2_SKIN_SLOTS_PER_MODEL independent slots - see
 	// VulkanGhoul2Model::vertexBuffer's comment for why one slot isn't
@@ -697,6 +714,28 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 		fileName, skinHandle, (int)s_ghoul2Models[index].surfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size() );
 
 	return index;
+}
+
+// See this function's own declaration comment (tr_local.h).
+int VK_FindGhoul2SurfaceIndex( int modelCacheIndex, const char *surfaceName, unsigned int *outBaseFlags )
+{
+	if ( modelCacheIndex <= 0 || (size_t)modelCacheIndex >= s_ghoul2Models.size() || !surfaceName )
+	{
+		return -1;
+	}
+	const VulkanGhoul2Model &model = s_ghoul2Models[modelCacheIndex];
+	for ( size_t i = 0; i < model.surfaceNames.size(); i++ )
+	{
+		if ( !Q_stricmp( model.surfaceNames[i].c_str(), surfaceName ) )
+		{
+			if ( outBaseFlags )
+			{
+				*outBaseFlags = model.surfaceFlags[i];
+			}
+			return (int)i;
+		}
+	}
+	return -1;
 }
 
 // Non-Ghoul2 static models (.md3) - map set pieces (misc_model_static),
@@ -820,7 +859,9 @@ int VK_LoadMD3Model( const char *fileName )
 				// model is cached by filename and expected to survive a world
 				// reload exactly like a Ghoul2 model does.
 				VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.ghoul2DescriptorPool, img, vk.whiteImage );
-				drawSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf->numTriangles * 3 } );
+				// -1: plain .md3 statics have no Ghoul2 surface hierarchy to
+				// index into - see GhoulSurfaceDraw::surfIndex's own comment.
+				drawSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)surf->numTriangles * 3, -1 } );
 			}
 			// No image resolved - skip rather than draw an opaque white quad,
 			// same call as tr_world.cpp's RE_LoadWorldMap and VK_LoadGhoul2Model
@@ -3294,6 +3335,28 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 
 			for ( const GhoulSurfaceDraw &surface : model.surfaces )
 			{
+				// This instance's own runtime on/off override (if any),
+				// checked against the baked-at-load-time decision this
+				// draw call already represents (a surface skipped via
+				// mdxmSurfHierarchy_t's own default G2SURFACEFLAG_OFF -
+				// see VK_LoadGhoul2Model's skip check - never became a
+				// GhoulSurfaceDraw entry at all, so isn't reachable here
+				// regardless of mSlist). See G2API_SetSurfaceOnOff's own
+				// comment (tr_init.cpp) for what populates mSlist and why
+				// NODESCENDANTS' recursive hide isn't applied here either.
+				bool overriddenOff = false;
+				for ( const surfaceInfo_t &entry : g2Instance.mSlist )
+				{
+					if ( entry.surface == surface.surfIndex )
+					{
+						overriddenOff = ( entry.offFlags & G2SURFACEFLAG_OFF ) != 0;
+						break;
+					}
+				}
+				if ( overriddenOff )
+				{
+					continue;
+				}
 				vkCmdBindDescriptorSets( cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, vk.worldPipelineLayout,
 					0, 1, &surface.descriptorSet, 0, nullptr );
 				vkCmdDrawIndexed( cmd, surface.indexCount, 1, surface.firstIndex, 0, 0 );

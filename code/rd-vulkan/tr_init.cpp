@@ -2035,7 +2035,71 @@ qboolean G2API_SetSkin( CGhoul2Info *ghlInfo, qhandle_t customSkin, qhandle_t re
 	ghlInfo->mModel = (qhandle_t)VK_LoadGhoul2Model( ghlInfo->mFileName, (int)renderSkin );
 	return qtrue;
 }
-qboolean G2API_SetSurfaceOnOff( CGhoul2Info *ghlInfo, const char *surfaceName, const int flags ) { (void)ghlInfo; (void)surfaceName; (void)flags; return qfalse; }
+// Real per-instance surface visibility toggling - ported from rd-vanilla's
+// real G2_SetSurfaceOnOff (G2_surfaces.cpp), adapted to this renderer's own
+// model-cache lookup (VK_FindGhoul2SurfaceIndex, tr_model.cpp) instead of
+// rd-vanilla's currentModel->mdxm pointer (never populated by this
+// renderer's CGhoul2Info instances - see VK_LoadGhoul2Model's own comment
+// on why this renderer tracks models by its own cache index, mModel,
+// rather than a real model_t). Same real semantics as the original:
+// ghlInfo->mSlist (a shared, cross-renderer field - CGhoul2Info::mSlist,
+// ghoul2_shared.h) holds a sparse list of per-instance overrides, one entry
+// per surface the game has ever explicitly toggled away from its .glm's own
+// baked default; only the G2SURFACEFLAG_OFF/NODESCENDANTS bits of an
+// incoming `flags` are ever applied (matching the real comment - "the only
+// bit we really care about... is the off bit"), and a new entry is only
+// pushed if it'd actually change anything, not for every call. Confirmed
+// real, exercised data behind this, not just real API shape: hoth2's
+// `protocol_imp` NPC (`ext_data/npcs/protocol_imp.npc`) declares `surfOff
+// head` + `surfOn head_off`, applied once at spawn via
+// G_SetG2PlayerModelInfo (g_client.cpp) - previously a silent no-op here,
+// meaning that droid always showed its default "head" surface and never
+// its "head_off" variant regardless of skin.
+//
+// NODESCENDANTS' real recursive "also hide every child surface in the
+// hierarchy" behaviour (G2_FindRecursiveSurface) is NOT ported - the bit is
+// still masked/stored faithfully in mSlist for forward-compatibility, but
+// VK_DrawGhoul2Entities' own on/off check (this file's other half of this
+// feature, tr_model.cpp) only ever looks at G2SURFACEFLAG_OFF on the exact
+// surface named, same scope this renderer's existing *load-time* baked-
+// flags check already had before this change.
+qboolean G2API_SetSurfaceOnOff( CGhoul2Info *ghlInfo, const char *surfaceName, const int flags )
+{
+	if ( !ghlInfo || !surfaceName )
+	{
+		return qfalse;
+	}
+
+	static const int kMask = G2SURFACEFLAG_OFF | G2SURFACEFLAG_NODESCENDANTS;
+
+	unsigned int baseFlagsRaw = 0;
+	int surfIndex = VK_FindGhoul2SurfaceIndex( ghlInfo->mModel, surfaceName, &baseFlagsRaw );
+	if ( surfIndex < 0 )
+	{
+		return qfalse;
+	}
+	int baseFlags = (int)baseFlagsRaw;
+
+	for ( surfaceInfo_t &entry : ghlInfo->mSlist )
+	{
+		if ( entry.surface == surfIndex )
+		{
+			entry.offFlags &= ~kMask;
+			entry.offFlags |= flags & kMask;
+			return qtrue;
+		}
+	}
+
+	int newFlags = ( baseFlags & ~kMask ) | ( flags & kMask );
+	if ( newFlags != baseFlags )
+	{
+		surfaceInfo_t entry;
+		entry.surface = surfIndex;
+		entry.offFlags = newFlags;
+		ghlInfo->mSlist.push_back( entry );
+	}
+	return qtrue;
+}
 void G2API_SetTime( int currentTime, int clock ) { (void)currentTime; (void)clock; }
 qboolean G2API_StopBoneAnim( CGhoul2Info *ghlInfo, const char *boneName ) { return VK_StopGhoul2BoneAnim( ghlInfo, VK_ResolveGhoul2AnimBone( ghlInfo, boneName ) ) ? qtrue : qfalse; }
 qboolean G2API_StopBoneAnimIndex( CGhoul2Info *ghlInfo, const int index ) { return VK_StopGhoul2BoneAnim( ghlInfo, index ) ? qtrue : qfalse; }
