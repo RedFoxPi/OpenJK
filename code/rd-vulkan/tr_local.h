@@ -707,3 +707,7 @@ void RE_EndFrame( int *frontEndMsec, int *backEndMsec );
 void RE_GetScreenShot( byte *buffer, int w, int h );
 void R_ScreenShotPNG_f( void );
 void VK_DestroyReadbackImage( void );
+// Real swapchain recreation - see this function's own comment (tr_init.cpp)
+// for the exact frozen-rendering bug it fixes and RE_BeginFrame's own
+// comment (tr_cmds.cpp) for both call sites.
+void VK_RecreateSwapchain( void );

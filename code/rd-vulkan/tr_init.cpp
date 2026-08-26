@@ -558,6 +558,82 @@ static void VK_CreateFramebuffers( void )
 	}
 }
 
+// Tears down every swapchain-*sized* resource (not the render pass, which
+// only depends on format - stable across a resize, not extent - and not
+// the device/instance/surface/pipelines, none of which need to change
+// either: every pipeline already uses VK_DYNAMIC_STATE_VIEWPORT/SCISSOR,
+// set fresh per frame from vk.swapchainExtent, precisely so a resize never
+// needs to rebuild any of them). See VK_RecreateSwapchain's own comment
+// for why this exists as a separate step from VK_Shutdown's full teardown.
+static void VK_DestroySwapchainResources( void )
+{
+	for ( auto fb : vk.swapchainFramebuffers ) vkDestroyFramebuffer( vk.device, fb, nullptr );
+	vk.swapchainFramebuffers.clear();
+	if ( vk.depthImageView ) { vkDestroyImageView( vk.device, vk.depthImageView, nullptr ); vk.depthImageView = VK_NULL_HANDLE; }
+	if ( vk.depthImage ) { vkDestroyImage( vk.device, vk.depthImage, nullptr ); vk.depthImage = VK_NULL_HANDLE; }
+	if ( vk.depthImageMemory ) { vkFreeMemory( vk.device, vk.depthImageMemory, nullptr ); vk.depthImageMemory = VK_NULL_HANDLE; }
+	for ( auto view : vk.swapchainImageViews ) vkDestroyImageView( vk.device, view, nullptr );
+	vk.swapchainImageViews.clear();
+	if ( vk.swapchain ) { vkDestroySwapchainKHR( vk.device, vk.swapchain, nullptr ); vk.swapchain = VK_NULL_HANDLE; }
+}
+
+// Real swapchain recreation - a genuine gap this renderer had since its
+// first pass (see RE_BeginFrame's own comment, tr_cmds.cpp, for the exact
+// symptom this fixes): before this, any real window resize made
+// vkAcquireNextImageKHR return VK_ERROR_OUT_OF_DATE_KHR every single frame
+// from then on (the swapchain was still sized for the *old* window), and
+// RE_BeginFrame's response was just to log a warning and skip the frame -
+// forever, since nothing ever rebuilt the swapchain, permanently freezing
+// rendering until a full engine restart. Called two ways: proactively from
+// RE_BeginFrame when the window's actual drawable size no longer matches
+// vk.swapchainExtent (the common real-world case, catches a resize before
+// even trying to acquire), and reactively if vkAcquireNextImageKHR itself
+// still returns VK_ERROR_OUT_OF_DATE_KHR despite that check (a surface
+// capability change not reflected in drawable size alone, or a race
+// between the check and the acquire call).
+//
+// Deliberately NOT a port of rd-vanilla's own resize handling - that
+// renderer's GL context has no equivalent "swapchain" concept at all (GL
+// just renders into whatever size the window currently is, no explicit
+// recreation step exists to port) - this is a from-scratch implementation
+// of what Vulkan's own swapchain model requires, same "reuse strategy"
+// this renderer applies throughout (see README.md).
+void VK_RecreateSwapchain( void )
+{
+	int w = 0, h = 0;
+	SDL_Vulkan_GetDrawableSize( vk.window, &w, &h );
+	if ( w <= 0 || h <= 0 )
+	{
+		// Minimized (or otherwise zero-area) - nothing to recreate yet;
+		// the caller's own per-frame size check will retry once the
+		// window has a real size again.
+		return;
+	}
+
+	vkDeviceWaitIdle( vk.device );
+
+	VK_DestroySwapchainResources();
+	// Forces a fresh readback image at the new size on the very next
+	// screenshot/GetScreenShot - it's a lazily-created singleton sized to
+	// whatever vk.swapchainExtent was at its own creation time (see
+	// VK_CreateReadbackImage, tr_cmds.cpp) and, unlike everything else
+	// here, was never being invalidated on a size change at all before
+	// this fix - a real second bug alongside the frozen-swapchain one,
+	// just silent instead of loud: a stale-sized readback image would
+	// still successfully copy (Vulkan doesn't require matching src/dst
+	// extents for vkCmdCopyImage's *region*, only that the region fits
+	// both), quietly producing a screenshot cropped/misaligned to the old
+	// window size instead of an error.
+	VK_DestroyReadbackImage();
+
+	VK_CreateSwapchain();
+	VK_CreateDepthResources();
+	VK_CreateFramebuffers();
+
+	vk.glConfig.vidWidth = vk.swapchainExtent.width;
+	vk.glConfig.vidHeight = vk.swapchainExtent.height;
+}
+
 static void VK_CreateCommandPoolsAndSync( void )
 {
 	VkCommandPoolCreateInfo poolInfo = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };

@@ -3099,6 +3099,81 @@ per-run noise floor (hoth2 0.44%/0.14%, vjun1 0.18%/0.68%, yavin1
 fewer or no real surfaces using these specific shaders in view from their
 fixed spawn cameras, not a sign the fix only partially worked.
 
+## Window resize / swapchain recreation
+
+Closes a real, severe usability gap that had nothing to do with any
+specific map or shader: a real window resize (dragging the window edge on
+a real desktop - the one thing every one of this renderer's fixed-window-
+size headless test scenes can never exercise) permanently froze rendering.
+Root cause: `RE_BeginFrame`'s `vkAcquireNextImageKHR` call returns
+`VK_ERROR_OUT_OF_DATE_KHR` once the window's actual size no longer matches
+the swapchain's - real, expected Vulkan behaviour after any resize - and
+the existing response to that was just to log a warning and skip the
+frame. Since nothing ever rebuilt the swapchain, *every* later frame's
+acquire kept failing the exact same way - not a one-frame hiccup, a
+permanent freeze until a full engine restart. A second, quieter bug sat
+right next to it: the screenshot readback image (`VK_CreateReadbackImage`,
+tr_cmds.cpp) is a lazily-created singleton sized to the swapchain at
+whatever moment it first gets used, and was never being invalidated on a
+resize either - unlike the frozen-swapchain bug this one wouldn't even
+error loudly, since `vkCmdCopyImage`'s region-based copy doesn't require
+matching image extents, just a region that fits both; it would have
+quietly produced a screenshot cropped or misaligned to the old window size
+instead.
+
+**Fix**: `VK_RecreateSwapchain` (tr_init.cpp) tears down and rebuilds
+every swapchain-*sized* resource - the swapchain itself, its image views,
+the depth image/view/memory, and the framebuffers - at the window's
+current real drawable size, and forces the readback image to regenerate
+at that same new size on its next use. Deliberately *not* a rebuild of
+the render pass (depends only on format, stable across a resize) or any
+pipeline (every one already uses `VK_DYNAMIC_STATE_VIEWPORT`/`SCISSOR`,
+set fresh from `vk.swapchainExtent` each frame specifically so a resize
+never needs to touch them). Called two ways from `RE_BeginFrame`:
+proactively, by comparing `SDL_Vulkan_GetDrawableSize` against
+`vk.swapchainExtent` before even trying to acquire (catches the common
+case with zero dropped frames); reactively, if `vkAcquireNextImageKHR`
+still somehow returns `VK_ERROR_OUT_OF_DATE_KHR` anyway, recreating and
+retrying the acquire once. Not a port of anything in rd-vanilla - GL has
+no equivalent "swapchain" concept for a resize to invalidate in the first
+place, so this is a from-scratch implementation of what Vulkan's own
+model requires, the same "reuse strategy" this renderer applies
+throughout (see "Ghoul2 is not reused from rd-vanilla" below).
+
+**Verified with a real live resize, not just code review** - this gap
+specifically can't be exercised by any of this renderer's own fixed-
+window-size xvfb-based test scenes, so `xdotool` was installed and used to
+resize the *actual* X11 window of a running, unmodified SP engine process
+mid-session (polling for each scripted screenshot's file to appear on
+disk, then immediately issuing the resize, all within one script so
+nothing races against the engine's own frame pacing): four resizes in one
+run against academy1 (800x600 -> 640x480 -> 1280x720 -> 320x240, growing
+and shrinking repeatedly, down to a quarter of the original test
+resolution) each produced a correctly-sized, correctly-rendered screenshot
+- confirmed by both the reported PNG dimensions matching exactly and by
+eye (real scene geometry, not a black/garbled frame) - with a clean `+quit`
+exit (status 0) and zero `OUT_OF_DATE`/`VK_ERROR`/crash output in the log
+across all four. Also ran the full standard SP regression suite (no resize
+involved) to confirm the added per-frame size check doesn't affect normal
+operation: all 5 scenes matched the pre-fix build within this renderer's
+already-documented noise floor.
+
+**Known, deliberate scope boundary, found during that same live test**:
+after a resize, the actual 3D/2D scene content kept rendering at the *old*
+logical resolution, letterboxed into a corner of the new, larger swapchain
+image (confirmed directly - a resize from 800x600 to 1024x768 produced a
+1024x768 PNG with real rendered content filling only its top-left 800x600
+and solid black filling the rest). This is expected, not a bug this fix
+should also close: the game's logical viewport size is `cls.glconfig`/
+`r_customwidth`/`r_customheight` state cached client-side (`code/client/`,
+shared by every renderer, never touched by this fix) - a live OS-level
+window resize alone doesn't make the *client* re-query it without a
+`vid_restart`, in rd-vanilla either, since that caching is renderer-
+agnostic shared code. What this fix actually guarantees is the renderer-
+level half: the Vulkan swapchain itself never again gets stuck permanently
+invalid after a resize, whatever resolution the client above it decides to
+render at.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3313,8 +3388,6 @@ fixed spawn cameras, not a sign the fix only partially worked.
   alone) - a `BLEND_ALPHA` shader needing the fallback is still unresolved.
 - Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, dissolves,
   model bounds/tag queries.
-- Window resize / swapchain recreation - a resize will currently just log a
-  warning and stop rendering rather than crash.
 
 ## Ghoul2 is not reused from rd-vanilla
 
@@ -3490,3 +3563,29 @@ that property and shouldn't be used to draw conclusions about a
 the mistake above, includes essentially every capture taken via
 `scenes.json` before the fix described below, not just captures from
 before `com_fixedtime` was added to it at all.
+
+**Testing a real live window resize** (see "Window resize / swapchain
+recreation" above for what this verified) needs a real X11 window a
+second process can reach into mid-session - `xvfb-run -a` alone isn't
+enough since it blocks for the whole capture and tears its Xvfb down
+right after, leaving no window to resize from outside. Run `Xvfb` and the
+engine separately instead: `Xvfb :97 -screen 0 800x600x24 &`, then launch
+`openjk_sp.x86_64` (same `+set`s as above, `DISPLAY=:97`) in the
+background with several `+wait N` / `+screenshot_png` pairs scripted in
+sequence, and in the *same shell* poll for each screenshot's PNG to land
+on disk before resizing - polling and resizing from a separate later
+command races against the engine's own frame pacing and reliably resizes
+*after* the process has already hit `+quit` instead (confirmed the hard
+way: under lavapipe, `+wait 400` completes in well under a second once a
+map's finished loading, far faster than two separate tool round-trips can
+land in between). `xdotool` (not preinstalled - `apt-get install
+xdotool`) does the actual resize once a screenshot's own file confirms the
+right moment: `WID=$(DISPLAY=:97 xdotool search --onlyvisible --name ""
+| tail -1)` finds the engine's window (no window manager is running under
+Xvfb, so `getactivewindow`/`_NET_ACTIVE_WINDOW`-based lookups fail - a
+plain `search` by empty name pattern still finds it), then `xdotool
+windowsize "$WID" <w> <h>` resizes it directly via `XResizeWindow`,
+independent of any window-manager size-hint negotiation. Comparing the
+resulting screenshots' own pixel dimensions (not just that a file exists)
+is what actually confirms the swapchain was recreated at the new size
+rather than silently kept at the old one.

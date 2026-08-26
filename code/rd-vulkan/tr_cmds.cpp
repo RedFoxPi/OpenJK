@@ -21,6 +21,8 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "../server/exe_headers.h"
 
 #include "tr_local.h"
+#include <SDL.h>
+#include <SDL_vulkan.h>
 #include <vector>
 
 // ============================================================================
@@ -118,11 +120,40 @@ void RE_BeginFrame( stereoFrame_t stereoFrame )
 	vkFrame_t &frame = vk.frames[vk.currentFrame];
 	vkWaitForFences( vk.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX );
 
+	// Proactive resize check - the common real-world case (a window drag-
+	// resize) reaches here before vkAcquireNextImageKHR ever has a chance
+	// to complain, so catching it here means a resize is usually invisible
+	// to the frame that follows it rather than causing even one dropped/
+	// warned-about frame. See VK_RecreateSwapchain's own comment
+	// (tr_init.cpp) for the real bug this - together with the
+	// VK_ERROR_OUT_OF_DATE_KHR retry below - fixes: without either check,
+	// any real resize permanently froze rendering (every later frame's
+	// acquire kept failing against a swapchain still sized for the old
+	// window) until a full engine restart, not just until the next resize.
+	int drawableW = 0, drawableH = 0;
+	SDL_Vulkan_GetDrawableSize( vk.window, &drawableW, &drawableH );
+	if ( drawableW > 0 && drawableH > 0 &&
+		( (uint32_t)drawableW != vk.swapchainExtent.width || (uint32_t)drawableH != vk.swapchainExtent.height ) )
+	{
+		VK_RecreateSwapchain();
+	}
+
 	VkResult acquireResult = vkAcquireNextImageKHR( vk.device, vk.swapchain, UINT64_MAX,
 		frame.imageAvailable, VK_NULL_HANDLE, &vk.currentSwapchainImage );
+	if ( acquireResult == VK_ERROR_OUT_OF_DATE_KHR )
+	{
+		// The proactive check above missed it (e.g. a surface capability
+		// change not reflected in drawable size alone) - recreate and
+		// retry once. A second failure here is treated the same as any
+		// other unexpected result (skip this one frame, warn) rather than
+		// looping - the next frame's proactive check above is the real
+		// backstop against getting stuck.
+		VK_RecreateSwapchain();
+		acquireResult = vkAcquireNextImageKHR( vk.device, vk.swapchain, UINT64_MAX,
+			frame.imageAvailable, VK_NULL_HANDLE, &vk.currentSwapchainImage );
+	}
 	if ( acquireResult != VK_SUCCESS && acquireResult != VK_SUBOPTIMAL_KHR )
 	{
-		// swapchain resize/recreation isn't implemented yet in this first pass
 		ri.Printf( PRINT_WARNING, "rd-vulkan: vkAcquireNextImageKHR returned %d\n", (int)acquireResult );
 		return;
 	}
