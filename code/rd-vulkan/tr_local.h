@@ -552,6 +552,13 @@ int VK_FindGhoul2SurfaceIndex( int modelCacheIndex, const char *surfaceName, uns
 int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName );
 bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t *out );
 bool VK_GetGhoul2BoneCurrentPoseMat( int modelCacheIndex, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime, mdxaBone_t *out );
+// Surface-bolt counterpart to VK_GetGhoul2BoneCurrentPoseMat, for a bolt
+// whose boltInfo_t has a surfaceNumber instead of a boneNumber - see this
+// function's own comment (tr_model.cpp) for the real formula it ports and
+// why. Returns false (leaving *out untouched) if surfIndex isn't a real
+// G2SURFACEFLAG_ISBOLT surface on this model (VulkanGhoul2Model::
+// tagTriangles has no entry for it) or any other invalid input.
+bool VK_GetGhoul2SurfaceBoltMatrix( int modelCacheIndex, int surfIndex, const CGhoul2Info *ghlInfo, int currentTime, mdxaBone_t *out );
 // The .gla's own recorded name (mdxaHeader_t::name, e.g.
 // "models/players/_humanoid/_humanoid" - no extension), read straight out
 // of VulkanSkeleton::fileData (kept resident for exactly this kind of

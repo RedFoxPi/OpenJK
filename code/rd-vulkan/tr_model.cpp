@@ -46,6 +46,7 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #include "tr_local.h"
 #include "../rd-common/mdx_format.h"
 #include "../qcommon/matcomp.h"
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -139,6 +140,12 @@ struct VulkanGhoul2Model
 	// Empty for a VulkanStaticModel (plain .md3, no surface hierarchy).
 	std::vector<std::string> surfaceNames;
 	std::vector<unsigned int> surfaceFlags;
+	// Bind-pose "tag triangle" (bindPos + bone weights, no UV) for every
+	// G2SURFACEFLAG_ISBOLT surface, keyed by its original surface index -
+	// see VK_GetGhoul2SurfaceBoltMatrix's own comment for what this drives,
+	// and VK_LoadGhoul2Model's own capture site for why it's exactly 3
+	// verts, no more.
+	std::unordered_map<int, std::array<GhoulSkinVertex, 3>> tagTriangles;
 };
 
 // A bind-pose-only skeleton: just bone names and their bind-pose object-
@@ -539,13 +546,55 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	std::vector<uint32_t> cpuIndexes;
 	std::vector<GhoulSurfaceDraw> drawSurfaces;
 	std::vector<GhoulSkinVertex> skinSource;
+	std::unordered_map<int, std::array<GhoulSkinVertex, 3>> tagTriangles;
 
 	for ( int i = 0; i < hdr->numSurfaces; i++ )
 	{
 		int surfIndex = surf->thisSurfaceIndex;
+		bool isBolt = surfIndex >= 0 && surfIndex < hdr->numSurfaces &&
+			( surfaceFlags[surfIndex] & G2SURFACEFLAG_ISBOLT );
 		bool skip = ( surfIndex < 0 || surfIndex >= hdr->numSurfaces )
 			|| ( surfaceFlags[surfIndex] & G2SURFACEFLAG_OFF )
+			|| isBolt
 			|| surf->numVerts <= 0 || surf->numTriangles <= 0;
+
+		// A bolt-only surface (G2SURFACEFLAG_ISBOLT, name convention "*foo" -
+		// confirmed real, directly parsed from real .glm data: every one of
+		// kyle/model.glm's 45 asterisk-prefixed surfaces carries this exact
+		// flag, always with a real 3-vert/1-triangle "tag triangle" and
+		// always an empty shader name - Carcass emits these purely as
+		// attachment-point geometry, never meant to be drawn as a mesh) -
+		// see VK_GetGhoul2SurfaceBoltMatrix's own comment for what this data
+		// is captured for. Never entered the draw path anyway even before
+		// this (its empty shader name always failed VK_FindImage, and its
+		// BLEND_ALPHA default - not BLEND_OPAQUE - kept it out of the
+		// map-image fallback too, so this was never a visible bug) - but it
+		// was still uselessly attempting that resolution every load, and
+		// without this capture a surface-bolt query has no triangle to
+		// compute a matrix from at all.
+		if ( isBolt && surf->numVerts >= 3 )
+		{
+			const mdxmVertex_t *tagVerts = (const mdxmVertex_t *)( (const byte *)surf + surf->ofsVerts );
+			const int *tagBoneReferences = (const int *)( (const byte *)surf + surf->ofsBoneReferences );
+			std::array<GhoulSkinVertex, 3> tri = {};
+			for ( int t = 0; t < 3; t++ )
+			{
+				GhoulSkinVertex &sv = tri[t];
+				sv.bindPos[0] = tagVerts[t].vertCoords[0];
+				sv.bindPos[1] = tagVerts[t].vertCoords[1];
+				sv.bindPos[2] = tagVerts[t].vertCoords[2];
+				sv.numWeights = G2_GetVertWeights( &tagVerts[t] );
+				float totalWeight = 0.0f;
+				for ( int k = 0; k < sv.numWeights && k < iMAX_G2_BONEWEIGHTS_PER_VERT; k++ )
+				{
+					int localBoneIndex = G2_GetVertBoneIndex( &tagVerts[t], k );
+					sv.boneIndex[k] = ( localBoneIndex >= 0 && localBoneIndex < surf->numBoneReferences )
+						? tagBoneReferences[localBoneIndex] : 0;
+					sv.boneWeight[k] = G2_GetVertBoneWeight( &tagVerts[t], k, totalWeight, sv.numWeights );
+				}
+			}
+			tagTriangles[surfIndex] = tri;
+		}
 
 		if ( !skip )
 		{
@@ -680,6 +729,7 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	model.skinSource = std::move( skinSource );
 	model.surfaceNames = std::move( surfaceNames );
 	model.surfaceFlags = std::move( surfaceFlags );
+	model.tagTriangles = std::move( tagTriangles );
 
 	// Sized for GHOUL2_SKIN_SLOTS_PER_MODEL independent slots - see
 	// VulkanGhoul2Model::vertexBuffer's comment for why one slot isn't
@@ -987,6 +1037,112 @@ bool VK_GetGhoul2BoneCurrentPoseMat( int modelCacheIndex, const CGhoul2Info *ghl
 		return false;
 	}
 	*out = pose[boneIndex];
+	return true;
+}
+
+// A surface bolt's current world-space (relative to model root) matrix -
+// the surface-name counterpart to VK_GetGhoul2BoneCurrentPoseMat above,
+// for a bolt whose CGhoul2Info::boltInfo_t has a real surfaceNumber
+// instead of a boneNumber (see G2API_AddBolt's own comment, tr_init.cpp,
+// for why a name can resolve to either). Ported from rd-vanilla's real
+// G2_ProcessSurfaceBolt2's "normal model tag" branch (tr_ghoul2.cpp) -
+// only that branch, not its sibling for AddSurface's barycentric
+// procedurally-generated tags (G2SURFACEFLAG_GENERATED), which this
+// renderer doesn't implement AddSurface for at all (see README.md).
+//
+// The formula: skin the surface's own "tag triangle" (its first 3 raw
+// verts - VK_LoadGhoul2Model's tagTriangles capture, the ONLY thing this
+// needs from a G2SURFACEFLAG_ISBOLT surface, since it has no real mesh to
+// draw) through the current pose using the exact same per-vertex weighted-
+// bone-transform arithmetic VK_SkinGhoul2Model already uses for ordinary
+// mesh vertices, then build an orthonormal basis from that triangle's
+// sides - real rd-vanilla's own comment calls the two side vectors it
+// uses "longest"/"shortest", but `iG2_TRISIDE_LONGEST`/`_SHORTEST`
+// (mdx_format.h) are fixed constants (0 and 2), not a runtime edge-length
+// comparison, so this is a fixed, mechanical formula, not a heuristic.
+bool VK_GetGhoul2SurfaceBoltMatrix( int modelCacheIndex, int surfIndex, const CGhoul2Info *ghlInfo, int currentTime, mdxaBone_t *out )
+{
+	if ( modelCacheIndex <= 0 || (size_t)modelCacheIndex >= s_ghoul2Models.size() || !ghlInfo || !out )
+	{
+		return false;
+	}
+	const VulkanGhoul2Model &model = s_ghoul2Models[modelCacheIndex];
+	auto it = model.tagTriangles.find( surfIndex );
+	if ( it == model.tagTriangles.end() )
+	{
+		return false;
+	}
+	int skeletonIndex = model.skeletonIndex;
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return false;
+	}
+	std::vector<mdxaBone_t> pose;
+	VK_ComputeGhoul2Pose( skeletonIndex, ghlInfo, currentTime, pose );
+
+	float pTri[3][3];
+	for ( int t = 0; t < 3; t++ )
+	{
+		const GhoulSkinVertex &sv = it->second[t];
+		pTri[t][0] = pTri[t][1] = pTri[t][2] = 0.0f;
+		for ( int k = 0; k < sv.numWeights; k++ )
+		{
+			int boneIndex = sv.boneIndex[k];
+			if ( boneIndex < 0 || (size_t)boneIndex >= pose.size() )
+			{
+				continue;
+			}
+			const mdxaBone_t &m = pose[boneIndex];
+			float w = sv.boneWeight[k];
+			pTri[t][0] += w * ( m.matrix[0][0] * sv.bindPos[0] + m.matrix[0][1] * sv.bindPos[1] + m.matrix[0][2] * sv.bindPos[2] + m.matrix[0][3] );
+			pTri[t][1] += w * ( m.matrix[1][0] * sv.bindPos[0] + m.matrix[1][1] * sv.bindPos[1] + m.matrix[1][2] * sv.bindPos[2] + m.matrix[1][3] );
+			pTri[t][2] += w * ( m.matrix[2][0] * sv.bindPos[0] + m.matrix[2][1] * sv.bindPos[1] + m.matrix[2][2] * sv.bindPos[2] + m.matrix[2][3] );
+		}
+	}
+
+	float sides[3][3];
+	for ( int j = 0; j < 3; j++ )
+	{
+		int n = ( j + 1 ) % 3;
+		sides[j][0] = pTri[n][0] - pTri[j][0];
+		sides[j][1] = pTri[n][1] - pTri[j][1];
+		sides[j][2] = pTri[n][2] - pTri[j][2];
+	}
+
+	auto normalize = []( float v[3] )
+	{
+		float len = sqrtf( v[0] * v[0] + v[1] * v[1] + v[2] * v[2] );
+		if ( len > 0.0f )
+		{
+			v[0] /= len; v[1] /= len; v[2] /= len;
+		}
+	};
+
+	float axis0[3] = { sides[0][0], sides[0][1], sides[0][2] };
+	float axis1[3] = { sides[2][0], sides[2][1], sides[2][2] };
+	normalize( axis0 );
+	normalize( axis1 );
+
+	// Project axis0 to be exactly perpendicular to axis1.
+	float d = axis0[0] * axis1[0] + axis0[1] * axis1[1] + axis0[2] * axis1[2];
+	axis0[0] -= d * axis1[0]; axis0[1] -= d * axis1[1]; axis0[2] -= d * axis1[2];
+	normalize( axis0 );
+
+	float axis2[3] = {
+		sides[0][1] * sides[2][2] - sides[0][2] * sides[2][1],
+		sides[0][2] * sides[2][0] - sides[0][0] * sides[2][2],
+		sides[0][0] * sides[2][1] - sides[0][1] * sides[2][0],
+	};
+	normalize( axis2 );
+
+	// MDX_TAG_ORIGIN (tr_ghoul2.cpp) = 2, the third tag vertex.
+	out->matrix[0][3] = pTri[2][0];
+	out->matrix[1][3] = pTri[2][1];
+	out->matrix[2][3] = pTri[2][2];
+
+	out->matrix[0][0] = axis1[0]; out->matrix[0][1] = axis0[0]; out->matrix[0][2] = -axis2[0];
+	out->matrix[1][0] = axis1[1]; out->matrix[1][1] = axis0[1]; out->matrix[1][2] = -axis2[1];
+	out->matrix[2][0] = axis1[2]; out->matrix[2][1] = axis0[2]; out->matrix[2][2] = -axis2[2];
 	return true;
 }
 

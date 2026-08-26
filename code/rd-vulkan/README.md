@@ -557,7 +557,9 @@ Run against `academy1`, headlessly, same as the world-geometry checks above:
   `pelvis`/`cervical`/`lower_lumbar` resolve to sane indices; the
   `*`-prefixed surface-attachment names some models also request correctly
   return "not found", since surface bolts - as opposed to bone bolts -
-  aren't implemented) and bolt matrices compose to plausible non-degenerate
+  aren't implemented **at the time of this investigation - see "Ghoul2
+  surface bolts" below for the later pass that added them**) and bolt
+  matrices compose to plausible non-degenerate
   positions (a believable few dozen units above the entity origin, not
   zero). Despite that, this renderer's own camera still doesn't match
   vanilla's framing at the shots tested - it stays close to a subject
@@ -3174,6 +3176,90 @@ level half: the Vulkan swapchain itself never again gets stuck permanently
 invalid after a resize, whatever resolution the client above it decides to
 render at.
 
+## Ghoul2 surface bolts (`G2API_AddBolt`'s surface-name path)
+
+Closes a real gap this file's own "not implemented" list had carried for a
+long time as "surface bolts... aren't implemented" - not a rare edge case,
+it turned out, but something real, exercised game code relies on for
+*every single player spawn in every one of this checkout's 4 test maps*.
+Real Ghoul2 convention (confirmed by directly parsing real `.glm` data,
+not assumed from the API shape alone): a surface whose name starts with a
+literal `*` is a `G2SURFACEFLAG_ISBOLT`-flagged "tag" surface Carcass
+(the model compiler) emits purely as an attachment-point marker - a real,
+always-3-vertex/1-triangle "tag triangle", always with an empty shader
+name, never meant to be drawn as mesh geometry - and `G2API_AddBolt`'s
+real precedence tries a **surface** name match before ever trying a bone
+name. Parsed `models/players/kyle/model.glm` directly: 45 real `*`-
+prefixed surfaces (`*head_eyes`, `*r_hand_cap_r_arm`, `*l_hand_cap_l_arm`,
+`*hip_l`, ... every one carrying `G2SURFACEFLAG_ISBOLT`); `saber_1.glm`
+has one, `*blade1`. Real game code calls `G2API_AddBolt` with names like
+these constantly - `g_client.cpp`'s `"*head_eyes"` on every player spawn,
+`wp_saber.cpp`'s `"*flash"`/`"*r_hand_cap_r_arm"`/`"*l_hand_cap_l_arm"`,
+`g_turret.cpp`'s `"*muzzle1"`/`"*flash03"`, `g_emplaced.cpp`'s
+`"*cannonflash"`/`"*seat"` - every one of which silently returned -1
+before this (bone-only lookup, no surface fallback), with most callers
+never checking for that failure.
+
+**Two-part fix, both real ports, not new inventions**:
+
+1. `G2API_AddBolt` (tr_init.cpp) now tries `VK_FindGhoul2SurfaceIndex`
+   (the same lookup "Ghoul2 per-surface on/off overrides" above already
+   added) *first*, falling back to the existing bone lookup only if that
+   fails - exact precedence match for rd-vanilla's real `G2_Add_Bolt`
+   (`G2_bolts.cpp`), including reusing an existing bolt on that surface or
+   a freed slot before appending a new one, mirroring the bone path's own
+   logic.
+2. `VK_GetGhoul2SurfaceBoltMatrix` (tr_model.cpp) computes the actual
+   matrix - ported from rd-vanilla's real `G2_ProcessSurfaceBolt2`'s
+   "normal model tag" branch (`tr_ghoul2.cpp`), *not* its sibling branch
+   for `G2API_AddSurface`'s barycentric procedurally-generated tags
+   (`G2SURFACEFLAG_GENERATED`), which this renderer doesn't implement
+   `AddSurface` for at all. The real formula: skin the tag triangle's 3
+   raw vertices through the current pose using the exact same per-vertex
+   weighted-bone-transform arithmetic `VK_SkinGhoul2Model` already applies
+   to ordinary mesh vertices (same weights, same math, just 3 vertices
+   instead of a whole surface), then build an orthonormal basis from the
+   triangle's sides - real rd-vanilla calls the two side vectors it uses
+   "longest"/"shortest", but `iG2_TRISIDE_LONGEST`/`_SHORTEST`
+   (`mdx_format.h`) are fixed constants (0 and 2), not a runtime edge-
+   length comparison, so this is a fully mechanical formula with no
+   ambiguity to guess at, ported exactly.
+
+**A genuine, if invisible, correctness cleanup found along the way**: this
+checkout's existing Ghoul2 load-time skip check only ever excluded
+`G2SURFACEFLAG_OFF` from the draw path, never `G2SURFACEFLAG_ISBOLT` -
+every one of those 45+1 real tag-triangle surfaces was being fed through
+the *normal* per-surface shader-resolution path every load, for nothing
+(their real, always-empty shader name always failed `VK_FindImage`, and
+their default classification - `BLEND_ALPHA`, not `BLEND_OPAQUE` - kept
+them out of the map-image fallback too, so this was never a *visible* bug,
+just wasted resolution attempts and unused vertex/index data). Implementing
+surface bolts needed their tag-triangle data captured somewhere regardless,
+so `VK_LoadGhoul2Model` now explicitly recognizes `G2SURFACEFLAG_ISBOLT`,
+captures the 3-vertex tag data into `VulkanGhoul2Model::tagTriangles`
+(keyed by surface index), and excludes the surface from the normal draw
+path outright - closing the resolution-attempt waste as a side effect of
+doing the real feature properly, not a separate fix.
+
+**Verified**: full SP scene suite clean, no crashes, warning-free rebuild.
+Confirmed real, extensive activation on real data via a temporary
+diagnostic (removed before committing, and re-captured *after* removing
+it - the print itself briefly showed up as visible on-screen console text
+in a first draft of this verification, which would have polluted the
+comparison if not caught): hundreds of successful surface-name resolutions
+logged across every non-menu test scene (`*head_eyes`, `*r_hand`,
+`*l_hand`, `*hips_l_knee`/`*hips_r_knee`, `*r_arm_elbow`/`*l_arm_elbow`,
+`*r_leg_foot`/`*l_leg_foot`, ...) against real player/NPC models (kyle,
+jedi, jedi_tf, jedi_hf, and others) on every single spawn. Pixel-diffed a
+build with this fix against one without it: all 5 scenes stayed within
+this renderer's already-documented per-run noise floor, confirming the
+ISBOLT exclusion changed nothing visible (as expected, since those
+surfaces were already unreachable through the old path) - the *bolt
+matrices themselves* aren't independently confirmed by eye against a
+visible effect that depends on one (e.g. an actual muzzle flash sprite or
+saber blade tag) in this checkout's own fixed spawn-camera captures, only
+that resolution succeeds and produces a matrix rather than failing.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3242,9 +3328,11 @@ render at.
   real cross-fade blending between an old and new animation over a real
   `blendTime`, and real sub-frame interpolation between adjacent whole
   frames - not a cruder single-whole-skeleton-track approximation. Real
-  per-instance surface on/off overrides (`SetSurfaceOnOff`) now too - see
-  "Ghoul2 per-surface on/off overrides" above. Still missing: bone-angle
-  overrides/ragdoll/IK, LOD selection, gore.
+  per-instance surface on/off overrides (`SetSurfaceOnOff`) and real
+  surface bolts (a bolt naming a `*`-prefixed tag surface, not just a
+  bone) now too - see "Ghoul2 per-surface on/off overrides"/"Ghoul2
+  surface bolts" above. Still missing: bone-angle overrides/ragdoll/IK,
+  LOD selection, gore.
 - Runtime polys (`RE_AddPolyToScene`, `tr_model.cpp`) - see "Runtime polys"
   above. Real per-scene queueing, CPU fan-to-triangle-list expansion, and a
   dedicated pipeline with the same three blend-mode variants (alpha/
@@ -3301,13 +3389,11 @@ render at.
   `_humanoid_academy1.gla`) are still stubs; every model always uses
   whichever single `.gla` `VK_LoadGhoul2Skeleton` first resolved for it.
   Also still missing: bone-angle overrides (`SetBoneAngles*`), ragdoll, IK,
-  LOD selection, gore, tags, ragdoll, model-to-model attachment
-  (`AttachG2Model`/`AttachEnt`), and surface bolts (a bolt naming a
-  *surface* rather than a bone - only bone bolts are implemented, see
-  "Ghoul2 rendering" above for `AddBolt`/`GetBoltMatrix`, itself still
-  bind-pose-only regardless of what the mesh is doing). See "Ghoul2 is not
-  reused from rd-vanilla" below for why the animation system was a separate,
-  larger task than the rest of this renderer.
+  LOD selection, gore, tags, and model-to-model attachment
+  (`AttachG2Model`/`AttachEnt`). Surface bolts (a bolt naming a *surface*
+  rather than a bone) are real now too - see "Ghoul2 surface bolts" above.
+  See "Ghoul2 is not reused from rd-vanilla" below for why the animation
+  system was a separate, larger task than the rest of this renderer.
 - `RE_SetRangedFog`, `R_SetTempGlobalFogColor`, and per-brush *local* fog
   volumes (a `LUMP_FOGS` entry with a real `brushNum`, bounded to one
   convex region, e.g. vjun1's `fog_black`) are all real now - see "World

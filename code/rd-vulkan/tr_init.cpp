@@ -1648,17 +1648,59 @@ public:
 static CVulkanGhoul2InfoArray s_ghoul2InfoArray;
 IGhoul2InfoArray &TheGhoul2InfoArray() { return s_ghoul2InfoArray; }
 
-// Bone bolts only (bind-pose only, see README.md) - surface bolts
-// (G2API_AddBoltSurfNum, or a surface-name match here) aren't implemented.
-// Mirrors rd-vanilla's real G2_Add_Bolt (G2_bolts.cpp): reuse a bolt
-// already on this bone, or a freed (-1,-1) slot, else append - a bolt
-// index is a position in ghlInfo->mBltlist, not a global handle.
+// Real surface-bolt support now (see VK_GetGhoul2SurfaceBoltMatrix's own
+// comment, tr_model.cpp, for the matrix side) - mirrors rd-vanilla's real
+// G2_Add_Bolt (G2_bolts.cpp) exactly, including its precedence: a surface
+// name is tried FIRST, a bone name only if that fails, not the other way
+// around. This isn't a minor detail - real, heavily-used game code relies
+// on it: every real surface bolt name in this codebase's own game code
+// (g_client.cpp's "*head_eyes" on every single player spawn, wp_saber.cpp's
+// "*flash"/"*r_hand_cap_r_arm"/"*l_hand_cap_l_arm", g_turret.cpp's
+// "*muzzle1"/"*flash03", g_emplaced.cpp's "*cannonflash"/"*seat", ...) uses
+// the real Ghoul2 convention of a literal leading "*" in the surface's own
+// name - confirmed by directly parsing real .glm data (kyle/model.glm has
+// 45 such surfaces, saber_1.glm's blade tag is "*blade1"), not assumed.
+// Every one of those would have silently returned -1 before this (bone-only
+// lookup, no surface fallback), and a caller that doesn't check for that
+// (most don't) would go on to query/attach at a permanently-invalid bolt.
+//
+// Reuse a bolt already on this surface/bone, or a freed (-1,-1) slot, else
+// append - a bolt index is a position in ghlInfo->mBltlist, not a global
+// handle, same as before.
 int G2API_AddBolt( CGhoul2Info *ghlInfo, const char *boneName )
 {
 	if ( !ghlInfo || !boneName || !boneName[0] )
 	{
 		return -1;
 	}
+
+	int surfIndex = VK_FindGhoul2SurfaceIndex( (int)ghlInfo->mModel, boneName, nullptr );
+	if ( surfIndex >= 0 )
+	{
+		for ( size_t i = 0; i < ghlInfo->mBltlist.size(); i++ )
+		{
+			if ( ghlInfo->mBltlist[i].surfaceNumber == surfIndex )
+			{
+				ghlInfo->mBltlist[i].boltUsed++;
+				return (int)i;
+			}
+		}
+		for ( size_t i = 0; i < ghlInfo->mBltlist.size(); i++ )
+		{
+			if ( ghlInfo->mBltlist[i].boneNumber == -1 && ghlInfo->mBltlist[i].surfaceNumber == -1 )
+			{
+				ghlInfo->mBltlist[i].surfaceNumber = surfIndex;
+				ghlInfo->mBltlist[i].boltUsed = 1;
+				return (int)i;
+			}
+		}
+		boltInfo_t surfBolt;
+		surfBolt.surfaceNumber = surfIndex;
+		surfBolt.boltUsed = 1;
+		ghlInfo->mBltlist.push_back( surfBolt );
+		return (int)ghlInfo->mBltlist.size() - 1;
+	}
+
 	int boneIndex = VK_FindGhoul2Bone( (int)ghlInfo->mModel, boneName );
 	if ( boneIndex < 0 )
 	{
@@ -1829,16 +1871,20 @@ qboolean G2API_GetBoltMatrix( CGhoul2Info_v &ghoul2, const int modelIndex, const
 		if ( boltIndex >= 0 && (size_t)boltIndex < ghlInfo.mBltlist.size() && ghlInfo.mBltlist[boltIndex].boneNumber >= 0 )
 		{
 			ok = VK_GetGhoul2BoneCurrentPoseMat( (int)ghlInfo.mModel, &ghlInfo, ghlInfo.mBltlist[boltIndex].boneNumber, g_vkGhoul2LastRenderTime, &bolt );
-			if ( ok )
-			{
-				// Same conditional scale-the-translation step as the real
-				// G2API_GetBoltMatrix - scale[i]==0 means "no override" for
-				// this axis, not "scale to zero" (refEntity_t::modelScale's
-				// convention).
-				if ( scale[0] ) bolt.matrix[0][3] *= scale[0];
-				if ( scale[1] ) bolt.matrix[1][3] *= scale[1];
-				if ( scale[2] ) bolt.matrix[2][3] *= scale[2];
-			}
+		}
+		else if ( boltIndex >= 0 && (size_t)boltIndex < ghlInfo.mBltlist.size() && ghlInfo.mBltlist[boltIndex].surfaceNumber >= 0 )
+		{
+			ok = VK_GetGhoul2SurfaceBoltMatrix( (int)ghlInfo.mModel, ghlInfo.mBltlist[boltIndex].surfaceNumber, &ghlInfo, g_vkGhoul2LastRenderTime, &bolt );
+		}
+		if ( ok )
+		{
+			// Same conditional scale-the-translation step as the real
+			// G2API_GetBoltMatrix - scale[i]==0 means "no override" for
+			// this axis, not "scale to zero" (refEntity_t::modelScale's
+			// convention).
+			if ( scale[0] ) bolt.matrix[0][3] *= scale[0];
+			if ( scale[1] ) bolt.matrix[1][3] *= scale[1];
+			if ( scale[2] ) bolt.matrix[2][3] *= scale[2];
 		}
 	}
 	if ( !ok )
