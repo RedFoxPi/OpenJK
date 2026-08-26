@@ -3258,10 +3258,11 @@ model/shader/skin registry (`R_GetModelByHandle` et al., defined in
 rd-vanilla's own `tr_model.cpp`/`tr_shader.cpp` - **not** the same file as
 this renderer's own `tr_model.cpp`, see below) to actually link. That's not
 "free" reuse, it's "port rd-vanilla's whole animation/bone-transform system
-too." Given that's a separate, larger task, every `G2API_*` entry point
-*beyond* model loading and skin registration is still stubbed (see
-`tr_init.cpp`) - no skeletal animation, bolts, LOD selection, surface on/off
-overrides, gore, or ragdoll.
+too." Given that's a separate, larger task, most `G2API_*` entry points
+*beyond* model loading and skin registration are still stubbed (see
+`tr_init.cpp`) - no LOD selection, gore, or ragdoll; skeletal animation,
+bolts, and surface on/off overrides are real now (see "Live animation"/
+"Ghoul2 per-surface on/off overrides" above).
 
 What **is** real, and *is* a from-scratch reuse-avoiding implementation
 rather than a stub: `.glm` mesh parsing and static bind-pose rendering
