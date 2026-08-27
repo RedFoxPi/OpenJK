@@ -631,6 +631,14 @@ bool VK_GetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int curren
 bool VK_PauseGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int currentTime );
 bool VK_IsGhoul2BoneAnimPaused( const CGhoul2Info *ghlInfo, int boneIndex );
 bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex );
+// Real G2API_SetBoneAngles/SetBoneAnglesIndex (tr_init.cpp) - see this
+// function's own comment (tr_model.cpp) for the real G2_Generate_Matrix
+// formula it ports, and why only the BONE_ANGLES_POSTMULT flag is
+// implemented (the only one any real call site in this game's own code
+// ever uses). Returns false (silent no-op, leaving any previously-set
+// override for this bone unchanged) for an unresolvable ghlInfo/boneIndex
+// or a flags value without POSTMULT set.
+bool VK_SetGhoul2BoneAngles( const CGhoul2Info *ghlInfo, int boneIndex, const vec3_t angles, int flags, Eorientations up, Eorientations left, Eorientations forward );
 
 // tr_shader.cpp
 //

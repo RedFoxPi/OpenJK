@@ -3433,6 +3433,96 @@ reason surface bolts' and model-to-model attachment's own downstream
 effects weren't (see those sections above): this checkout's fixed test
 scenes don't happen to exercise it.
 
+## Ghoul2 bone-angle overrides (`SetBoneAngles`/`SetBoneAnglesIndex`)
+
+Closes another real gap this file's own "not implemented" list carried
+since the original animation work: "bone-angle overrides/ragdoll/IK (a
+separate, still-real scope cut - see `G2API_SetBoneAngles*`'s stubs)".
+Confirmed real, and more heavily exercised than almost anything else in
+this list: `bg_pmove.cpp` calls `G2API_SetBoneAnglesIndex` on
+`footLBone`/`footRBone` to align each foot to the ground slope during
+ordinary movement, and `g_client.cpp`'s ~250-line head/torso "look" system
+calls it on `craniumBone`/`cervicalBone`/`thoracicBone`/`upperLumbarBone`/
+etc. to turn a player or NPC's head and torso toward whatever they're
+looking at - both running essentially every single simulation frame for
+every player and NPC in the game, not a rare or edge-case call at all.
+Turret/emplaced-gun aiming (`g_turret.cpp`, `g_emplaced.cpp`) and
+interrogation-droid limb targeting (`AI_Interrogator.cpp`, `AI_Droid.cpp`)
+use the same mechanism. A grep across every real `G2API_SetBoneAngles(
+Index)` call site in `code/game`/`code/cgame` turned up exactly one flags
+value: `BONE_ANGLES_POSTMULT` - never `BONE_ANGLES_PREMULT` or
+`BONE_ANGLES_REPLACE` (both real rd-vanilla features, `G2_bones.cpp`), so
+- this renderer's usual evidence-scoped approach - only POSTMULT is
+implemented; the other two stay stubs rather than guess at unexercised
+behavior.
+
+**Real rd-vanilla mechanism ported** (`G2_Generate_Matrix`, `G2_bones.cpp`;
+its POSTMULT consumption in the main per-bone transform, `tr_ghoul2.cpp`):
+a bone-angle override is a fixed rotation matrix, computed once (not
+re-derived every frame) from a caller-supplied Euler angle triple and three
+`Eorientations` values (`up`/`left`/`forward`) that remap which of the
+triple's components map onto which local axis - real bones don't all point
+the same way relative to their own name's intuitive "forward", so different
+callers pick different remaps for the same angle data. The remapped angles
+become a rotation matrix (`AnglesToAxis`, the same helper this renderer
+already uses for `G2API_GetBoltMatrix`'s world-matrix construction), then
+that rotation gets converted into the bone's own local coordinate frame via
+a similarity transform - `BasePoseMat * rotation * BasePoseMatInv` - the
+same "conjugate by bind pose" pattern already used for surface bolts (see
+that section above), just applied to a caller-supplied rotation instead of
+a resolved tag-triangle basis. `BasePoseMatInv` (`mdxaSkel_t::BasePoseMatInv`,
+`mdx_format.h`) is a *real field the `.gla` file already carries* - "the
+inverse, to save run-time calc," per the format's own comment - not
+something this renderer derives at load time; `VulkanBone` just needed to
+also keep it (previously only `BasePoseMat` was kept). At render time, this
+precomputed matrix post-multiplies the bone's normal animated matrix -
+exactly matching real rd-vanilla's per-bone transform structure, where the
+`BONE_ANGLES_POSTMULT` check runs unconditionally after the normal
+parent-times-delta composition, regardless of whether that bone is a root
+or has a parent.
+
+**Implementation** (three files): `VulkanBone` gained `basePoseMatInv`
+(tr_model.cpp, populated in `VK_LoadGhoul2Skeleton`, straight off the same
+`mdxaSkel_t` the existing `basePoseMat` already comes from - no new parsing
+needed, just reading a field that was already being skipped over).
+`VK_SetGhoul2BoneAngles` computes and stores the override matrix into a
+new, deliberately separate `(CGhoul2Info*, boneIndex)`-keyed map
+(`s_ghoul2AngleOverride`) - not folded into the existing
+`VulkanGhoul2AnimState`/`s_ghoul2AnimState` used for animation tracks, even
+though real rd-vanilla's own `boneInfo_t` stores both concerns in one
+struct, since this renderer's animation-state struct already exists purely
+for that one purpose and a bone can have an animation track, an
+angle-override, both, or neither, completely independently either way.
+`VK_ResolveGhoul2BonePose` (already the single place per-bone pose data
+gets assembled before the hierarchy walk) now also looks up this map -
+by exact bone index, deliberately *not* inherited up the parent chain the
+way an animation track is, matching real rd-vanilla's own indexed
+`boneList[boneListIndex]` lookup. `VK_ComputeGhoul2BoneRecursive` applies
+the stored override as a post-multiply immediately after its existing
+root/non-root composition, mirroring the real code's own control-flow
+shape. `G2API_SetBoneAngles`/`SetBoneAnglesIndex` (tr_init.cpp) are now
+real thin wrappers instead of stubs; the By-name variant reuses
+`VK_ResolveGhoul2AnimBone` (the exact same bone-name resolution
+`G2API_SetBoneAnim`'s own By-name variant already relies on). `blendTime`
+is accepted but ignored - no real call site above ever passes a nonzero
+one for an angle override (unlike `SetBoneAnim`'s `blendTime`, which real
+code relies on constantly), an honestly-documented, evidence-scoped gap
+rather than a silent drop of something actually used.
+
+**Verified, and unusually well**: full SP scene suite clean, warning-free
+rebuild. Pixel-diffed a build with this fix against one without it: 4 of 5
+scenes stayed within the usual per-run noise floor, but **vjun1 produced a
+real, structural, correctly-shaped diff** - two clear humanoid silhouettes,
+not particle scatter - and inspecting the actual before/after screenshots
+directly confirms it: the Twi'lek NPC seated in vjun1's cockpit cutscene
+visibly changed head/torso orientation between the two builds, exactly the
+kind of effect this feature's real mechanism (head/torso "look" bone-angle
+overrides, `g_client.cpp`) predicts. Unlike several recent Ghoul2 features
+in this file (surface bolts' matrices, model-to-model attachment, per-level
+animation overrides), this one's downstream visual effect *is*
+independently confirmed by eye on a real fixed test scene, not just
+verified for code correctness and exercised call sites.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3504,11 +3594,12 @@ scenes don't happen to exercise it.
   per-instance surface on/off overrides (`SetSurfaceOnOff`), real
   surface bolts (a bolt naming a `*`-prefixed tag surface, not just a
   bone), real model-to-model attachment (`AttachG2Model`), and real
-  per-level animation-file overrides (`SetAnimIndex`/`GetAnimIndex`) now
-  too - see "Ghoul2 per-surface on/off overrides"/"Ghoul2 surface bolts"/
-  "Ghoul2 model-to-model attachment"/"Ghoul2 per-level animation-file
-  overrides" above. Still missing: bone-angle overrides/ragdoll/IK, LOD
-  selection, gore.
+  per-level animation-file overrides (`SetAnimIndex`/`GetAnimIndex`), and
+  real bone-angle overrides (`SetBoneAngles`/`SetBoneAnglesIndex`,
+  `BONE_ANGLES_POSTMULT` only) now too - see "Ghoul2 per-surface on/off
+  overrides"/"Ghoul2 surface bolts"/"Ghoul2 model-to-model attachment"/
+  "Ghoul2 per-level animation-file overrides"/"Ghoul2 bone-angle overrides"
+  above. Still missing: ragdoll/IK, LOD selection, gore.
 - Runtime polys (`RE_AddPolyToScene`, `tr_model.cpp`) - see "Runtime polys"
   above. Real per-scene queueing, CPU fan-to-triangle-list expansion, and a
   dedicated pipeline with the same three blend-mode variants (alpha/
@@ -3563,11 +3654,12 @@ scenes don't happen to exercise it.
   different concept from which frame within one - relevant for NPCs with a
   per-level animation-file override, e.g. `_humanoid_academy1.gla`) are
   real now too - see "Ghoul2 per-level animation-file overrides" above.
-  Also still missing: bone-angle overrides (`SetBoneAngles*`), ragdoll, IK,
-  LOD selection, gore, and tags. Surface bolts (a bolt naming a *surface*
-  rather than a bone) and model-to-model attachment (`AttachG2Model`/
-  `DetachG2Model`) are real now too - see "Ghoul2 surface bolts"/"Ghoul2
-  model-to-model attachment" above. `AttachEnt` (cross-*entity* attachment,
+  Bone-angle overrides (`SetBoneAngles*`, `BONE_ANGLES_POSTMULT` only - see
+  "Ghoul2 bone-angle overrides" above) are real now too. Also still
+  missing: ragdoll, IK, LOD selection, gore, and tags. Surface bolts (a
+  bolt naming a *surface* rather than a bone) and model-to-model attachment
+  (`AttachG2Model`/`DetachG2Model`) are real now too - see "Ghoul2 surface
+  bolts"/"Ghoul2 model-to-model attachment" above. `AttachEnt` (cross-*entity* attachment,
   a different and narrower mechanism - see "Ghoul2 model-to-model
   attachment" above for why) is still a stub.
   See "Ghoul2 is not reused from rd-vanilla" below for why the animation

@@ -173,6 +173,14 @@ struct VulkanBone
 {
 	std::string name;
 	mdxaBone_t basePoseMat;
+	// The real .gla's own precomputed inverse (mdxaSkel_t::BasePoseMatInv,
+	// mdx_format.h - "inverse, to save run-time calc", baked in at model-
+	// compile time, not derived here) - needed by VK_SetGhoul2BoneAngles to
+	// reproduce real rd-vanilla's G2_Generate_Matrix similarity-transform
+	// formula (BasePoseMat * rotationFromAngles * BasePoseMatInv) for a
+	// bone-angle override, the same "sandwich by bind pose" pattern surface
+	// bolts' own formula uses elsewhere in this file.
+	mdxaBone_t basePoseMatInv;
 	int parent; // -1 = root - needed for VK_ComputeGhoul2Pose's hierarchy walk
 };
 struct VulkanSkeleton
@@ -239,6 +247,7 @@ int VK_LoadGhoul2Skeleton( const char *animName )
 		VulkanBone vb;
 		vb.name = bone->name;
 		vb.basePoseMat = bone->BasePoseMat;
+		vb.basePoseMatInv = bone->BasePoseMatInv;
 		vb.parent = bone->parent;
 		skel.bones.push_back( std::move( vb ) );
 	}
@@ -1351,6 +1360,15 @@ struct VulkanGhoul2BonePose
 	int blendLerpFrame = 0;  // the old animation's captured "next" frame
 	float blendFrameLerp = 0.0f; // fractional part of the captured position
 	float blendWeight = 0.0f;    // 0 = fully old pose, 1 = fully new pose
+	// Bone-angle override (G2API_SetBoneAngles/Index, BONE_ANGLES_POSTMULT -
+	// see VK_SetGhoul2BoneAngles's own comment) - applied in
+	// VK_ComputeGhoul2BoneRecursive as a post-multiply on top of the normal
+	// animated matrix above, exactly like real rd-vanilla's own POSTMULT
+	// step. Looked up by this exact bone index, never inherited from an
+	// ancestor - see VK_ResolveGhoul2BonePose's own comment for why this is
+	// a separate lookup from the animation-track walk above it.
+	bool hasAngleOverride = false;
+	mdxaBone_t angleOverrideMatrix;
 };
 
 // Defined further below, alongside the rest of the live per-bone animation
@@ -1480,6 +1498,18 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, parent, outBones, computed, rootBase );
 		VK_Multiply3x4Matrix( &outBones[boneIndex], &outBones[parent], &delta );
 	}
+
+	// Bone-angle override (G2API_SetBoneAngles/Index, BONE_ANGLES_POSTMULT -
+	// see VK_SetGhoul2BoneAngles's own comment) - applied AFTER the normal
+	// composition above regardless of root/non-root branch, exactly matching
+	// real rd-vanilla's own structure (tr_ghoul2.cpp's per-bone transform:
+	// the POSTMULT check runs unconditionally after the if/else-if(child)
+	// block, not inside either branch).
+	if ( pose.hasAngleOverride )
+	{
+		mdxaBone_t tempMatrix = outBones[boneIndex];
+		VK_Multiply3x4Matrix( &outBones[boneIndex], &tempMatrix, &pose.angleOverrideMatrix );
+	}
 	computed[boneIndex] = true;
 }
 
@@ -1588,6 +1618,30 @@ struct VulkanGhoul2AnimState
 // used only when a caller's bone name/index genuinely couldn't be
 // resolved.
 static std::unordered_map<const CGhoul2Info *, std::unordered_map<int, VulkanGhoul2AnimState>> s_ghoul2AnimState;
+
+// Bone-angle overrides (G2API_SetBoneAngles/SetBoneAnglesIndex,
+// BONE_ANGLES_POSTMULT only - see VK_SetGhoul2BoneAngles's own comment for
+// why this is the one flag combination real game code actually uses).
+// Deliberately a separate map from s_ghoul2AnimState above, not folded into
+// VulkanGhoul2AnimState, even though real rd-vanilla's boneInfo_t
+// (game/ghoul2_shared.h) stores both an animation track AND an angle-
+// override matrix in the very same per-bone-index struct - this renderer's
+// own VulkanGhoul2AnimState already exists purely for the animation side
+// and adding unrelated override-matrix fields to it would blur what each
+// one is for; a bone can have an animation-state entry, an angle-override
+// entry, both, or neither, completely independently, matching real
+// behavior either way. Same (CGhoul2Info*, boneIndex) key space as
+// s_ghoul2AnimState.
+struct VulkanGhoul2AngleOverride
+{
+	// Precomputed once, at G2API_SetBoneAngles(Index) call time - not
+	// recomputed per frame - exactly matching real rd-vanilla's own
+	// G2_Generate_Matrix, which likewise bakes this once into
+	// boneInfo_t::matrix rather than re-deriving it from the raw angles on
+	// every draw. See VK_SetGhoul2BoneAngles's own comment for the formula.
+	mdxaBone_t matrix;
+};
+static std::unordered_map<const CGhoul2Info *, std::unordered_map<int, VulkanGhoul2AngleOverride>> s_ghoul2AngleOverride;
 
 // Real flag bit values (game/ghoul2_shared.h) - not included from here (a
 // game-side header this renderer doesn't otherwise depend on).
@@ -1936,6 +1990,125 @@ bool VK_StopGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex )
 	return instIt->second.erase( boneIndex ) > 0;
 }
 
+// Real bit value (game/ghoul2_shared.h) - not included from here (a
+// game-side header this renderer doesn't otherwise depend on). The only
+// BONE_ANGLES_* flag any real call site in this game's own code ever
+// passes - PREMULT and REPLACE are both real rd-vanilla features (see
+// G2_Generate_Matrix/tr_ghoul2.cpp) with zero exercised callers found
+// anywhere in code/game or code/cgame (a grep across every
+// G2API_SetBoneAngles(Index) call site turned up POSTMULT and nothing
+// else), so - same evidence-scoped approach as this renderer's other
+// features - only POSTMULT is implemented; a flags value without it is a
+// silent no-op rather than a guess at unexercised behavior.
+static const int VK_BONE_ANGLES_POSTMULT = 0x0002;
+
+// Real G2API_SetBoneAngles(Index) (tr_init.cpp's thin wrappers call into
+// this) - ports rd-vanilla's real G2_Generate_Matrix (G2_bones.cpp)
+// POSTMULT branch exactly, not rederived: build a rotation matrix from
+// `angles` (a PITCH/YAW/ROLL Euler triple) after remapping its three
+// components onto the bone-local up/left/forward axes the caller asked
+// for (real callers pick different remaps depending on which real skeleton
+// axis a given bone's "forward" happens to point down - e.g. a foot bone's
+// local axes aren't aligned the same way a head bone's are), then convert
+// that rotation into the bone's own local coordinate frame via a
+// similarity transform sandwiching it between the bone's BasePoseMat and
+// BasePoseMatInv (the exact "conjugate by bind pose" pattern
+// VK_GetGhoul2SurfaceBoltMatrix's own formula also uses, for the same
+// underlying reason: a rotation expressed in world/parent space needs this
+// conversion to apply correctly regardless of the bone's own orientation
+// within the skeleton). Precomputed once here - not re-derived every frame
+// - exactly like real rd-vanilla bakes it into boneInfo_t::matrix once at
+// G2_Generate_Matrix call time; VK_ComputeGhoul2BoneRecursive just reads
+// the stored result.
+bool VK_SetGhoul2BoneAngles( const CGhoul2Info *ghlInfo, int boneIndex, const vec3_t angles, int flags, Eorientations up, Eorientations left, Eorientations forward )
+{
+	if ( !ghlInfo || boneIndex < 0 )
+	{
+		return false;
+	}
+	if ( !( flags & VK_BONE_ANGLES_POSTMULT ) )
+	{
+		return false;
+	}
+	if ( ghlInfo->mModel <= 0 || (size_t)ghlInfo->mModel >= s_ghoul2Models.size() )
+	{
+		return false;
+	}
+	int skeletonIndex = s_ghoul2Models[ghlInfo->mModel].skeletonIndex;
+	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
+	{
+		return false;
+	}
+	const std::vector<VulkanBone> &bones = s_skeletons[skeletonIndex].bones;
+	if ( (size_t)boneIndex >= bones.size() )
+	{
+		return false;
+	}
+	const VulkanBone &bone = bones[boneIndex];
+
+	// Real angles[] convention is [PITCH, YAW, ROLL] (indices 0/1/2) - same
+	// as every other Euler-angle use in this codebase. `default: break;`
+	// (ORIGIN, the enum's zero value) leaves that component at its
+	// zero-initialized default - real G2_Generate_Matrix leaves the
+	// corresponding local uninitialized instead, but no real caller ever
+	// passes ORIGIN for up/left/forward (confirmed by the same grep as
+	// VK_BONE_ANGLES_POSTMULT's own comment), so this never diverges from
+	// real behavior in practice - it's a defined-behavior safety net, not a
+	// deliberate reinterpretation.
+	vec3_t newAngles = { 0.0f, 0.0f, 0.0f };
+	switch ( up )
+	{
+		case NEGATIVE_X: newAngles[1] = angles[2] + 180.0f; break;
+		case POSITIVE_X: newAngles[1] = angles[2]; break;
+		case NEGATIVE_Y: newAngles[1] = angles[0]; break;
+		case POSITIVE_Y: newAngles[1] = angles[0]; break;
+		case NEGATIVE_Z: newAngles[1] = angles[1] + 180.0f; break;
+		case POSITIVE_Z: newAngles[1] = angles[1]; break;
+		default: break;
+	}
+	switch ( left )
+	{
+		case NEGATIVE_X: newAngles[0] = angles[2]; break;
+		case POSITIVE_X: newAngles[0] = angles[2] + 180.0f; break;
+		case NEGATIVE_Y: newAngles[0] = angles[0]; break;
+		case POSITIVE_Y: newAngles[0] = angles[0] + 180.0f; break;
+		case NEGATIVE_Z: newAngles[0] = angles[1]; break;
+		case POSITIVE_Z: newAngles[0] = angles[1]; break;
+		default: break;
+	}
+	switch ( forward )
+	{
+		case NEGATIVE_X: newAngles[2] = angles[2]; break;
+		case POSITIVE_X: newAngles[2] = angles[2]; break;
+		case NEGATIVE_Y: newAngles[2] = angles[0]; break;
+		case POSITIVE_Y: newAngles[2] = angles[0] + 180.0f; break;
+		case NEGATIVE_Z: newAngles[2] = angles[1]; break;
+		case POSITIVE_Z: newAngles[2] = angles[1] + 180.0f; break;
+		default: break;
+	}
+
+	// Create_Matrix (G2_misc.cpp): AnglesToAxis into a translation-less
+	// mdxaBone_t, column c = axis[c] - same construction
+	// G2API_GetBoltMatrix's own world-matrix build already uses
+	// (tr_init.cpp), just with a zero translation instead of a position.
+	matrix3_t axis;
+	AnglesToAxis( newAngles, axis );
+	mdxaBone_t rot = {};
+	for ( int row = 0; row < 3; row++ )
+	{
+		rot.matrix[row][0] = axis[0][row];
+		rot.matrix[row][1] = axis[1][row];
+		rot.matrix[row][2] = axis[2][row];
+		rot.matrix[row][3] = 0.0f;
+	}
+
+	mdxaBone_t temp1;
+	VK_Multiply3x4Matrix( &temp1, &rot, &bone.basePoseMatInv );
+	VulkanGhoul2AngleOverride &override_ = s_ghoul2AngleOverride[ghlInfo][boneIndex];
+	VK_Multiply3x4Matrix( &override_.matrix, &bone.basePoseMat, &temp1 );
+	return true;
+}
+
 // The full pose (sub-frame-interpolated, and mid-blend if applicable) to
 // skin one specific bone with right now, resolved by walking from
 // boneIndex up its parent chain (starting at itself) until a bone is found
@@ -1950,39 +2123,52 @@ static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel
 {
 	VulkanGhoul2BonePose pose;
 	auto instIt = s_ghoul2AnimState.find( ghlInfo );
-	if ( instIt == s_ghoul2AnimState.end() )
+	if ( instIt != s_ghoul2AnimState.end() )
 	{
-		return pose;
-	}
-	int walk = boneIndex;
-	while ( walk >= 0 )
-	{
-		auto boneIt = instIt->second.find( walk );
-		if ( boneIt != instIt->second.end() )
+		int walk = boneIndex;
+		while ( walk >= 0 )
 		{
-			const VulkanGhoul2AnimState &state = boneIt->second;
-			VK_Ghoul2TimingModel( state, currentTime, skel.numFrames, pose.currentFrame, pose.newFrame, pose.backlerp );
-
-			// A blend is only actually applied for the window of time it
-			// covers - once elapsed time reaches blendDurationMs the
-			// snapshot is retired and the bone plays the new animation
-			// outright, matching real G2_TransformBone's
-			// `blendTime>=0.0f && blendTime<boneList[...].blendTime` gate.
-			if ( state.blendDurationMs > 0 )
+			auto boneIt = instIt->second.find( walk );
+			if ( boneIt != instIt->second.end() )
 			{
-				int elapsed = currentTime - state.blendStartTime;
-				if ( elapsed >= 0 && elapsed < state.blendDurationMs )
+				const VulkanGhoul2AnimState &state = boneIt->second;
+				VK_Ghoul2TimingModel( state, currentTime, skel.numFrames, pose.currentFrame, pose.newFrame, pose.backlerp );
+
+				// A blend is only actually applied for the window of time it
+				// covers - once elapsed time reaches blendDurationMs the
+				// snapshot is retired and the bone plays the new animation
+				// outright, matching real G2_TransformBone's
+				// `blendTime>=0.0f && blendTime<boneList[...].blendTime` gate.
+				if ( state.blendDurationMs > 0 )
 				{
-					pose.hasBlend = true;
-					pose.blendFrame = (int)state.blendFrame;
-					pose.blendLerpFrame = state.blendLerpFrame;
-					pose.blendFrameLerp = state.blendFrame - (float)pose.blendFrame;
-					pose.blendWeight = (float)elapsed / (float)state.blendDurationMs;
+					int elapsed = currentTime - state.blendStartTime;
+					if ( elapsed >= 0 && elapsed < state.blendDurationMs )
+					{
+						pose.hasBlend = true;
+						pose.blendFrame = (int)state.blendFrame;
+						pose.blendLerpFrame = state.blendLerpFrame;
+						pose.blendFrameLerp = state.blendFrame - (float)pose.blendFrame;
+						pose.blendWeight = (float)elapsed / (float)state.blendDurationMs;
+					}
 				}
+				break;
 			}
-			return pose;
+			walk = skel.bones[walk].parent;
 		}
-		walk = skel.bones[walk].parent;
+	}
+
+	// Bone-angle override lookup - a separate concern from the animation-
+	// track walk above (see VulkanGhoul2BonePose::hasAngleOverride's own
+	// comment for why this is keyed by boneIndex directly, not inherited).
+	auto overrideInstIt = s_ghoul2AngleOverride.find( ghlInfo );
+	if ( overrideInstIt != s_ghoul2AngleOverride.end() )
+	{
+		auto overrideBoneIt = overrideInstIt->second.find( boneIndex );
+		if ( overrideBoneIt != overrideInstIt->second.end() )
+		{
+			pose.hasAngleOverride = true;
+			pose.angleOverrideMatrix = overrideBoneIt->second.matrix;
+		}
 	}
 	return pose;
 }
