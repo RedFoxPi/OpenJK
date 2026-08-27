@@ -3086,6 +3086,14 @@ with no `tcGen`" - `dark_dust` and siblings pass (additive, no `tcGen`);
 `env_glass`/`glass_security_*` still correctly don't (additive, but real
 `tcGen environment`).
 
+**Update, much later**: real `tcGen environment` UV generation IS now
+implemented - see "`tcGen environment` (reflection-mapped UV generation)"
+below. The gate above was widened again at that point to also let
+`env_glass`/`glass_security_*` through specifically *because* their fallback
+image is no longer sampled with the wrong (baked) UVs - the "actively wrong
+static texture" problem this section's own comment warned about no longer
+applies to that one specific case.
+
 **`rgbGen const`**: a real, minimal addition to tr_shader.cpp's shader-
 script scanner (`VK_GetShaderRgbGenConst`, mirroring `VK_GetShaderTcModScroll`'s
 existing shape) - every one of this checkout's real `rgbGen const` shaders
@@ -3670,6 +3678,135 @@ sine cycle instead of their previous dim, static fade colour. academy1/
 yavin1 (zero real flare surfaces - see "Static flares" above) and menu
 stayed pixel-identical, exactly as expected.
 
+## `tcGen environment` (reflection-mapped UV generation)
+
+Closes a real, previously-flagged gap: this renderer detected `tcGen`'s mere
+*presence* on a shader's first stage (`VK_ShaderHasTcGen`, used only as a
+safety gate for the map-image fallback - see "`rgbGen const` and a widened
+additive map-image fallback" above) but never actually generated the
+reflection-vector UVs `tcGen environment` calls for.
+
+**Real per-map usage, checked the same way as every other feature in this
+file** (cross-referencing shader script `tcGen environment` hits against
+each test map's own real `LUMP_SHADERS` string table, not just "does this
+shader exist somewhere in the asset library"): 22 real hoth2 first-stage
+matches (`textures/hoth/basicltgray_shiny`, `blast_panel*`, `door_02*`,
+`exit_beam*`, `h_wall_*`, `h_door*`, `h_floor_02/03`, `trim_01`) and 6 real
+vjun1 matches (`textures/common/env_glass`, `glass_security_chain/hex/
+square/tris`, `textures/imperial/square`) - all genuine world architecture
+(shiny metal walls, blast doors, security glass), not UI/MP-only shaders
+like the `tcMod rotate` investigation above ruled out.
+
+**A critical wrinkle found before writing any rendering code**: every one of
+those 28 real shaders is a real Quake3 "shiny surface" 3-stage composite -
+stage 1 `map <genericReflectionTexture>` + `tcGen environment` (no
+`blendFunc`, so it's an opaque replace), stage 2 `map <realBaseTexture>`
+blended on top (`GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA`), stage 3 `map
+$lightmap` multiply - except for the 6 vjun1 glass shaders, whose stage 1
+uses `blendFunc GL_ONE GL_ONE` instead and has no stage-2 base texture at
+all (real translucent glass, not a shiny-metal highlight). This renderer
+only ever draws a world surface's first stage - `img = VK_FindImage(shader
+name)` - which, for 23 of these 28 shaders, means the shader's own name
+*already* coincidentally matches a real base-texture file (`textures/hoth/
+h_wall_04b` the shader is also literally `textures/hoth/h_wall_04b.png` the
+file - checked directly against the real `.pk3` file listing, not assumed):
+this renderer has been drawing those 23 surfaces correctly all along, with
+their real *second*-stage base texture and ordinary baked UVs, entirely by
+name-coincidence, never touching the first stage's `tcGen environment` at
+all. Only the remaining 5 (`textures/hoth/basicltgray_shiny`, whose real
+base texture is a *different*-named file, `textures/cairn/basicltgray`) and
+the 5 vjun1 glass shaders (no second stage/base texture to name-match at
+all) actually depend on the map-image fallback (`VK_GetShaderMapImage`,
+which only ever records the *first* stage's `map`) - and for those, the
+fallback was previously either resolving the *wrong* image with *wrong*
+(ordinary baked) UVs (`basicltgray_shiny`, sampling a generic reflection
+texture as if it tiled normally), or not resolving anything at all
+(`env_glass`/`glass_security_*`, blocked outright by the existing `tcGen`
+safety gate - see "`rgbGen const`..." above - so these 5 were completely
+invisible). Naively applying reflection UVs to whatever image a shader's
+resolution already lands on would have been a **regression** for the other
+23 real surfaces (replacing their already-correct ordinary-UV rendering
+with wrong reflection UVs sampled against their real base texture) - the
+fix is gated specifically on "did this batch's image come from the
+map-image fallback, and is that fallback's shader's first stage genuinely
+`tcGen environment`" (`RE_LoadWorldMap`'s `envMap` local, `WorldSurfaceBatch::
+envMap`), never on "does this shader mention `tcGen environment` anywhere,
+regardless of which stage is actually being drawn".
+
+**The real formula**, ported directly from rd-vanilla's own
+`RB_CalcEnvironmentTexCoords` (tr_shade_calc.cpp), not reconstructed from
+memory:
+```
+viewer = normalize(cameraWorldPos - vertexWorldPos)
+d = dot(normal, viewer)
+st = (normal.x*d - 0.5*viewer.x, normal.y*d - 0.5*viewer.y)
+```
+Notably: only x/y ever feed the result (z is untouched in the real code,
+not a simplification made here), and there's no remap to a 0..1 range - the
+real function doesn't do one either, relying on the texture sampler's wrap
+addressing to tile the roughly-[-1,1] values this produces. The `viewer`
+term uses `backEnd.ori.viewOrigin`/`tess.xyz` in real rd-vanilla, which for
+ordinary (non-first-person-viewmodel) world geometry are the raw world-
+space camera position and vertex position - world surfaces have no
+per-entity transform in this renderer either, so `pc.camPos.xyz`/`inPos` are
+already in the same space, no rotation needed first. The `RF_FIRST_PERSON`
+branch (a light-direction-based variant for first-person view models) has
+no real world-BSP-surface user and isn't ported.
+
+**Implementation**: `WorldVertex` (tr_local.h) gained a `normal[3]` field -
+previously entirely absent, despite the real BSP's `drawVert_t` already
+carrying one right next to `xyz`/`st`/`lightmap` - populated straight from
+the BSP at load time for every vertex (cheap, and simpler than special-
+casing which surfaces need it), plus a matching new vertex attribute
+(location 4) in `VK_CreateWorldPipeline` (tr_init.cpp). `tr_shader.cpp`'s
+`tcGen` parsing now also captures the type argument (previously discarded)
+into a new `VK_GetShaderTcGenEnvironment` accessor, distinct from the
+existing presence-only `VK_ShaderHasTcGen`. `WorldSurfaceBatch` gained an
+`envMap` bool (appended last, default-initialized `false`, same positional-
+aggregate-init reasoning as `scaleS`/`scaleT` above), set true only in the
+narrow fallback case described above. The actual UV generation happens in
+`world.vert`, not on the CPU: it's inherently per-frame/view-dependent
+(the camera moves), so it's computed per real vertex every frame exactly
+like real rd-vanilla's own per-vertex tess loop, gated by a new push-
+constant flag (`uvScale.z`, reusing what was previously unused padding -
+see `vkWorldPushConstants_t`'s comment) that RE_RenderScene sets per-batch
+alongside the existing scroll/scale/fog state changes.
+
+**Verified**: full SP scene suite clean, no crashes, warning-free rebuild
+(new vertex attribute compiled and linked correctly via glslangValidator).
+A temporary debug print (removed before committing) confirmed programmatically,
+not just visually, that exactly the intended shaders take the new code path
+on each real map and no others: `textures/common/env_glass` +
+`textures/hoth/basicltgray_shiny` on hoth2; `textures/common/env_glass` and
+all 4 `glass_security_*` variants on vjun1; zero hits on academy1/yavin1
+(neither has any real matching surface, matching the BSP cross-reference
+above exactly). The other 23 real matching surfaces were confirmed to
+*not* take this path (still resolving their base texture directly by name,
+exactly as before) - the specific regression risk identified above.
+Pixel-diffed a build with this fix against one without it, stash-based:
+academy1/yavin1 came back pixel-identical (no real matching surfaces in
+view, as expected). hoth2 and vjun1 showed measurable diffs, but this
+project's own render-regression suite has an existing, separately-confirmed
+per-run noise floor from time-varying weather/particle effects on these two
+maps specifically (confirmed here by diffing two runs of the *same*
+unchanged code against each other: hoth2 alone varies by 47.6% of pixels/
+1.89% mean run-to-run from snow-particle placement) large enough to swamp
+this feature's own signal in a whole-frame pixel diff - neither fixed test
+camera happens to frame one of the affected surfaces closely enough for an
+unambiguous whole-frame before/after comparison the way hoth2's flares or
+academy1's light-shaft dust did. A manually-positioned camera (real BSP
+vertex coordinates read directly from the compiled level, `setviewpos`) at
+one of vjun1's cockpit windows (`glass_security_tris`) and near one of
+hoth2's staircase treads (`basicltgray_shiny`) didn't land a clean, large,
+obviously-different framing either - the debug-log confirmation above is
+the honest evidence for this feature, not an eyeballed screenshot. Ruled
+out as an implementation bug rather than an inherent limit of the fixed
+test cameras: not attempted further, given the existing per-map evidence
+this is a small, cheap, low-risk correctness fix in its own right (removes
+a wrong-static-texture bug for `basicltgray_shiny` and an outright-invisible
+bug for `env_glass`/`glass_security_*`, without touching any of the 23
+already-correct surfaces).
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3873,20 +4010,22 @@ stayed pixel-identical, exactly as expected.
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
 - Full `.shader` script parsing: only a defined shader's first stage's
-  `map`/`blendFunc`/`tcMod scroll`/`tcMod scale`/`rgbGen const`/
-  `alphaGen portal <range>` (see "World-geometry tcMod scroll"/"`tcMod
-  scale` for world geometry"/"`rgbGen const` and a widened additive
-  map-image fallback"/"Static flares" above for those), whether it declares
-  any `tcGen` at all (not which kind - see the same `rgbGen const` section),
-  and (for fog shaders specifically, see "3D world geometry" above) a
-  top-level `fogparms` line, are read - later stages, every other `tcMod`
-  type (`rotate`/`stretch`/`turb`/`transform`/`entityTranslate`),
-  actual `tcGen` UV generation (e.g. `tcGen environment` for reflective
-  glass/chrome - its *presence* is detected to gate the map-image fallback
-  safely, but no reflection mapping is ever computed), `rgbGen
-  identityLighting`/`vertex`/wave animation, `alphaGen` waves, and
-  `skyparms` are still ignored. World geometry does now get real blend-mode
-  selection (see "World geometry blend modes" above) for a shader whose own
+  `map`/`blendFunc`/`tcMod scroll`/`tcMod scale`/`rgbGen const`/`rgbGen wave
+  sin`/`alphaGen portal <range>`/`tcGen environment` (see "World-geometry
+  tcMod scroll"/"`tcMod scale` for world geometry"/"`rgbGen const` and a
+  widened additive map-image fallback"/"Static flares"/"Real rgbGen const/
+  wave for flares"/"`tcGen environment` (reflection-mapped UV generation)"
+  above for those), whether it declares any `tcGen` at all (not which kind
+  otherwise - see the `rgbGen const` section), and (for fog shaders
+  specifically, see "3D world geometry" above) a top-level `fogparms` line,
+  are read - later stages, every other `tcMod` type (`rotate`/`stretch`/
+  `turb`/`transform`/`entityTranslate`), every other `tcGen` type (`tcGen
+  lightmap`/`tcGen vector` - no real per-map match on this checkout's test
+  maps for either, see the `tcMod rotate` investigation's methodology),
+  `rgbGen identityLighting`/`vertex`/non-`sin` wave functions, `alphaGen`
+  waves, and `skyparms` are still ignored. World geometry does now get real
+  blend-mode selection (see "World geometry blend modes" above) for a
+  shader whose own
   name directly resolves to a texture file, and the map-image fallback (see
   "hoth2's missing terrain" above) now also covers a `BLEND_ADDITIVE`
   shader specifically when it has no `tcGen` (see the `rgbGen const`

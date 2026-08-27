@@ -114,6 +114,18 @@ static std::unordered_map<std::string, vkShaderRgbWave_t> s_shaderRgbWave;
 // env_glass/glass_security_* shaders this excludes.
 static std::unordered_map<std::string, bool> s_shaderHasTcGen;
 
+// Whether the first stage's `tcGen` is specifically `environment` (real
+// per-vertex reflection-vector UV generation, RB_CalcEnvironmentTexCoords in
+// rd-vanilla's tr_shade_calc.cpp), keyed by shader name. Confirmed real,
+// substantial usage on this renderer's own test maps' actual world BSP
+// surfaces (not just present somewhere in the broader shader library): 22
+// hoth2 surfaces (shiny metal walls, blast panels, doors, the exit beam) and
+// 6 vjun1 surfaces (security glass, env_glass, the imperial square trim) all
+// declare `tcGen environment` on their first stage. See
+// VK_GetShaderTcGenEnvironment and world.vert/RE_LoadWorldMap for the actual
+// implementation - this map only records which shaders need it.
+static std::unordered_map<std::string, bool> s_shaderTcGenEnvironment;
+
 // First stage's `map <path>` argument, keyed by shader name - see
 // VK_GetShaderMapImage's comment for why this exists: a shader's own name is
 // NOT reliably the same path as its actual base texture (e.g. hoth2's
@@ -193,6 +205,7 @@ static void ParseShaderFile( const char *text )
 		bool haveRgbWave = false;
 		vkShaderRgbWave_t rgbWave = {};
 		bool hasTcGen = false;
+		bool tcGenEnvironment = false;
 		std::string mapImage;
 
 		while ( depth > 0 )
@@ -360,15 +373,23 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
-			// `tcGen <type>` - only whether the keyword appears at all is
-			// recorded (see s_shaderHasTcGen's own comment) - no UV
-			// generation mode is actually implemented, so the type itself
-			// and any following arguments (`tcGen vector` takes two extra
-			// vec3s) are deliberately left unconsumed, same as tcMod's own
-			// unhandled types above.
+			// `tcGen <type>` - whether the keyword appears at all is recorded
+			// (see s_shaderHasTcGen's own comment) and the type itself is
+			// checked for `environment` specifically (see
+			// s_shaderTcGenEnvironment's comment - the one tcGen mode this
+			// renderer actually implements). Any further arguments a type
+			// might take (`tcGen vector` takes two extra vec3s) are
+			// deliberately left unconsumed, same as tcMod's own unhandled
+			// types above - harmless, since they don't match any recognized
+			// keyword on the next iterations either.
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "tcGen" ) )
 			{
 				hasTcGen = true;
+				const char *type = COM_ParseExt( &p, qfalse );
+				if ( !Q_stricmp( type, "environment" ) )
+				{
+					tcGenEnvironment = true;
+				}
 				continue;
 			}
 
@@ -463,6 +484,10 @@ static void ParseShaderFile( const char *text )
 		if ( hasTcGen && s_shaderHasTcGen.find( name ) == s_shaderHasTcGen.end() )
 		{
 			s_shaderHasTcGen[name] = true;
+		}
+		if ( tcGenEnvironment && s_shaderTcGenEnvironment.find( name ) == s_shaderTcGenEnvironment.end() )
+		{
+			s_shaderTcGenEnvironment[name] = true;
 		}
 	}
 
@@ -684,6 +709,17 @@ bool VK_ShaderHasTcGen( const char *name )
 	VK_LoadShaderScripts();
 
 	return s_shaderHasTcGen.find( VK_StripShaderNameExtension( name ) ) != s_shaderHasTcGen.end();
+}
+
+// Whether a shader's first stage declares `tcGen environment` specifically
+// (see s_shaderTcGenEnvironment's own comment). RE_LoadWorldMap uses this to
+// flag matching WorldSurfaceBatch entries for the real per-vertex reflection
+// UV generation (world.vert) instead of ordinary baked/scrolled/scaled UVs.
+bool VK_GetShaderTcGenEnvironment( const char *name )
+{
+	VK_LoadShaderScripts();
+
+	return s_shaderTcGenEnvironment.find( VK_StripShaderNameExtension( name ) ) != s_shaderTcGenEnvironment.end();
 }
 
 // Looks up a shader's first stage's `map`/`clampmap` path - the only

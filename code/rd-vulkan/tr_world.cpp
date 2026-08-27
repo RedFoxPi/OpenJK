@@ -133,6 +133,19 @@ struct WorldSurfaceBatch
 	// 0.0f zero-init default) is required here specifically: 0.0f would
 	// multiply every UV to (0,0), not leave it alone.
 	float scaleS = 1.0f, scaleT = 1.0f;
+	// This surface's shader's first-stage `tcGen environment` (real per-
+	// vertex reflection-mapped UV generation, VK_GetShaderTcGenEnvironment,
+	// tr_shader.cpp) - false (ordinary UVs) for the common case. Confirmed
+	// real, substantial usage: 22 hoth2 surfaces (shiny metal walls, blast
+	// panels, doors, the exit beam) and 6 vjun1 surfaces (security glass,
+	// env_glass, the imperial square trim). When true, world.vert ignores
+	// inUV/pc.uvScale entirely for this batch's vertices and instead
+	// computes UVs from the vertex normal and camera position each frame
+	// (RB_CalcEnvironmentTexCoords, rd-vanilla's tr_shade_calc.cpp) - see
+	// WorldVertex::normal's own comment for where the normal comes from.
+	// Deliberately appended last, same positional-aggregate-init reason as
+	// scaleS/scaleT above.
+	bool envMap = false;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -756,6 +769,15 @@ static void VK_TessellatePatchQuad( const WorldVertex ctrl[3][3], int level,
 					out.color[1] += w * p.color[1];
 					out.color[2] += w * p.color[2];
 					out.color[3] += w * p.color[3];
+					// No real confirmed patch surface uses tcGen environment
+					// on this renderer's test maps (all 28 real matches are
+					// planar wall/glass surfaces), but interpolating anyway
+					// costs nothing and keeps patches consistent with every
+					// other WorldVertex field here rather than silently
+					// leaving this one at zero.
+					out.normal[0] += w * p.normal[0];
+					out.normal[1] += w * p.normal[1];
+					out.normal[2] += w * p.normal[2];
 				}
 			}
 
@@ -859,6 +881,12 @@ void RE_LoadWorldMap( const char *name )
 		// aren't used by this renderer, see WorldVertex's comment.
 		cpuVerts[i].lightmapUV[0] = verts[i].lightmap[0][0];
 		cpuVerts[i].lightmapUV[1] = verts[i].lightmap[0][1];
+		// See WorldVertex::normal's own comment - always copied straight
+		// from the BSP regardless of whether this vertex ends up on a
+		// tcGen-environment surface.
+		cpuVerts[i].normal[0] = verts[i].normal[0];
+		cpuVerts[i].normal[1] = verts[i].normal[1];
+		cpuVerts[i].normal[2] = verts[i].normal[2];
 		// White (no-op) by default - overwritten below with this vertex's
 		// real baked colour, but only for surfaces the per-surface loop
 		// below determines are vertex-lit. See WorldVertex::color's own
@@ -1006,6 +1034,16 @@ void RE_LoadWorldMap( const char *name )
 		}
 
 		image_t *img = VK_FindImage( shaders[surf.shaderNum].shader );
+		// See WorldSurfaceBatch::envMap's own comment - only ever set true
+		// below, and only for the specific fallback case where the resolved
+		// image genuinely came from a `tcGen environment` first stage (the
+		// common case, where `img` above already resolved directly by the
+		// shader's own name matching a real texture file, is drawing that
+		// surface's ordinary *second*-stage base texture - real vanilla's
+		// own composited look for these shaders - with correct ordinary
+		// UVs already; forcing reflection UVs onto that image would be
+		// wrong, not an improvement).
+		bool envMap = false;
 		if ( !img )
 		{
 			// A shader's own name is not reliably the same path as its real
@@ -1037,15 +1075,27 @@ void RE_LoadWorldMap( const char *name )
 			// checking real shaders that would otherwise take this path:
 			// several (`textures/common/env_glass`, `.../glass_security_hex`)
 			// use `tcGen environment` on their first stage - a reflection-
-			// vector UV generation mode this renderer doesn't implement at
+			// vector UV generation mode this renderer didn't implement at
 			// all - so resolving their fallback `map` and sampling it with
 			// the surface's own baked UV would render an actively wrong
 			// static texture, not a translucent glass look. Left unresolved
 			// rather than drawn wrong, same "invisible beats wrong" call as
 			// the RE_RegisterShaderNoMip videologo fix in tr_image.cpp.
 			//
+			// Update: real per-vertex reflection UV generation for `tcGen
+			// environment` IS now implemented (see WorldSurfaceBatch::envMap
+			// below and world.vert) - the "actively wrong static texture"
+			// problem the comment above describes no longer applies when
+			// this specific fallback image came from a tcGen-environment
+			// first stage, so that case is now explicitly let through
+			// alongside the no-tcGen-at-all case. Any OTHER tcGen type
+			// (`tcGen lightmap`/`tcGen vector`, neither with a single real
+			// per-map match on this renderer's test maps as of this writing)
+			// stays blocked exactly as before.
+			//
 			// Widened to also allow BLEND_ADDITIVE through, but ONLY when
-			// the shader has no `tcGen` at all (VK_ShaderHasTcGen) - env_glass/
+			// the shader has no `tcGen` at all (VK_ShaderHasTcGen) OR its
+			// tcGen is specifically `environment` - env_glass/
 			// glass_security_* are ALSO additive-classified (their first
 			// stage really is `blendFunc GL_ONE GL_ONE`, checked directly
 			// against real shader data, not assumed different from the
@@ -1059,14 +1109,20 @@ void RE_LoadWorldMap( const char *name )
 			// dark_dust (see "World geometry blend modes" above), previously
 			// invisible outright rather than just wrongly-blended.
 			vkBlendMode_t fallbackBlendMode = VK_GetShaderBlendMode( shaders[surf.shaderNum].shader );
+			bool fallbackTcGenEnvironment = VK_GetShaderTcGenEnvironment( shaders[surf.shaderNum].shader );
 			bool safeForMapImageFallback = fallbackBlendMode == BLEND_OPAQUE ||
-				( fallbackBlendMode == BLEND_ADDITIVE && !VK_ShaderHasTcGen( shaders[surf.shaderNum].shader ) );
+				( fallbackBlendMode == BLEND_ADDITIVE &&
+					( !VK_ShaderHasTcGen( shaders[surf.shaderNum].shader ) || fallbackTcGenEnvironment ) );
 			if ( safeForMapImageFallback )
 			{
 				const char *mapImage = VK_GetShaderMapImage( shaders[surf.shaderNum].shader );
 				if ( mapImage )
 				{
 					img = VK_FindImage( mapImage );
+					if ( img && fallbackTcGenEnvironment )
+					{
+						envMap = true;
+					}
 				}
 			}
 		}
@@ -1214,7 +1270,7 @@ void RE_LoadWorldMap( const char *name )
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
-			scrollS, scrollT, blendMode, scaleS, scaleT } );
+			scrollS, scrollT, blendMode, scaleS, scaleT, envMap } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1716,6 +1772,11 @@ void RE_RenderScene( const refdef_t *fd )
 	// crash.
 	worldPush.uvScale[0] = 1.0f;
 	worldPush.uvScale[1] = 1.0f;
+	// uvScale.z is the tcGen-environment flag (see the per-batch loop below,
+	// and vkWorldPushConstants_t's own comment) - 0.0 (ordinary UVs) is the
+	// correct starting state here, same explicit-not-implicit-zero
+	// discipline as uvScale.xy above.
+	worldPush.uvScale[2] = 0.0f;
 	vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		0, sizeof( worldPush ), &worldPush );
 
@@ -1744,6 +1805,7 @@ void RE_RenderScene( const refdef_t *fd )
 	int currentFogIndex = -1;
 	float currentScrollS = 0.0f, currentScrollT = 0.0f;
 	float currentScaleS = 1.0f, currentScaleT = 1.0f;
+	bool currentEnvMap = false;
 	float timeSeconds = (float)fd->time / 1000.0f;
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
@@ -1764,7 +1826,8 @@ void RE_RenderScene( const refdef_t *fd )
 		}
 		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex ||
 			batch.scrollS != currentScrollS || batch.scrollT != currentScrollT ||
-			batch.scaleS != currentScaleS || batch.scaleT != currentScaleT )
+			batch.scaleS != currentScaleS || batch.scaleT != currentScaleT ||
+			batch.envMap != currentEnvMap )
 		{
 			currentPushIsVertexLit = batch.vertexLit;
 			currentFogIndex = batch.fogIndex;
@@ -1772,9 +1835,15 @@ void RE_RenderScene( const refdef_t *fd )
 			currentScrollT = batch.scrollT;
 			currentScaleS = batch.scaleS;
 			currentScaleT = batch.scaleT;
+			currentEnvMap = batch.envMap;
 			worldPush.camPos[3] = currentPushIsVertexLit ? 1.0f : 2.0f;
 			worldPush.uvScale[0] = currentScaleS;
 			worldPush.uvScale[1] = currentScaleT;
+			// See vkWorldPushConstants_t's own comment (tr_local.h) - uvScale.z
+			// doubles as the tcGen-environment flag for this batch (1.0 =
+			// generate reflection UVs in world.vert, ignoring uvScale.xy/inUV
+			// entirely; 0.0 = the common ordinary-UV case).
+			worldPush.uvScale[2] = currentEnvMap ? 1.0f : 0.0f;
 			if ( currentFogIndex >= 0 )
 			{
 				const WorldFogEntry &fog = s_worldFogs[currentFogIndex];

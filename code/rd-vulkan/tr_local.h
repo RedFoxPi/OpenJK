@@ -186,6 +186,16 @@ struct WorldVertex
 	float pos[3];
 	float uv[2];
 	float lightmapUV[2];
+	// Real BSP-baked vertex normal (drawVert_t::normal, qcommon/qfiles.h),
+	// world-space (world geometry has no per-entity transform, so this needs
+	// no further rotation before use). Always populated straight from the
+	// BSP at load time (RE_LoadWorldMap) regardless of surface type - the
+	// data is already sitting right next to xyz/st/lightmap in every
+	// drawVert_t, so there's no reason to special-case which surfaces get
+	// it. Only actually read by world.vert's reflection-vector computation
+	// though, gated per-batch on WorldSurfaceBatch::envMap - every other
+	// surface carries a real normal here that's simply never sampled.
+	float normal[3];
 	// dsurface_t/drawVert_t's real baked colour (style 0), normalized to
 	// 0..1 - but only genuinely populated from BSP data for vertex-lit
 	// surfaces (WorldSurfaceBatch::vertexLit, RE_LoadWorldMap); every other
@@ -248,13 +258,21 @@ struct PolyVertex
 // rd-vanilla's), not a deliberate simplification. uvScale.xy is this
 // batch's `tcMod scale` multiplier (world.vert multiplies the diffuse UV
 // by it before adding the scroll offset above) - 1.0,1.0 (a true no-op)
-// for the common case (no `tcMod scale` on this batch's shader). uvScale.zw
-// is unused padding. Every call site must set camPos[3] AND uvScale.xy
-// explicitly - a zero-initialized push (`= {}`) defaults camPos[3] to 0.0
-// (multiplies the surface to solid black, not "no overbright") and
-// uvScale.xy to 0.0,0.0 (multiplies every UV to (0,0), not "no rescale") -
-// both are silent-black/silent-wrong-texture bugs, not crashes, so a
-// missed call site is easy to overlook without a direct screenshot check.
+// for the common case (no `tcMod scale` on this batch's shader). uvScale.z
+// is the tcGen-environment flag (VK_GetShaderTcGenEnvironment, tr_shader.cpp)
+// - 1.0 makes world.vert ignore inUV/uvScale.xy entirely and instead
+// generate UVs per-vertex from the vertex normal and camPos (real
+// RB_CalcEnvironmentTexCoords, rd-vanilla's tr_shade_calc.cpp); 0.0 (the
+// common case) draws ordinary UVs exactly as before. uvScale.w is unused
+// padding. Every call site must set camPos[3] AND uvScale.xy explicitly -
+// a zero-initialized push (`= {}`) defaults camPos[3] to 0.0 (multiplies
+// the surface to solid black, not "no overbright") and uvScale.xy to
+// 0.0,0.0 (multiplies every UV to (0,0), not "no rescale") - both are
+// silent-black/silent-wrong-texture bugs, not crashes, so a missed call
+// site is easy to overlook without a direct screenshot check. uvScale.z
+// is safe to leave at a zero-initialized push's default 0.0 (ordinary UVs,
+// the correct behaviour for every call site except world geometry's own
+// per-batch loop, which sets it explicitly either way for clarity).
 struct vkWorldPushConstants_t
 {
 	float mvp[16];
@@ -692,6 +710,11 @@ bool VK_GetShaderRgbWave( const char *name, float *base, float *amp, float *phas
 // this function's own comment (tr_shader.cpp) and RE_LoadWorldMap's map-
 // image-fallback safety gate (tr_world.cpp), the only caller.
 bool VK_ShaderHasTcGen( const char *name );
+// Whether a shader's first stage declares `tcGen environment` specifically -
+// see this function's own comment (tr_shader.cpp) and RE_LoadWorldMap (the
+// only caller), which flags matching world surfaces for real per-vertex
+// reflection-mapped UV generation (world.vert) instead of ordinary UVs.
+bool VK_GetShaderTcGenEnvironment( const char *name );
 
 // tr_weather.cpp
 //
