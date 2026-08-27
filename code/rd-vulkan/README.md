@@ -3334,6 +3334,105 @@ left unconfirmed by eye in the previous section, for the same underlying
 reason: this checkout's fixed test scenes don't happen to exercise the
 downstream visible effect.
 
+## Ghoul2 per-level animation-file overrides (`SetAnimIndex`/`GetAnimIndex`)
+
+Closes another real gap this file's own "not implemented" list carried:
+"every model always uses whichever single `.gla` `VK_LoadGhoul2Skeleton`
+first resolved for it." Confirmed real, and unusually heavily exercised:
+`bg_panimate.cpp` calls `gi.G2API_SetAnimIndex(&gent->ghoul2[gent-
+>playerModel], curAnim.glaIndex)` on **every single torso/legs animation
+change for every player and NPC in the game** - not a rare edge case at
+all, just one whose *value* (`curAnim.glaIndex`) is almost always 0 (the
+base `.gla`) and so, until now, silently matched this renderer's existing
+always-use-the-default-skeleton behavior by coincidence. It stops being a
+coincidence for any animation that came from a **per-level "cinematic"
+animation-file override** - confirmed real and present for *every one* of
+this checkout's 4 fixed test maps: `_humanoid_academy1.gla`,
+`_humanoid_hoth2.gla`, `_humanoid_vjun1.gla`, `_humanoid_yavin1.gla` all
+ship in the real game data alongside the base `_humanoid.gla`, each holding
+extra animations - not present in the base file - that a level's own
+scripted cutscene NPCs specifically need (`NPC_stats.cpp`'s
+`G_ParseAnimFileSet`, called once per level for the `_humanoid` skeleton
+family).
+
+**Real rd-vanilla mechanism**: `CGhoul2Info::animModelIndexOffset` (already
+a real field on the shared struct, just never read here before) is an
+offset added directly to a model's own default `.gla`'s registration handle
+(`ghlInfo->currentModel->mdxm->animIndex + animModelIndexOffset`,
+`G2_API.cpp`) to land on whichever `.gla` was registered that many calls
+later - concretely 0 for the base file, 1 for that same map's own
+cinematic-override file, since `G_ParseAnimFileSet` always precaches them
+back-to-back and (real code, with its own comment flagging the fragility:
+"double check this always comes first!") **asserts** the second call's
+handle is exactly the first call's plus one.
+
+**Implementation - and a real bug found and reverted during its own
+verification**: this renderer doesn't need real vanilla's literal shared
+`qhandle_t` space to reproduce the same behavior - `VK_LoadGhoul2Skeleton`
+is already a name-keyed, idempotent loader, so a small parallel handle
+array on top of it is enough. The first version of this fix, however,
+registered a `.glm`'s own default `.gla` into the *same* handle sequence
+`G2API_PrecacheGhoul2Model` hands out (mirroring how real vanilla's
+`RE_RegisterModel` genuinely is one shared global handle space for every
+model of every kind) - and that broke the real invariant above: confirmed
+via an actual crash on academy1's own regression run, where humanoid
+player/NPC models (`luke`, `kyle`, `rebel_pilot` - all defaulting to
+`_humanoid.gla`) and the wholly unrelated `protocol` droid (its own
+`protocol.gla`) all load during the UI menu-precache phase, *before* Game
+Initialization ever runs `G_ParseAnimFileSet` - `protocol.gla` claimed a
+handle in between `G_ParseAnimFileSet`'s two back-to-back precache calls,
+and the real assert fired, aborting the game DLL (the render-regression
+harness then hung waiting on a screenshot that would never come, since the
+child process had already crashed - not an infinite loop in this
+renderer's own code). **Fixed by keeping the handle space genuinely
+isolated**: `VK_PrecacheGhoul2AnimHandle` (the "find or create" side) is
+now called *only* from `G2API_PrecacheGhoul2Model` (tr_init.cpp), exactly
+matching which real vanilla code path ever calls
+`RE_RegisterModel`-for-a-`.gla` for the `_humanoid` family in practice -
+`VK_LoadGhoul2Model` no longer registers into it at all, instead keeping
+only its own default `.gla`'s *name* (`VulkanGhoul2Model::baseAnimName`).
+At pose-resolve time, `VK_ResolveGhoul2SkeletonIndex` looks that name up in
+the handle space *on demand* (`VK_FindGhoul2AnimHandle`, lookup-only, never
+creates an entry) rather than relying on a handle baked in once at
+`.glm`-load time - correct regardless of load order, since a model may load
+long before anything ever explicitly precaches its skeleton's name (exactly
+what happens during the UI phase above). `G2API_SetAnimIndex`/
+`GetAnimIndex` themselves just read/write the existing
+`animModelIndexOffset` field; `VK_ResolveGhoul2SkeletonIndex` is the only
+place that acts on it, threaded through every function that computes a
+*live* pose (`VK_GetGhoul2BoneCurrentPoseMat`, `VK_GetGhoul2SurfaceBoltMatrix`,
+`VK_GetGhoul2NumFrames`, and `VK_DrawGhoul2Entities`'s main per-sub-model
+draw loop) - deliberately *not* `VK_GetGhoul2BoneBasePoseMat`, since a
+per-level override `.gla` shares its base file's bone hierarchy/rest pose,
+only adding extra animation frames.
+
+**One known, honestly-documented gap**: real rd-vanilla also clears every
+bone slot's `BONE_ANIM_BLEND`-family flags when the index actually changes,
+so a blend-in-progress on some other bone doesn't carry a stale flag across
+the switch. Not replicated here - this renderer's simpler per-instance
+animation state (`VulkanGhoul2AnimState`) doesn't track that flag the same
+way, and per `bg_panimate.cpp`'s own call pattern, the very next call after
+`SetAnimIndex` is always a fresh `SetBoneAnimIndex` on that same bone
+anyway.
+
+**Verified**: full SP scene suite clean (including the specific academy1
+crash found and fixed above), warning-free rebuild. Pixel-diffed a build
+with this fix against one without it: all 5 scenes stayed within this
+renderer's already-documented per-run noise floor - expected, since
+`curAnim.glaIndex` is 0 (matching this renderer's pre-existing default-
+skeleton behavior) for ordinary spawn-camera idle/movement animations on
+every one of this checkout's fixed test scenes; only a cutscene-exclusive
+animation would ever resolve to the override file, and none of the 4 fixed
+spawn captures happens to catch one playing. Confirmed via load-time log
+lines that every one of academy1/hoth2/vjun1/yavin1's own cinematic-
+override `.gla` genuinely loads without error (`_humanoid_academy1.gla: 53
+bones`, etc., matching the base file's own bone count exactly, as expected
+for a shared-hierarchy animation-only override) - not independently
+confirmed by eye against a visible cutscene-animation effect, for the same
+reason surface bolts' and model-to-model attachment's own downstream
+effects weren't (see those sections above): this checkout's fixed test
+scenes don't happen to exercise it.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3404,10 +3503,12 @@ downstream visible effect.
   frames - not a cruder single-whole-skeleton-track approximation. Real
   per-instance surface on/off overrides (`SetSurfaceOnOff`), real
   surface bolts (a bolt naming a `*`-prefixed tag surface, not just a
-  bone), and real model-to-model attachment (`AttachG2Model`) now too -
-  see "Ghoul2 per-surface on/off overrides"/"Ghoul2 surface bolts"/"Ghoul2
-  model-to-model attachment" above. Still missing: bone-angle overrides/
-  ragdoll/IK, LOD selection, gore.
+  bone), real model-to-model attachment (`AttachG2Model`), and real
+  per-level animation-file overrides (`SetAnimIndex`/`GetAnimIndex`) now
+  too - see "Ghoul2 per-surface on/off overrides"/"Ghoul2 surface bolts"/
+  "Ghoul2 model-to-model attachment"/"Ghoul2 per-level animation-file
+  overrides" above. Still missing: bone-angle overrides/ragdoll/IK, LOD
+  selection, gore.
 - Runtime polys (`RE_AddPolyToScene`, `tr_model.cpp`) - see "Runtime polys"
   above. Real per-scene queueing, CPU fan-to-triangle-list expansion, and a
   dedicated pipeline with the same three blend-mode variants (alpha/
@@ -3457,12 +3558,11 @@ downstream visible effect.
   animation over a real `blendTime`, and real sub-frame interpolation
   between adjacent whole frames. Reverse/negative-speed playback is ported
   faithfully in `VK_Ghoul2TimingModel` but untested against a real scene,
-  since no real caller in this game currently uses it. `
-  SetAnimIndex`/`GetAnimIndex` (selecting *which* `.gla`/animation-file a
-  model uses, a different concept from which frame within one - relevant
-  for NPCs with a per-level animation-file override, e.g.
-  `_humanoid_academy1.gla`) are still stubs; every model always uses
-  whichever single `.gla` `VK_LoadGhoul2Skeleton` first resolved for it.
+  since no real caller in this game currently uses it. `SetAnimIndex`/
+  `GetAnimIndex` (selecting *which* `.gla`/animation-file a model uses, a
+  different concept from which frame within one - relevant for NPCs with a
+  per-level animation-file override, e.g. `_humanoid_academy1.gla`) are
+  real now too - see "Ghoul2 per-level animation-file overrides" above.
   Also still missing: bone-angle overrides (`SetBoneAngles*`), ragdoll, IK,
   LOD selection, gore, and tags. Surface bolts (a bolt naming a *surface*
   rather than a bone) and model-to-model attachment (`AttachG2Model`/

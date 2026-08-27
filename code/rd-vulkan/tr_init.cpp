@@ -1775,7 +1775,11 @@ qboolean G2API_DetachG2Model( CGhoul2Info *ghlInfo ) { if ( !ghlInfo ) return qf
 qboolean G2API_GetAnimFileName( CGhoul2Info *ghlInfo, char **filename ) { (void)ghlInfo; if ( filename ) *filename = nullptr; return qfalse; }
 char *G2API_GetAnimFileNameIndex( qhandle_t modelIndex ) { (void)modelIndex; return nullptr; }
 char *G2API_GetAnimFileInternalNameIndex( qhandle_t modelIndex ) { (void)modelIndex; return nullptr; }
-int G2API_GetAnimIndex( CGhoul2Info *ghlInfo ) { (void)ghlInfo; return 0; }
+// Real now - see G2API_SetAnimIndex's own comment below for the mechanism
+// this is the read side of (CGhoul2Info::animModelIndexOffset, already a
+// real field on the shared struct - not new API surface, just an unread
+// one until now).
+int G2API_GetAnimIndex( CGhoul2Info *ghlInfo ) { return ghlInfo ? ghlInfo->animModelIndexOffset : 0; }
 // Resolves a By-name G2API call's boneName to the same real skeleton bone
 // index an equivalent ...Index call would already have (ghlInfo->mModel is
 // the model cache index VK_FindGhoul2Bone expects - the same field
@@ -2097,11 +2101,12 @@ qboolean G2API_PauseBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, co
 // permanent `return 0;` silently meant no map's cinematic-only animations
 // ever loaded, for any NPC, ever - not just "this specific .gla is
 // missing," every map that ships one. Uses a dedicated handle cache
-// (`s_precachedModelHandles`), not `RE_RegisterModel`'s existing
-// hardcoded-1 stub (see its own comment) or `VK_LoadGhoul2Skeleton`'s real
-// per-skeleton cache (a different handle space, used for a different
-// purpose - actually rendering a skeleton, not this ordinal "did it
-// register, and did the second one land right after the first" check) -
+// (`VK_PrecacheGhoul2AnimHandle`'s own registry, tr_model.cpp), not
+// `RE_RegisterModel`'s existing hardcoded-1 stub (see its own comment) or
+// `VK_LoadGhoul2Skeleton`'s real per-skeleton cache (a different handle
+// space, used for a different purpose - actually rendering a skeleton, not
+// this ordinal "did it register, and did the second one land right after
+// the first" check) -
 // `G_ParseAnimFileSet` asserts a *second* precache call (the cinematic
 // GLA) returns exactly the *first* call's handle (the standard GLA) plus
 // one, so this needs handles assigned strictly in first-seen call order,
@@ -2110,28 +2115,29 @@ qboolean G2API_PauseBoneAnimIndex( CGhoul2Info *ghlInfo, const int boneIndex, co
 // semantics for "file doesn't exist") only when a never-before-seen
 // filename genuinely can't be read - the common, expected case for any
 // map that doesn't ship a cinematic-specific GLA at all, not an error.
-static std::unordered_map<std::string, int> s_precachedModelHandles;
+//
+// Now routes through VK_PrecacheGhoul2AnimHandle (tr_model.cpp), which
+// actually loads the skeleton behind each handle (not just an existence
+// check discarding the buffer), so `handle + offset`
+// (G2API_SetAnimIndex/GetAnimIndex below) actually resolves to a real,
+// already-loaded skeleton rather than just an opaque ordinal - see that
+// function's own comment for why this handle space still needs to stay
+// isolated from ordinary per-model skeleton loading (VK_LoadGhoul2Model
+// never registers into it), not shared the way real vanilla's literal
+// qhandle_t space is. See "Ghoul2 per-level animation-file overrides"
+// (README.md) for the full story.
 qhandle_t G2API_PrecacheGhoul2Model( const char *fileName )
 {
 	if ( !fileName || !fileName[0] )
 	{
 		return 0;
 	}
-	auto it = s_precachedModelHandles.find( fileName );
-	if ( it != s_precachedModelHandles.end() )
+	std::string name = fileName;
+	if ( COM_CompareExtension( fileName, ".gla" ) && name.size() > 4 )
 	{
-		return (qhandle_t)it->second;
+		name.resize( name.size() - 4 );
 	}
-	void *buffer = nullptr;
-	long len = ri.FS_ReadFile( fileName, &buffer );
-	if ( !buffer || len <= 0 )
-	{
-		return 0;
-	}
-	ri.FS_FreeFile( buffer );
-	int handle = (int)s_precachedModelHandles.size() + 1;
-	s_precachedModelHandles[fileName] = handle;
-	return (qhandle_t)handle;
+	return (qhandle_t)VK_PrecacheGhoul2AnimHandle( name.c_str() );
 }
 qboolean G2API_RagEffectorGoal( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t pos ) { (void)ghoul2; (void)boneName; (void)pos; return qfalse; }
 qboolean G2API_RagEffectorKick( CGhoul2Info_v &ghoul2, const char *boneName, vec3_t velocity ) { (void)ghoul2; (void)boneName; (void)velocity; return qfalse; }
@@ -2143,7 +2149,35 @@ qboolean G2API_RemoveBone( CGhoul2Info *ghlInfo, const char *boneName ) { (void)
 qboolean G2API_RemoveGhoul2Model( CGhoul2Info_v &ghlInfo, const int modelIndex ) { (void)ghlInfo; (void)modelIndex; return qfalse; }
 qboolean G2API_RemoveSurface( CGhoul2Info *ghlInfo, const int index ) { (void)ghlInfo; (void)index; return qfalse; }
 void G2API_SaveGhoul2Models( CGhoul2Info_v &ghoul2 ) { (void)ghoul2; }
-qboolean G2API_SetAnimIndex( CGhoul2Info *ghlInfo, const int index ) { (void)ghlInfo; (void)index; return qfalse; }
+// Real now - closes a real gap this file's own "not implemented" list
+// carried as "every model always uses whichever single .gla
+// VK_LoadGhoul2Skeleton first resolved for it." Confirmed real, exercised
+// usage: bg_panimate.cpp calls this on *every* torso/legs animation change
+// for every player/NPC in the game (`curAnim.glaIndex`, almost always 0 -
+// the base .gla - but 1 whenever that animation came from a per-level
+// "cinematic" animation-file override, per G_ParseAnimFileSet's real
+// mechanism, NPC_stats.cpp - see VK_ResolveGhoul2SkeletonIndex's own
+// comment, tr_model.cpp, for the full story and why a matching
+// "_humanoid_<mapname>.gla" ships for every one of this checkout's 4 fixed
+// test maps). Just stores the offset - VK_ResolveGhoul2SkeletonIndex (used
+// by every place that computes a live pose) is what actually acts on it.
+// Real rd-vanilla (G2_API.cpp) also clears every bone slot's
+// BONE_ANIM_BLEND-family flags when the index actually changes, so a
+// blend-in-progress on some *other* bone doesn't carry a stale flag across
+// the switch; not replicated here (this renderer's simpler per-instance
+// animation state - VulkanGhoul2AnimState - doesn't track that flag the
+// same way, and the very next call on the same bone is always a fresh
+// SetBoneAnimIndex anyway per bg_panimate.cpp's own call pattern above) -
+// a known, minor, honestly-documented gap, not silently dropped.
+qboolean G2API_SetAnimIndex( CGhoul2Info *ghlInfo, const int index )
+{
+	if ( !ghlInfo )
+	{
+		return qfalse;
+	}
+	ghlInfo->animModelIndexOffset = index;
+	return qtrue;
+}
 // boneName/index, setFrame, and blendTime are ignored - see
 // VK_SetGhoul2BoneAnim's comment (tr_model.cpp): a single whole-skeleton
 // track per instance (not per-bone-subtree), no blending between two

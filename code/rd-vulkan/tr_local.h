@@ -600,6 +600,14 @@ const char *VK_GetGhoul2GLAName( int modelCacheIndex );
 // matrix instead of the ordinary fixed root rotation, so its own hierarchy
 // composes relative to the bolt rather than the entity's raw origin/axis.
 void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones, const mdxaBone_t *attachBase = nullptr );
+// Per-level animation-file-override handle space (G2API_SetAnimIndex/
+// GetAnimIndex/PrecacheGhoul2Model, tr_init.cpp) - see
+// VK_PrecacheGhoul2AnimHandle's own comment (tr_model.cpp) for the real
+// mechanism this backs. animNameNoExt has no ".gla" extension (same
+// convention as VK_LoadGhoul2Skeleton, which this calls internally).
+// Returns 0 (falsy) if the file doesn't exist, same as a failed
+// RE_RegisterModel in real vanilla.
+int VK_PrecacheGhoul2AnimHandle( const char *animNameNoExt );
 // Live per-instance, per-bone animation state (see VulkanGhoul2AnimState's
 // comment in tr_model.cpp for the real scope/simplifications) - backs
 // G2API_SetBoneAnim/GetBoneAnim/PauseBoneAnim/IsPaused/StopBoneAnim below.

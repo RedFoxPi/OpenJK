@@ -146,6 +146,14 @@ struct VulkanGhoul2Model
 	// and VK_LoadGhoul2Model's own capture site for why it's exactly 3
 	// verts, no more.
 	std::unordered_map<int, std::array<GhoulSkinVertex, 3>> tagTriangles;
+	// This model's own default .gla's name (mdxmHeader_t::animName, no
+	// extension) - kept so VK_ResolveGhoul2SkeletonIndex can look it up in
+	// the per-level animation-file-override handle space (see
+	// VK_FindGhoul2AnimHandle's own comment for why that's a name lookup,
+	// not a handle baked in once here at load time: this model may load
+	// long before - or, in principle, after - anything ever explicitly
+	// precaches its skeleton by name).
+	std::string baseAnimName;
 };
 
 // A bind-pose-only skeleton: just bone names and their bind-pose object-
@@ -256,6 +264,109 @@ int VK_LoadGhoul2Skeleton( const char *animName )
 	ri.Printf( PRINT_ALL, "rd-vulkan: loaded Ghoul2 skeleton %s: %d bones\n", fileName.c_str(), numBones );
 
 	return index;
+}
+
+// Per-level animation-file overrides (G2API_SetAnimIndex/GetAnimIndex,
+// CGhoul2Info::animModelIndexOffset - tr_init.cpp/game code) need a handle
+// space real rd-vanilla builds via ordinary RE_RegisterModel calls, and
+// `mdxmHeader_t::animIndex + offset` (real G2_API.cpp) just adds `offset`
+// to a base .gla's own handle to land on whichever .gla was registered
+// `offset` calls later - concretely, 0 for the base "_humanoid.gla" every
+// player/NPC model defaults to, 1 for that SAME map's own
+// "_humanoid_<mapname>.gla" cinematic-animation override (confirmed real,
+// present for every one of this checkout's 4 fixed test maps:
+// _humanoid_academy1.gla, _humanoid_hoth2.gla, _humanoid_vjun1.gla,
+// _humanoid_yavin1.gla all ship in the real game data, each holding extra
+// animations - not present in the base file - that a level's own scripted
+// cutscene NPCs specifically need).
+//
+// Deliberately NOT the same handle space as VK_LoadGhoul2Skeleton's own
+// per-.gla cache, even though both ultimately load through it - an earlier
+// version of this code registered a .glm's own default .gla into this same
+// handle sequence as a side effect of ordinary model loading (mirroring how
+// real vanilla's RE_RegisterModel is genuinely one shared global handle
+// space for every model of every kind), and that broke real, load-bearing
+// game code: NPC_stats.cpp's G_ParseAnimFileSet asserts its *second*
+// precache call (the cinematic GLA) returns exactly its first call's handle
+// (the standard GLA) plus one - a real, fragile invariant real vanilla's
+// own comment flags ("double check this always comes first!"). Confirmed
+// by a real crash on academy1: humanoid player/NPC models (luke, kyle,
+// rebel_pilot - all using "_humanoid.gla") and the wholly unrelated
+// protocol droid (its own "protocol.gla") all load during the earlier UI
+// menu-precache phase, before Game Initialization ever runs
+// G_ParseAnimFileSet - "protocol.gla" claimed a handle in between the two
+// calls this invariant depends on being adjacent, and the assert fired.
+// Real vanilla avoids this collision because G_ParseAnimFileSet's own
+// explicit precache calls are the *only* thing that ever touches this
+// specific handle space for the "_humanoid" family - ordinary per-model
+// default-skeleton resolution never does. Keeping the two spaces separate
+// here (matching that real isolation, not real vanilla's literal shared-
+// qhandle_t mechanism) reproduces the same observable behavior without the
+// same fragility.
+static std::unordered_map<std::string, int> s_animHandlesByName;
+static std::vector<int> s_animHandleSkeletonIndex; // handle N -> s_skeletons index (handles are 1-based; index 0 unused)
+
+// Explicit precache only - the "find or create" side, called exclusively
+// from G2API_PrecacheGhoul2Model (tr_init.cpp). Never called as a side
+// effect of loading an ordinary Ghoul2 model's own default skeleton - see
+// this cache's own comment for why that distinction is load-bearing.
+int VK_PrecacheGhoul2AnimHandle( const char *animNameNoExt )
+{
+	if ( !animNameNoExt || !animNameNoExt[0] )
+	{
+		return 0;
+	}
+	auto cached = s_animHandlesByName.find( animNameNoExt );
+	if ( cached != s_animHandlesByName.end() )
+	{
+		return cached->second;
+	}
+	// Real RE_RegisterModel-for-a-.gla semantics: a file that doesn't exist
+	// gets no handle at all (0, falsy) rather than reserving a slot for it -
+	// this is the expected, common case for any map with no cinematic-
+	// specific GLA of its own (most non-humanoid models, and any humanoid
+	// map that doesn't need level-specific cutscene animations).
+	int skeletonIndex = VK_LoadGhoul2Skeleton( animNameNoExt );
+	if ( skeletonIndex <= 0 )
+	{
+		return 0;
+	}
+	if ( s_animHandleSkeletonIndex.empty() )
+	{
+		s_animHandleSkeletonIndex.push_back( 0 ); // burn handle 0, same convention as every other cache here
+	}
+	s_animHandleSkeletonIndex.push_back( skeletonIndex );
+	int handle = (int)s_animHandleSkeletonIndex.size() - 1;
+	s_animHandlesByName[animNameNoExt] = handle;
+	return handle;
+}
+
+// Lookup-only counterpart, for VK_ResolveGhoul2SkeletonIndex below: does a
+// Ghoul2 model's own default .gla (by name, not by any handle baked in at
+// .glm-load time - see that function's own comment for why a lookup, not a
+// stored handle) happen to *already* be registered in this handle space?
+// Never creates an entry - a model whose skeleton was never explicitly
+// precached (no map-specific override exists for it, or this model simply
+// isn't a "_humanoid" family model at all) correctly finds nothing here,
+// same as real vanilla's own mdxmHeader_t::animIndex would never get set
+// for such a model either.
+static int VK_FindGhoul2AnimHandle( const char *animNameNoExt )
+{
+	if ( !animNameNoExt || !animNameNoExt[0] )
+	{
+		return 0;
+	}
+	auto it = s_animHandlesByName.find( animNameNoExt );
+	return it != s_animHandlesByName.end() ? it->second : 0;
+}
+
+static int VK_Ghoul2AnimHandleSkeletonIndex( int handle )
+{
+	if ( handle <= 0 || (size_t)handle >= s_animHandleSkeletonIndex.size() )
+	{
+		return 0;
+	}
+	return s_animHandleSkeletonIndex[handle];
 }
 
 // Index 0 is reserved/invalid (mirrors CGhoul2Info::mModel's use as a
@@ -503,7 +614,11 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 
 	// For bolt lookups only (G2API_AddBolt/GetBoltMatrix) - see
 	// VulkanSkeleton's comment. animName has no extension (matches
-	// R_LoadMDXM's real `va("%s.gla", mdxm->animName)` convention).
+	// R_LoadMDXM's real `va("%s.gla", mdxm->animName)` convention). Kept
+	// (not just used transiently here) as VulkanGhoul2Model::baseAnimName -
+	// see VK_ResolveGhoul2SkeletonIndex's own comment for why a per-level
+	// animation-file override needs to look this up by name, on demand,
+	// rather than a handle baked in once at load time.
 	int skeletonIndex = VK_LoadGhoul2Skeleton( hdr->animName );
 
 	// Surface hierarchy: one variable-length mdxmSurfHierarchy_t per surface
@@ -726,6 +841,7 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	VulkanGhoul2Model model;
 	model.surfaces = std::move( drawSurfaces );
 	model.skeletonIndex = skeletonIndex;
+	model.baseAnimName = hdr->animName;
 	model.skinSource = std::move( skinSource );
 	model.surfaceNames = std::move( surfaceNames );
 	model.surfaceFlags = std::move( surfaceFlags );
@@ -1007,6 +1123,43 @@ bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t
 	return true;
 }
 
+// Real per-instance animation-file-override resolution (G2API_SetAnimIndex,
+// CGhoul2Info::animModelIndexOffset) - see VK_PrecacheGhoul2AnimHandle's own
+// comment for the real mechanism this ports. Every place that computes a
+// live animated pose (not the fixed bind pose - VK_GetGhoul2BoneBasePoseMat
+// above deliberately doesn't call this, since a per-level override .gla
+// shares its base file's bone hierarchy/rest pose, only adding extra
+// animation frames) needs to use the *overridden* skeleton, not always
+// model.skeletonIndex, or an NPC using an offset .gla's exclusive animation
+// (e.g. a scripted cutscene gesture only academy1's own
+// _humanoid_academy1.gla contains) would read frame data from the wrong
+// file entirely. Looks up the model's own base .gla by *name*
+// (VK_FindGhoul2AnimHandle), not a handle cached at .glm-load time - this
+// model may well have loaded before anything ever explicitly precached its
+// skeleton's name (see that function's own comment for the real crash this
+// avoids). Falls back to the model's own default skeleton whenever no
+// override is active (the overwhelmingly common case: animModelIndexOffset
+// stays 0 unless a caller explicitly set it), this model's own skeleton was
+// never explicitly precached at all (most non-"_humanoid" models), or the
+// offset doesn't resolve to a loaded skeleton (points past whatever was
+// actually registered).
+static int VK_ResolveGhoul2SkeletonIndex( const VulkanGhoul2Model &model, const CGhoul2Info *ghlInfo )
+{
+	if ( ghlInfo && ghlInfo->animModelIndexOffset != 0 )
+	{
+		int baseHandle = VK_FindGhoul2AnimHandle( model.baseAnimName.c_str() );
+		if ( baseHandle > 0 )
+		{
+			int altSkeletonIndex = VK_Ghoul2AnimHandleSkeletonIndex( baseHandle + ghlInfo->animModelIndexOffset );
+			if ( altSkeletonIndex > 0 )
+			{
+				return altSkeletonIndex;
+			}
+		}
+	}
+	return model.skeletonIndex;
+}
+
 // Same contract as VK_GetGhoul2BoneBasePoseMat, but the bone's *currently
 // animated* world-space (relative to model root) matrix instead of its
 // fixed rest pose - reuses VK_ComputeGhoul2Pose, the same per-frame
@@ -1025,7 +1178,7 @@ bool VK_GetGhoul2BoneCurrentPoseMat( int modelCacheIndex, const CGhoul2Info *ghl
 	{
 		return false;
 	}
-	int skeletonIndex = s_ghoul2Models[modelCacheIndex].skeletonIndex;
+	int skeletonIndex = VK_ResolveGhoul2SkeletonIndex( s_ghoul2Models[modelCacheIndex], ghlInfo );
 	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
 	{
 		return false;
@@ -1072,7 +1225,7 @@ bool VK_GetGhoul2SurfaceBoltMatrix( int modelCacheIndex, int surfIndex, const CG
 	{
 		return false;
 	}
-	int skeletonIndex = model.skeletonIndex;
+	int skeletonIndex = VK_ResolveGhoul2SkeletonIndex( model, ghlInfo );
 	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
 	{
 		return false;
@@ -1614,7 +1767,7 @@ static int VK_GetGhoul2NumFrames( const CGhoul2Info *ghlInfo )
 	{
 		return 0;
 	}
-	int skeletonIndex = s_ghoul2Models[ghlInfo->mModel].skeletonIndex;
+	int skeletonIndex = VK_ResolveGhoul2SkeletonIndex( s_ghoul2Models[ghlInfo->mModel], ghlInfo );
 	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
 	{
 		return 0;
@@ -3504,11 +3657,20 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 					}
 				}
 			}
+			// VK_ResolveGhoul2SkeletonIndex: a per-level animation-file
+			// override (G2API_SetAnimIndex - see that function's own
+			// comment, tr_model.cpp) shares this model's own bind pose/
+			// bone hierarchy, only swapping which .gla's *animation frame
+			// data* poses are actually read from - so the override applies
+			// here (live pose), not to the bind-pose/skinning-weight data
+			// VK_SkinGhoul2Model reads from model.skinSource, which stays
+			// tied to the base skeleton regardless.
+			int poseSkeletonIndex = VK_ResolveGhoul2SkeletonIndex( model, &g2Instance );
 			std::vector<mdxaBone_t> pose;
-			VK_ComputeGhoul2Pose( model.skeletonIndex, &g2Instance, currentTime, pose, hasAttachBase ? &attachBase : nullptr );
+			VK_ComputeGhoul2Pose( poseSkeletonIndex, &g2Instance, currentTime, pose, hasAttachBase ? &attachBase : nullptr );
 			VK_SkinGhoul2Model( model, pose, skinSlot );
 			VK_DebugLogGhoul2Anim( ent, &g2Instance,
-				( model.skeletonIndex > 0 && (size_t)model.skeletonIndex < s_skeletons.size() ) ? &s_skeletons[model.skeletonIndex] : nullptr,
+				( poseSkeletonIndex > 0 && (size_t)poseSkeletonIndex < s_skeletons.size() ) ? &s_skeletons[poseSkeletonIndex] : nullptr,
 				currentTime );
 
 			// Full push constant struct (mvp + camPos + fogColor), both
