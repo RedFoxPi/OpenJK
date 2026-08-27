@@ -118,6 +118,21 @@ struct WorldSurfaceBatch
 	// (opaque batches first, so translucent ones draw depth-tested against
 	// them) - see RE_LoadWorldMap's own sort call.
 	vkBlendMode_t blendMode;
+	// This surface's shader's first-stage `tcMod scale` multiplier, or
+	// 1.0,1.0 (a true no-op) for the common no-scale case - see
+	// VK_GetShaderTcModScroll's comment (tr_shader.cpp) for the real test
+	// cases that motivated this and how it composes with scrollS/scrollT
+	// above when a shader declares both. Deliberately the LAST field, with
+	// default member initializers (not 0.0f) rather than inserted earlier
+	// alongside scrollS/scrollT: every existing WorldSurfaceBatch
+	// constructor call is positional aggregate init (sky faces, real BSP
+	// surfaces) supplying exactly the old field count, so appending new
+	// fields at the end - not in the middle - is what lets those call
+	// sites keep compiling unchanged while correctly picking up the
+	// default. 1.0f (not scrollS/scrollT's own correct-by-coincidence
+	// 0.0f zero-init default) is required here specifically: 0.0f would
+	// multiply every UV to (0,0), not leave it alone.
+	float scaleS = 1.0f, scaleT = 1.0f;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -1110,11 +1125,12 @@ void RE_LoadWorldMap( const char *name )
 			fogIndex = surf.fogNum;
 		}
 
-		// See WorldSurfaceBatch::scrollS/scrollT's comment - 0,0 (no lookup
-		// hit) is exactly correct for the vast majority of shaders that
-		// never declare a tcMod scroll at all.
-		float scrollS = 0.0f, scrollT = 0.0f;
-		VK_GetShaderTcModScroll( shaders[surf.shaderNum].shader, &scrollS, &scrollT );
+		// See WorldSurfaceBatch::scrollS/scrollT/scaleS/scaleT's own
+		// comments - 0,0/1,1 (no lookup hit) is exactly correct for the
+		// vast majority of shaders that never declare a tcMod scroll or
+		// scale at all.
+		float scrollS = 0.0f, scrollT = 0.0f, scaleS = 1.0f, scaleT = 1.0f;
+		VK_GetShaderTcModScroll( shaders[surf.shaderNum].shader, &scrollS, &scrollT, &scaleS, &scaleT );
 
 		// BLEND_OPAQUE, not VK_GetShaderBlendMode's own default
 		// (BLEND_ALPHA, correct for the 2D UI path's bare-image case) - a
@@ -1188,7 +1204,7 @@ void RE_LoadWorldMap( const char *name )
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
-			scrollS, scrollT, blendMode } );
+			scrollS, scrollT, blendMode, scaleS, scaleT } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1595,6 +1611,11 @@ void RE_RenderScene( const refdef_t *fd )
 		vkWorldPushConstants_t skyPush = {};
 		memcpy( skyPush.mvp, skyMvp, sizeof( skyMvp ) );
 		skyPush.camPos[3] = 1.0f;
+		// Identity, not zero-init's 0,0 - see vkWorldPushConstants_t's own
+		// comment (tr_local.h). Sky doesn't support tcMod scale (not a real
+		// .shader-driven surface the same way BSP geometry is).
+		skyPush.uvScale[0] = 1.0f;
+		skyPush.uvScale[1] = 1.0f;
 		vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 			0, sizeof( skyPush ), &skyPush );
 
@@ -1631,6 +1652,12 @@ void RE_RenderScene( const refdef_t *fd )
 	// dsurface_t.fogNum rather than blanket-applying one fog to the whole
 	// world regardless of what each surface actually compiled into (see
 	// WorldSurfaceBatch::fogIndex's comment).
+	// uvScale must be set explicitly to the identity (1,1), not left at
+	// zero-init's 0,0 - see vkWorldPushConstants_t's own comment (tr_local.h)
+	// for why a missed uvScale init is a silent wrong-texture bug, not a
+	// crash.
+	worldPush.uvScale[0] = 1.0f;
+	worldPush.uvScale[1] = 1.0f;
 	vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		0, sizeof( worldPush ), &worldPush );
 
@@ -1658,6 +1685,7 @@ void RE_RenderScene( const refdef_t *fd )
 	bool currentPushIsVertexLit = false;
 	int currentFogIndex = -1;
 	float currentScrollS = 0.0f, currentScrollT = 0.0f;
+	float currentScaleS = 1.0f, currentScaleT = 1.0f;
 	float timeSeconds = (float)fd->time / 1000.0f;
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
@@ -1677,13 +1705,18 @@ void RE_RenderScene( const refdef_t *fd )
 			vk.lastBoundPipeline = pipeline;
 		}
 		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex ||
-			batch.scrollS != currentScrollS || batch.scrollT != currentScrollT )
+			batch.scrollS != currentScrollS || batch.scrollT != currentScrollT ||
+			batch.scaleS != currentScaleS || batch.scaleT != currentScaleT )
 		{
 			currentPushIsVertexLit = batch.vertexLit;
 			currentFogIndex = batch.fogIndex;
 			currentScrollS = batch.scrollS;
 			currentScrollT = batch.scrollT;
+			currentScaleS = batch.scaleS;
+			currentScaleT = batch.scaleT;
 			worldPush.camPos[3] = currentPushIsVertexLit ? 1.0f : 2.0f;
+			worldPush.uvScale[0] = currentScaleS;
+			worldPush.uvScale[1] = currentScaleT;
 			if ( currentFogIndex >= 0 )
 			{
 				const WorldFogEntry &fog = s_worldFogs[currentFogIndex];

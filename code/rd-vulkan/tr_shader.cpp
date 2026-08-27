@@ -41,14 +41,29 @@ struct vkShaderFogParms_t
 };
 static std::unordered_map<std::string, vkShaderFogParms_t> s_shaderFogParms;
 
-// First stage's `tcMod scroll <sSpeed> <tSpeed>`, keyed by shader name - see
-// VK_GetShaderTcModScroll's own comment for what this drives. Every other
-// tcMod type (`rotate`/`scale`/`stretch`/`turb`/`transform`/
-// `entityTranslate`) and every rgbGen/alphaGen wave are still unread - see
-// rd-vulkan/README.md.
+// First stage's `tcMod scroll <sSpeed> <tSpeed>` and `tcMod scale <sx>
+// <sy>`, keyed by shader name - see VK_GetShaderTcModScroll's own comment
+// for what this drives. Every other tcMod type (`rotate`/`stretch`/`turb`/
+// `transform`/`entityTranslate`) and every rgbGen/alphaGen wave are still
+// unread - see rd-vulkan/README.md.
+//
+// sSpeed/tSpeed are stored already corrected for declaration order against
+// `tcMod scale` on the same stage, not the raw per-second speed a bare
+// `tcMod scroll` line would suggest - real Quake3 composes a stage's tcMod
+// keywords as an ordered matrix stack (each one transforms the *output* of
+// whichever came before it), so `tcMod scale` then `tcMod scroll` leaves
+// the scroll offset unscaled (scale applies to the base UV only), while
+// `tcMod scroll` then `tcMod scale` scales the scroll offset too (scale
+// applies to everything after it, including the moving part). Baking that
+// distinction into this stored speed once, at parse time, means the
+// render-time formula stays the same simple `uv*scale + speed*time` in
+// both cases - see ParseShaderFile's own comment at the `tcMod` parsing
+// site for the actual order-tracking logic, and VK_GetShaderTcModScroll's
+// comment for real confirmed examples of both orderings.
 struct vkShaderTcModScroll_t
 {
 	float sSpeed, tSpeed;
+	float scaleS = 1.0f, scaleT = 1.0f; // identity (no visible change) when no `tcMod scale` was declared
 };
 static std::unordered_map<std::string, vkShaderTcModScroll_t> s_shaderTcModScroll;
 
@@ -150,6 +165,12 @@ static void ParseShaderFile( const char *text )
 		bool haveFogParms = false;
 		vkShaderFogParms_t fogParms = {};
 		bool haveTcModScroll = false;
+		bool haveTcModScale = false;
+		// True only if `tcMod scale` was seen before `tcMod scroll` on this
+		// stage - see vkShaderTcModScroll_t's own comment for why this
+		// changes what gets stored. Meaningless (never read) when only one
+		// of the two is present.
+		bool tcModScaleBeforeScroll = false;
 		vkShaderTcModScroll_t tcModScroll = {};
 		bool havePortalRange = false;
 		float portalRange = 0.0f;
@@ -227,17 +248,18 @@ static void ParseShaderFile( const char *text )
 			}
 
 			// tcMod is a per-stage keyword with a type-specific argument
-			// count (`scroll <s> <t>`, `rotate <deg/sec>`, `stretch <func>
-			// <base> <amp> <phase> <freq>`, ...) - only `scroll`'s own two
-			// numeric arguments are understood and recorded here (see
-			// VK_GetShaderTcModScroll's comment for why just this one).
-			// Every other tcMod type's numeric arguments are deliberately
-			// left unconsumed after their type keyword is read - they fall
-			// through to the bottom of this loop as ordinary unmatched
-			// tokens and are silently skipped, exactly like any other
-			// unrecognized keyword already is (blendFunc/map's own
-			// specific handling works the same way: anything not
-			// specifically intercepted is just ignored, not an error).
+			// count (`scroll <s> <t>`, `scale <sx> <sy>`, `rotate <deg/sec>`,
+			// `stretch <func> <base> <amp> <phase> <freq>`, ...) - only
+			// `scroll`'s and `scale`'s own numeric arguments are understood
+			// and recorded here (see VK_GetShaderTcModScroll's comment for
+			// why just these two). Every other tcMod type's numeric
+			// arguments are deliberately left unconsumed after their type
+			// keyword is read - they fall through to the bottom of this
+			// loop as ordinary unmatched tokens and are silently skipped,
+			// exactly like any other unrecognized keyword already is
+			// (blendFunc/map's own specific handling works the same way:
+			// anything not specifically intercepted is just ignored, not an
+			// error).
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "tcMod" ) )
 			{
 				std::string modType = COM_ParseExt( &p, qfalse );
@@ -246,6 +268,18 @@ static void ParseShaderFile( const char *text )
 					tcModScroll.sSpeed = (float)atof( COM_ParseExt( &p, qfalse ) );
 					tcModScroll.tSpeed = (float)atof( COM_ParseExt( &p, qfalse ) );
 					haveTcModScroll = true;
+					// See vkShaderTcModScroll_t's own comment - scale was
+					// already seen on this stage means scale came first.
+					if ( haveTcModScale )
+					{
+						tcModScaleBeforeScroll = true;
+					}
+				}
+				else if ( !Q_stricmp( modType.c_str(), "scale" ) )
+				{
+					tcModScroll.scaleS = (float)atof( COM_ParseExt( &p, qfalse ) );
+					tcModScroll.scaleT = (float)atof( COM_ParseExt( &p, qfalse ) );
+					haveTcModScale = true;
 				}
 				continue;
 			}
@@ -364,8 +398,20 @@ static void ParseShaderFile( const char *text )
 		{
 			s_shaderMapImage[name] = mapImage;
 		}
-		if ( haveTcModScroll && s_shaderTcModScroll.find( name ) == s_shaderTcModScroll.end() )
+		if ( ( haveTcModScroll || haveTcModScale ) && s_shaderTcModScroll.find( name ) == s_shaderTcModScroll.end() )
 		{
+			// `tcMod scroll` then `tcMod scale` (scaleBeforeScroll false,
+			// the default) scales the moving part too - see
+			// vkShaderTcModScroll_t's own comment for the full reasoning.
+			// Baking that into the stored speed here, once, keeps the
+			// render-time formula (world.vert) the same simple
+			// `uv*scale + speed*time` regardless of which order a given
+			// shader actually declared them in.
+			if ( haveTcModScroll && haveTcModScale && !tcModScaleBeforeScroll )
+			{
+				tcModScroll.sSpeed *= tcModScroll.scaleS;
+				tcModScroll.tSpeed *= tcModScroll.scaleT;
+			}
 			s_shaderTcModScroll[name] = tcModScroll;
 		}
 		if ( havePortalRange && s_shaderPortalRange.find( name ) == s_shaderPortalRange.end() )
@@ -487,14 +533,20 @@ bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist )
 }
 
 // Looks up a shader's first stage's `tcMod scroll <sSpeed> <tSpeed>` (units
-// per second, added directly to the diffuse UV - see RE_LoadWorldMap/
-// RE_RenderScene, tr_world.cpp, the only caller). Returns false (speeds
-// left untouched) if the shader wasn't found or its first stage never
-// declared a scroll - the common case, and the caller's default (no
-// scroll) is exactly correct for it. Real, visible test case: vjun1's
-// `textures/impdetention/deathcon1a` (a containment-field texture, 51 real
-// world surfaces), confirmed by direct BSP/.shader parsing, not assumed.
-bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed )
+// per second, added directly to the diffuse UV after scaleS/scaleT below is
+// applied - see RE_LoadWorldMap/RE_RenderScene, tr_world.cpp, the only
+// caller) and `tcMod scale <sx> <sy>` (a constant multiplier on the diffuse
+// UV - real Quake3 recomputes this every frame via its tcMod matrix stack,
+// but since it never varies with time, baking it in once here produces
+// pixel-identical output). Returns false (both left untouched) if the
+// shader wasn't found or its first stage declared neither - the common
+// case, and the caller's defaults (no scroll, scaleS/T = 1.0 identity) are
+// exactly correct for it. Real, visible test cases confirmed by direct
+// BSP/.shader parsing, not assumed: vjun1's
+// `textures/impdetention/deathcon1a` (scroll, 51 real world surfaces) and
+// hoth2's `textures/hoth/rock_huge_snow`/`textures/hoth/at_at_leg` (scale
+// only, `tcMod scale 0.5 0.5`/`tcMod scale 4 4`).
+bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed, float *scaleS, float *scaleT )
 {
 	VK_LoadShaderScripts();
 
@@ -505,6 +557,8 @@ bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed )
 	}
 	*sSpeed = it->second.sSpeed;
 	*tSpeed = it->second.tSpeed;
+	*scaleS = it->second.scaleS;
+	*scaleT = it->second.scaleT;
 	return true;
 }
 

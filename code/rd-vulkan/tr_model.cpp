@@ -3744,6 +3744,11 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 			vkWorldPushConstants_t staticPush = {};
 			memcpy( staticPush.mvp, staticEntityMvp, sizeof( staticEntityMvp ) );
 			staticPush.camPos[3] = 1.0f;
+			// Identity, not zero-init's 0,0 - see vkWorldPushConstants_t's
+			// own comment (tr_local.h). tcMod scale isn't wired up for
+			// static (.md3) models, same scope as tcMod scroll.
+			staticPush.uvScale[0] = 1.0f;
+			staticPush.uvScale[1] = 1.0f;
 			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				0, sizeof( staticPush ), &staticPush );
 
@@ -3878,6 +3883,11 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 			vkWorldPushConstants_t entityPush = {};
 			memcpy( entityPush.mvp, entityMvp, sizeof( entityMvp ) );
 			entityPush.camPos[3] = 1.0f;
+			// Identity, not zero-init's 0,0 - see vkWorldPushConstants_t's
+			// own comment (tr_local.h). tcMod scale isn't wired up for
+			// Ghoul2 models, same scope as tcMod scroll.
+			entityPush.uvScale[0] = 1.0f;
+			entityPush.uvScale[1] = 1.0f;
 			vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 				0, sizeof( entityPush ), &entityPush );
 

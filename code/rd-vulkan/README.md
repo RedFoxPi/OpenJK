@@ -2653,6 +2653,11 @@ unread: its numeric arguments fall through to the parser's existing
 the same way any other not-specifically-handled keyword already is - not a
 half-implementation, a deliberately narrow one.
 
+**Update, much later: `tcMod scale` is real now too** - see "`tcMod scale`
+for world geometry" further below for the real implementation and the
+order-of-composition subtlety between it and `scroll` on the same stage.
+`rotate`/`stretch`/`turb`/`transform`/`entityTranslate` remain unread.
+
 **Confirmed against real map data before writing any code**, not
 implemented speculatively and hoped-for: parsed all four test maps'
 `LUMP_SHADERS`/`LUMP_SURFACES` and every one of this game's 68
@@ -3523,6 +3528,77 @@ animation overrides), this one's downstream visual effect *is*
 independently confirmed by eye on a real fixed test scene, not just
 verified for code correctness and exercised call sites.
 
+## `tcMod scale` for world geometry
+
+Closes another real gap in this renderer's `.shader` coverage: `tcMod
+scale <sx> <sy>` (a constant multiplier on a stage's diffuse UV) was
+previously one of the "every other tcMod type... deliberately left
+unconsumed" this file's own comments flagged. Confirmed real and, after
+`tcMod scroll`, this checkout's single most common `tcMod` keyword: 453
+occurrences across the real `.shader` files this checkout ships, real and
+currently-visible on multiple surfaces across the test maps (hoth2's
+`textures/hoth/rock_huge_snow`/`textures/hoth/snow_02` at `tcMod scale 0.5
+0.5`, `textures/hoth/at_at_leg` at `tcMod scale 4 4`).
+
+**Why this one is simpler than `tcMod scroll`**: real Quake3 recomputes a
+stage's whole `tcMod` matrix stack every frame regardless of whether any
+individual step is actually time-varying, but `scale`'s own contribution to
+that matrix never changes over time - so, unlike `scroll` (which genuinely
+needs a live per-frame value), baking `scale` in once produces
+pixel-identical output to recomputing it every frame forever. The one real
+complication: **179 real stages in this checkout's shader files declare
+both `tcMod scale` and `tcMod scroll` on the same stage**, and Quake3's
+`tcMod` keywords compose as an ordered matrix stack - whichever is declared
+first transforms the *output* of whichever came before it. `scale` then
+`scroll` leaves the scroll offset unscaled; `scroll` then `scale` scales
+the moving part too (confirmed both orders appear in real shipped shaders,
+not a hypothetical edge case - e.g. `hoth.shader`'s `stunpass_rotated`
+stages use `scale` then `scroll`, `weapons.shader`'s `rifle_energy3` uses
+`scroll` then `scale`). Getting this backwards doesn't crash or look
+obviously broken - it just makes an animated texture scroll at the wrong
+apparent speed relative to its own tiling, a subtle, easy-to-miss
+correctness bug rather than a loud one.
+
+**Implementation**: `ParseShaderFile` (tr_shader.cpp) now tracks
+declaration order between `tcMod scale` and `tcMod scroll` on a stage
+(`tcModScaleBeforeScroll`), and - rather than carrying that order flag
+through to render time - bakes its effect into the *stored* scroll speed
+once, at parse time: if scroll was declared first, the stored speed is
+pre-multiplied by the scale factor, so world.vert's render-time formula
+stays the same simple `uv * scale + speed * time` regardless of which
+order a given shader actually used (see `vkShaderTcModScroll_t`'s own
+comment for the full derivation). `VK_GetShaderTcModScroll` now returns
+`scaleS`/`scaleT` alongside the existing `sSpeed`/`tSpeed`. `WorldSurfaceBatch`
+gained `scaleS`/`scaleT` (default 1.0, appended as the struct's last fields
+specifically so every existing positional-aggregate-init call site - sky
+faces, real BSP surfaces - keeps compiling unchanged and still gets the
+correct identity default without needing to be touched). `vkWorldPushConstants_t`
+gained a `uvScale` vec4 (using the struct's 4th 16-byte slot, bringing the
+push constant to exactly 128 bytes - the Vulkan spec's guaranteed minimum
+for every conformant implementation); world.vert multiplies the diffuse UV
+by it before adding the existing scroll offset. **A real pitfall caught
+before it shipped**: a missing `uvScale` init at any push-constant
+construction site silently multiplies every UV to `(0,0)` (same failure
+shape as the pre-existing `camPos[3]` overbright-factor trap this file's
+own comment already warns about) - not a crash, a silently-wrong or
+all-black texture - so every one of this renderer's four `vkWorldPushConstants_t`
+construction sites (world surfaces, sky, static `.md3` models, Ghoul2
+models) was audited and explicitly set to the `1.0,1.0` identity, not left
+to rely on zero-init.
+
+**Verified**: full SP scene suite clean, warning-free rebuild. Pixel-diffed
+a build with this fix against one without it: all 5 scenes stayed within
+this renderer's already-documented per-run noise floor - not, on its own,
+strong confirmation, since none of the four fixed spawn-camera captures
+happens to frame one of the confirmed real `tcMod scale` textures large
+and dominant in view (hoth2's spawn point faces open sky and distant flat
+terrain, not the nearby rock faces or AT-AT leg texture that actually use
+it) - an honest gap consistent with several other recent features in this
+file whose real effect isn't independently confirmed by eye in these
+particular fixed scenes, even though the underlying mechanism, real
+exercised shader data, and order-of-composition math are all directly
+verified.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3724,13 +3800,14 @@ verified for code correctness and exercised call sites.
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
 - Full `.shader` script parsing: only a defined shader's first stage's
-  `map`/`blendFunc`/`tcMod scroll`/`rgbGen const`/`alphaGen portal <range>`
-  (see "World-geometry tcMod scroll"/"`rgbGen const` and a widened additive
+  `map`/`blendFunc`/`tcMod scroll`/`tcMod scale`/`rgbGen const`/
+  `alphaGen portal <range>` (see "World-geometry tcMod scroll"/"`tcMod
+  scale` for world geometry"/"`rgbGen const` and a widened additive
   map-image fallback"/"Static flares" above for those), whether it declares
   any `tcGen` at all (not which kind - see the same `rgbGen const` section),
   and (for fog shaders specifically, see "3D world geometry" above) a
   top-level `fogparms` line, are read - later stages, every other `tcMod`
-  type (`rotate`/`scale`/`stretch`/`turb`/`transform`/`entityTranslate`),
+  type (`rotate`/`stretch`/`turb`/`transform`/`entityTranslate`),
   actual `tcGen` UV generation (e.g. `tcGen environment` for reflective
   glass/chrome - its *presence* is detected to gate the map-image fallback
   safely, but no reflection mapping is ever computed), `rgbGen

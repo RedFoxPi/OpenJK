@@ -19,14 +19,21 @@ layout(push_constant) uniform PushConstants {
     // CPU-side - see tr_world.cpp's RE_RenderScene), 0,0 for the common
     // no-scroll case
     vec4 fogStart;
+    // xy = this batch's tcMod scale multiplier, 1,1 for the common
+    // no-scale case (see vkWorldPushConstants_t's own comment, tr_local.h,
+    // for why scale multiplies first and the scroll offset above is
+    // already pre-scaled at parse time when a shader's tcMod order needs
+    // that). zw unused.
+    vec4 uvScale;
 } pc;
 
 void main() {
     gl_Position = pc.mvp * vec4(inPos, 1.0);
-    // tcMod scroll only ever applies to the diffuse UV, never the lightmap
-    // UV - real Quake3's lightmap coordinates are baked per-vertex from the
-    // BSP compile and never move independently of the surface itself.
-    fragUV = inUV + pc.fogStart.yz;
+    // tcMod scroll/scale only ever apply to the diffuse UV, never the
+    // lightmap UV - real Quake3's lightmap coordinates are baked
+    // per-vertex from the BSP compile and never move or rescale
+    // independently of the surface itself.
+    fragUV = inUV * pc.uvScale.xy + pc.fogStart.yz;
     fragLightmapUV = inLightmapUV;
     fragColor = inColor;
     // World-space Euclidean camera distance - a simplified stand-in for

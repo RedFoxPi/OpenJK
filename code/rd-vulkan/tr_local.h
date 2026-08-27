@@ -217,43 +217,51 @@ struct PolyVertex
 };
 
 // Layout must match world.vert/world.frag's `layout(push_constant) uniform
-// PushConstants { mat4 mvp; vec4 camPos; vec4 fogColor; vec4 fogStart; }`. A
-// plain column-major float[16] matches GLSL's mat4 layout directly (16-byte-
-// aligned columns); camPos/fogColor/fogStart are already vec4-sized/aligned
-// so no padding trap there either. fogColor[3] doubles as the fog's "opaque"
-// distance (see VK_LoadWorldFog in tr_world.cpp) - 0 disables fog entirely
-// (the sky draw always passes 0 here; see RE_RenderScene), matching
-// world.frag's `if (fogColor.a > 0.0)` gate. fogStart[0] is the world-space
-// distance before which no fog applies at all (0 for the common case - fog
-// ramps in starting right at the camera, same behaviour as before this
-// field existed) - only nonzero when this batch's fog is the map's single
-// global one AND "ranged fog" is active (VK_SetRangedFog/a worldspawn
-// `linFogStart` key - see tr_world.cpp's own comment on s_rangedFog for
-// what that's for and why it's unverified against this renderer's own test
-// maps). fogStart[1]/fogStart[2] double again as this batch's tcMod scroll
-// UV offset (world.vert adds them directly to the diffuse UV) - already-
-// computed CPU-side as `scrollSpeed * currentTimeSeconds` (see
-// RE_RenderScene), not the raw per-second speed itself, so world.vert never
-// needs the current time as its own separate uniform. 0,0 for the common
-// case (no `tcMod scroll` on this batch's shader - see
-// VK_GetShaderTcModScroll, tr_shader.cpp). fogStart[3] is unused padding.
-// camPos[3] similarly doubles as
-// a per-draw overbright factor (world.frag's comment): 2.0 for real BSP
-// lightmapped world/sky geometry (baked assuming this doubling - Quake3's
-// "overbright bits"), 1.0 for Ghoul2 draws (tr_model.cpp), which are paired
-// with a plain white placeholder in the lightmap slot rather than an actual
-// baked-and-compensated one - doubling that too silently rendered every
-// character twice as bright as its own diffuse texture, a real, user-
-// reported bug (Vulkan screenshots reading much brighter than rd-vanilla's),
-// not a deliberate simplification. Every call site must set this
-// explicitly - a zero-initialized push (`= {}`) defaults camPos[3] to 0.0,
-// which multiplies the surface to solid black, not "no overbright."
+// PushConstants { mat4 mvp; vec4 camPos; vec4 fogColor; vec4 fogStart; vec4
+// uvScale; }`. A plain column-major float[16] matches GLSL's mat4 layout
+// directly (16-byte-aligned columns); the vec4 fields are already
+// vec4-sized/aligned so no padding trap there either. fogColor[3] doubles
+// as the fog's "opaque" distance (see VK_LoadWorldFog in tr_world.cpp) - 0
+// disables fog entirely (the sky draw always passes 0 here; see
+// RE_RenderScene), matching world.frag's `if (fogColor.a > 0.0)` gate.
+// fogStart[0] is the world-space distance before which no fog applies at
+// all (0 for the common case - fog ramps in starting right at the camera,
+// same behaviour as before this field existed) - only nonzero when this
+// batch's fog is the map's single global one AND "ranged fog" is active
+// (VK_SetRangedFog/a worldspawn `linFogStart` key - see tr_world.cpp's own
+// comment on s_rangedFog for what that's for and why it's unverified
+// against this renderer's own test maps). fogStart[1]/fogStart[2] double
+// again as this batch's tcMod scroll UV offset (world.vert adds them to
+// the diffuse UV, after uvScale below is applied) - already-computed
+// CPU-side as `scrollSpeed * currentTimeSeconds` (see RE_RenderScene), not
+// the raw per-second speed itself, so world.vert never needs the current
+// time as its own separate uniform. 0,0 for the common case (no `tcMod
+// scroll` on this batch's shader - see VK_GetShaderTcModScroll,
+// tr_shader.cpp). fogStart[3] is unused padding. camPos[3] similarly
+// doubles as a per-draw overbright factor (world.frag's comment): 2.0 for
+// real BSP lightmapped world/sky geometry (baked assuming this doubling -
+// Quake3's "overbright bits"), 1.0 for Ghoul2 draws (tr_model.cpp), which
+// are paired with a plain white placeholder in the lightmap slot rather
+// than an actual baked-and-compensated one - doubling that too silently
+// rendered every character twice as bright as its own diffuse texture, a
+// real, user-reported bug (Vulkan screenshots reading much brighter than
+// rd-vanilla's), not a deliberate simplification. uvScale.xy is this
+// batch's `tcMod scale` multiplier (world.vert multiplies the diffuse UV
+// by it before adding the scroll offset above) - 1.0,1.0 (a true no-op)
+// for the common case (no `tcMod scale` on this batch's shader). uvScale.zw
+// is unused padding. Every call site must set camPos[3] AND uvScale.xy
+// explicitly - a zero-initialized push (`= {}`) defaults camPos[3] to 0.0
+// (multiplies the surface to solid black, not "no overbright") and
+// uvScale.xy to 0.0,0.0 (multiplies every UV to (0,0), not "no rescale") -
+// both are silent-black/silent-wrong-texture bugs, not crashes, so a
+// missed call site is easy to overlook without a direct screenshot check.
 struct vkWorldPushConstants_t
 {
 	float mvp[16];
 	float camPos[4];
 	float fogColor[4];
 	float fogStart[4];
+	float uvScale[4];
 };
 
 typedef struct
@@ -658,8 +666,9 @@ void VK_LoadShaderScripts( void );
 vkBlendMode_t VK_GetShaderBlendMode( const char *name, vkBlendMode_t notFoundDefault = BLEND_ALPHA );
 bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist );
 // See this function's own comment (tr_shader.cpp) for what's actually
-// supported (just `scroll`) and the real test case that motivated it.
-bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed );
+// supported (`scroll` and `scale`, and how they compose when a stage has
+// both) and the real test cases that motivated each.
+bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed, float *scaleS, float *scaleT );
 // First stage's `map`/`clampmap` file path, or nullptr - see this
 // function's own comment (tr_shader.cpp) for why RE_LoadWorldMap
 // (tr_world.cpp) needs this as a fallback when a shader's own name isn't
