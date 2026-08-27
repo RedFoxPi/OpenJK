@@ -1733,7 +1733,37 @@ int G2API_AddBoltSurfNum( CGhoul2Info *ghlInfo, const int surfIndex ) { (void)gh
 int G2API_AddSurface( CGhoul2Info *ghlInfo, int surfaceNumber, int polyNumber, float bi, float bj, int lod ) { (void)ghlInfo; (void)surfaceNumber; (void)polyNumber; (void)bi; (void)bj; (void)lod; return -1; }
 void G2API_AnimateG2Models( CGhoul2Info_v &ghoul2, int t, CRagDollUpdateParams *p ) { (void)ghoul2; (void)t; (void)p; }
 qboolean G2API_AttachEnt( int *boltInfo, CGhoul2Info *ghlInfoTo, int toBoltIndex, int entNum, int toModelNum ) { (void)boltInfo; (void)ghlInfoTo; (void)toBoltIndex; (void)entNum; (void)toModelNum; return qfalse; }
-qboolean G2API_AttachG2Model( CGhoul2Info *ghlInfo, CGhoul2Info *ghlInfoTo, int toBoltIndex, int toModel ) { (void)ghlInfo; (void)ghlInfoTo; (void)toBoltIndex; (void)toModel; return qfalse; }
+// Real model-to-model attachment now (see VK_DrawGhoul2Entities's own
+// comment, tr_model.cpp, for how mModelBoltLink is actually consumed at
+// draw time) - same encoding as rd-vanilla's real G2API_AttachG2Model
+// (G2_API.cpp): MODEL_SHIFT/BOLT_SHIFT/MODEL_AND/BOLT_AND (ghoul2/G2.h) are
+// small, fixed bit-packing constants copied verbatim, not rederived, since
+// getting a bit-packing width subtly wrong is easy to do and hard to
+// notice by eye. Confirmed real, exercised usage before implementing:
+// wp_saber.cpp calls this to attach a held saber/weapon's own sub-model
+// (`ent->ghoul2[weaponModel]`) to a bolt on the player body's sub-model
+// (`ent->ghoul2[playerModel]`) - both indices into the *same* entity's
+// ghoul2 vector, which is exactly what `toModel` identifies here. The
+// kG2ModelWidth/kG2BoltShift/etc. constants live in tr_local.h, shared with
+// the decode side in tr_model.cpp.
+qboolean G2API_AttachG2Model( CGhoul2Info *ghlInfo, CGhoul2Info *ghlInfoTo, int toBoltIndex, int toModel )
+{
+	if ( !ghlInfo || !ghlInfoTo )
+	{
+		return qfalse;
+	}
+	if ( toBoltIndex < 0 || (size_t)toBoltIndex >= ghlInfoTo->mBltlist.size() )
+	{
+		return qfalse;
+	}
+	// Real bolt, not a freed (-1,-1) slot - same check as rd-vanilla's own.
+	if ( ghlInfoTo->mBltlist[toBoltIndex].boneNumber == -1 && ghlInfoTo->mBltlist[toBoltIndex].surfaceNumber == -1 )
+	{
+		return qfalse;
+	}
+	ghlInfo->mModelBoltLink = ( ( toModel & kG2ModelAnd ) << kG2ModelShift ) | ( ( toBoltIndex & kG2BoltAnd ) << kG2BoltShift );
+	return qtrue;
+}
 void G2API_CollisionDetect( CCollisionRecord *collRecMap, CGhoul2Info_v &ghoul2, const vec3_t angles, const vec3_t position, int frameNumber, int entNum, vec3_t rayStart, vec3_t rayEnd, vec3_t scale, CMiniHeap *heap, EG2_Collision traceType, int useLod, float fRadius )
 {
 	(void)collRecMap; (void)ghoul2; (void)angles; (void)position; (void)frameNumber; (void)entNum; (void)rayStart; (void)rayEnd; (void)scale; (void)heap; (void)traceType; (void)useLod; (void)fRadius;
@@ -1741,7 +1771,7 @@ void G2API_CollisionDetect( CCollisionRecord *collRecMap, CGhoul2Info_v &ghoul2,
 void G2API_CleanGhoul2Models( CGhoul2Info_v &ghoul2 ) { ghoul2.clear(); }
 void G2API_CopyGhoul2Instance( CGhoul2Info_v &from, CGhoul2Info_v &to, int modelIndex ) { (void)from; (void)to; (void)modelIndex; }
 void G2API_DetachEnt( int *boltInfo ) { (void)boltInfo; }
-qboolean G2API_DetachG2Model( CGhoul2Info *ghlInfo ) { (void)ghlInfo; return qfalse; }
+qboolean G2API_DetachG2Model( CGhoul2Info *ghlInfo ) { if ( !ghlInfo ) return qfalse; ghlInfo->mModelBoltLink = -1; return qtrue; }
 qboolean G2API_GetAnimFileName( CGhoul2Info *ghlInfo, char **filename ) { (void)ghlInfo; if ( filename ) *filename = nullptr; return qfalse; }
 char *G2API_GetAnimFileNameIndex( qhandle_t modelIndex ) { (void)modelIndex; return nullptr; }
 char *G2API_GetAnimFileInternalNameIndex( qhandle_t modelIndex ) { (void)modelIndex; return nullptr; }

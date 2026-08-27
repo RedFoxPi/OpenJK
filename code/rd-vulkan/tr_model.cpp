@@ -1237,8 +1237,16 @@ static void VK_LerpGhoul2BoneMatrix( mdxaBone_t &out, const mdxaBone_t &a, const
 	}
 }
 
+// rd-vanilla's real fixed root-bone seed matrix (RootMatrix(), tr_ghoul2.cpp)
+// - see VK_ComputeGhoul2BoneRecursive's own comment on its root-bone branch
+// for the full story of what this is and why it's needed unconditionally.
+// File-scope (not local to that branch) so VK_ComputeGhoul2Pose can also
+// use it as the default `attachBase` for an unattached (or root, index 0)
+// sub-model - see that function's own comment.
+static const mdxaBone_t s_g2RootRotation = { { { 0.0f, -1.0f, 0.0f, 0.0f }, { 1.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 1.0f, 0.0f } } };
+
 static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdxaHeader_t *header, const std::vector<VulkanGhoul2BonePose> &bonePose,
-	int boneIndex, std::vector<mdxaBone_t> &outBones, std::vector<bool> &computed )
+	int boneIndex, std::vector<mdxaBone_t> &outBones, std::vector<bool> &computed, const mdxaBone_t &rootBase )
 {
 	if ( computed[boneIndex] )
 	{
@@ -1307,20 +1315,24 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 		// 90 degrees short of rd-vanilla's orientation at the root - normally
 		// masked by the rest of the mesh still reading as "a person," but
 		// glaringly visible on any shot where the camera's own facing isn't
-		// also off by the same 90 degrees to compensate.
-		static const mdxaBone_t s_g2RootRotation = { { { 0.0f, -1.0f, 0.0f, 0.0f }, { 1.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 1.0f, 0.0f } } };
-		VK_Multiply3x4Matrix( &outBones[boneIndex], &s_g2RootRotation, &delta );
+		// also off by the same 90 degrees to compensate. `rootBase` is this
+		// same constant for an ordinary (unattached) model - see
+		// VK_ComputeGhoul2Pose's own comment for the one real case it's
+		// something else instead (a bolt matrix, for a model-to-model
+		// attached sub-model - "Ghoul2 model-to-model attachment").
+		VK_Multiply3x4Matrix( &outBones[boneIndex], &rootBase, &delta );
 	}
 	else
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, parent, outBones, computed );
+		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, parent, outBones, computed, rootBase );
 		VK_Multiply3x4Matrix( &outBones[boneIndex], &outBones[parent], &delta );
 	}
 	computed[boneIndex] = true;
 }
 
-void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones )
+void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones, const mdxaBone_t *attachBase )
 {
+	const mdxaBone_t &rootBase = attachBase ? *attachBase : s_g2RootRotation;
 	outBones.clear();
 	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
 	{
@@ -1351,7 +1363,7 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int cu
 	}
 	for ( int i = 0; i < numBones; i++ )
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, i, outBones, computed );
+		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, i, outBones, computed, rootBase );
 	}
 }
 
@@ -3456,8 +3468,44 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 			// not flattened onto one whole-skeleton frame either.
 			uint32_t skinSlot = model.nextSkinSlot;
 			model.nextSkinSlot = ( model.nextSkinSlot + 1 ) % GHOUL2_SKIN_SLOTS_PER_MODEL;
+
+			// Model-to-model attachment (G2API_AttachG2Model, tr_init.cpp):
+			// mModelBoltLink, when set, replaces this sub-model's normal
+			// fixed root-rotation seed matrix (s_g2RootRotation) with the
+			// bolted-to sibling sub-model's own *current* bolt matrix -
+			// same dispatch (bone-bolt vs. surface-bolt) and same
+			// kG2ModelShift/kG2BoltShift decode as G2API_GetBoltMatrix
+			// (tr_init.cpp) uses for the equivalent encode. Real
+			// rd-vanilla (tr_ghoul2.cpp's main render dispatch loop) never
+			// does this for sub-model index 0 - the first sub-model is
+			// always the root/body and always uses the fixed seed matrix,
+			// even if some caller mistakenly set its mModelBoltLink.
+			mdxaBone_t attachBase;
+			bool hasAttachBase = false;
+			if ( subModelIdx != 0 && g2Instance.mModelBoltLink != -1 )
+			{
+				int boltMod = ( g2Instance.mModelBoltLink >> kG2ModelShift ) & kG2ModelAnd;
+				int boltNum = ( g2Instance.mModelBoltLink >> kG2BoltShift ) & kG2BoltAnd;
+				if ( boltMod >= 0 && boltMod < ent.ghoul2->size() )
+				{
+					const CGhoul2Info &toInstance = (*ent.ghoul2)[boltMod];
+					if ( boltNum >= 0 && (size_t)boltNum < toInstance.mBltlist.size() )
+					{
+						if ( toInstance.mBltlist[boltNum].boneNumber >= 0 )
+						{
+							hasAttachBase = VK_GetGhoul2BoneCurrentPoseMat( (int)toInstance.mModel, &toInstance,
+								toInstance.mBltlist[boltNum].boneNumber, currentTime, &attachBase );
+						}
+						else if ( toInstance.mBltlist[boltNum].surfaceNumber >= 0 )
+						{
+							hasAttachBase = VK_GetGhoul2SurfaceBoltMatrix( (int)toInstance.mModel, toInstance.mBltlist[boltNum].surfaceNumber,
+								&toInstance, currentTime, &attachBase );
+						}
+					}
+				}
+			}
 			std::vector<mdxaBone_t> pose;
-			VK_ComputeGhoul2Pose( model.skeletonIndex, &g2Instance, currentTime, pose );
+			VK_ComputeGhoul2Pose( model.skeletonIndex, &g2Instance, currentTime, pose, hasAttachBase ? &attachBase : nullptr );
 			VK_SkinGhoul2Model( model, pose, skinSlot );
 			VK_DebugLogGhoul2Anim( ent, &g2Instance,
 				( model.skeletonIndex > 0 && (size_t)model.skeletonIndex < s_skeletons.size() ) ? &s_skeletons[model.skeletonIndex] : nullptr,

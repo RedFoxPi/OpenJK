@@ -559,6 +559,20 @@ bool VK_GetGhoul2BoneCurrentPoseMat( int modelCacheIndex, const CGhoul2Info *ghl
 // G2SURFACEFLAG_ISBOLT surface on this model (VulkanGhoul2Model::
 // tagTriangles has no entry for it) or any other invalid input.
 bool VK_GetGhoul2SurfaceBoltMatrix( int modelCacheIndex, int surfIndex, const CGhoul2Info *ghlInfo, int currentTime, mdxaBone_t *out );
+// CGhoul2Info::mModelBoltLink's bit-packing (model-to-model attachment,
+// G2API_AttachG2Model/G2API_DetachG2Model in tr_init.cpp, consumed at draw
+// time by VK_DrawGhoul2Entities in tr_model.cpp) - same encoding as
+// rd-vanilla's real MODEL_SHIFT/BOLT_SHIFT/MODEL_AND/BOLT_AND (ghoul2/G2.h),
+// copied verbatim rather than rederived since a bit-packing width subtly
+// wrong is easy to get wrong and hard to notice. Shared here (rather than
+// duplicated) so the encode side (tr_init.cpp) and decode side
+// (tr_model.cpp) can never drift apart.
+static const int kG2ModelWidth = 10;
+static const int kG2BoltWidth = 10;
+static const int kG2BoltShift = 0;
+static const int kG2ModelShift = kG2BoltShift + kG2BoltWidth;
+static const int kG2ModelAnd = ( 1 << kG2ModelWidth ) - 1;
+static const int kG2BoltAnd = ( 1 << kG2BoltWidth ) - 1;
 // The .gla's own recorded name (mdxaHeader_t::name, e.g.
 // "models/players/_humanoid/_humanoid" - no extension), read straight out
 // of VulkanSkeleton::fileData (kept resident for exactly this kind of
@@ -577,8 +591,15 @@ const char *VK_GetGhoul2GLAName( int modelCacheIndex );
 // verified-against-rd-vanilla math, the per-bone hierarchy-inheritance
 // resolution, and its remaining deliberate scope cuts). skeletonIndex is
 // VK_LoadGhoul2Skeleton's return value, not a model cache index. Clears
-// and leaves outBones empty on any invalid input.
-void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones );
+// and leaves outBones empty on any invalid input. attachBase, if non-null,
+// replaces the fixed root-rotation constant every root bone would
+// otherwise seed its hierarchy walk with - see VK_DrawGhoul2Entities's own
+// comment ("Ghoul2 model-to-model attachment") for the one real case that
+// needs this: a sub-model attached to a bolt on a sibling sub-model within
+// the same entity (G2API_AttachG2Model) is seeded with that bolt's current
+// matrix instead of the ordinary fixed root rotation, so its own hierarchy
+// composes relative to the bolt rather than the entity's raw origin/axis.
+void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones, const mdxaBone_t *attachBase = nullptr );
 // Live per-instance, per-bone animation state (see VulkanGhoul2AnimState's
 // comment in tr_model.cpp for the real scope/simplifications) - backs
 // G2API_SetBoneAnim/GetBoneAnim/PauseBoneAnim/IsPaused/StopBoneAnim below.

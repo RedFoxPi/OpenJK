@@ -3260,6 +3260,80 @@ visible effect that depends on one (e.g. an actual muzzle flash sprite or
 saber blade tag) in this checkout's own fixed spawn-camera captures, only
 that resolution succeeds and produces a matrix rather than failing.
 
+## Ghoul2 model-to-model attachment
+
+Closes another real gap this file's own "not implemented" list carried as
+"model-to-model attachment (`AttachG2Model`/`AttachEnt`)". Confirmed real,
+exercised usage before implementing, not just an API shape that happens to
+exist: `wp_saber.cpp:407` calls `G2API_AttachG2Model` to attach a drawn
+weapon/saber's own sub-model (`ent->ghoul2[weaponModel]`) to a bolt on the
+player body's sub-model (`ent->ghoul2[playerModel]`) every time a weapon is
+raised, and `Q3_Interface.cpp:5897`/`5915` call it twice more to attach a
+cinematic prop model to the left/right hand bolts during scripted cutscene
+behaviors. (Two other call sites - `g_emplaced.cpp:1069`,
+`g_misc_model.cpp:258` - are commented-out dead code, not real usage, and
+weren't counted as justification.) `G2API_AttachEnt` (cross-*entity*
+attachment via `s.boltInfo`, used only by `g_utils.cpp` for temp entities/
+effects) is a different, narrower mechanism with no evidence it affects any
+of this checkout's fixed spawn-camera test scenes, and is still deliberately
+left a stub.
+
+**Real rd-vanilla mechanism ported** (`G2_API.cpp`'s `G2API_AttachG2Model`/
+`G2API_DetachG2Model`, `ghoul2/G2.h`'s bit-packing constants,
+`tr_ghoul2.cpp`'s main render dispatch loop that actually consumes the
+link): `CGhoul2Info::mModelBoltLink` bit-packs a *bolt index* and a *sub-
+model index* - both into the same entity's own `ghoul2` vector - as
+`(toModel << MODEL_SHIFT) | (toBoltIndex << BOLT_SHIFT)`, using the real
+`MODEL_WIDTH=10`/`BOLT_WIDTH=10`/`BOLT_SHIFT=0`/`MODEL_SHIFT=10` constants
+copied verbatim (now shared, not duplicated, between the encode and decode
+sides via `tr_local.h`'s `kG2ModelWidth`/`kG2BoltShift`/etc.). At render
+time, for every sub-model *other than the first* (rd-vanilla never applies
+this to a model's own root/body sub-model, even if some caller mistakenly
+set its link), a set `mModelBoltLink != -1` replaces that sub-model's normal
+fixed root-bone seed matrix (`s_g2RootRotation` - real rd-vanilla's own
+`identityMatrix` constant, despite the misleading name; not an identity
+matrix at all, but a fixed 90-degree axis-swap rotation) with the *target*
+sub-model's own current bolt matrix instead, dispatching to the same bone-
+bolt vs. surface-bolt matrix computation `G2API_GetBoltMatrix` already uses
+(`VK_GetGhoul2BoneCurrentPoseMat` or `VK_GetGhoul2SurfaceBoltMatrix`,
+depending on whether `mBltlist[boltNum]` names a bone or a `*`-prefixed tag
+surface - see "Ghoul2 surface bolts" above). The effect: an attached
+sub-model's entire skeleton pose is built starting from wherever the bolt on
+its target currently is, every frame, rather than from a fixed world-space
+root - a held saber genuinely follows the hand bone through the player's
+current animation instead of floating at a fixed offset from the entity
+origin.
+
+**Implementation** (three files): `G2API_AttachG2Model`/
+`G2API_DetachG2Model` (tr_init.cpp) now really encode/clear
+`mModelBoltLink` instead of unconditionally returning `qfalse`/failing
+silently (`AttachG2Model` still validates `toBoltIndex` names a real,
+used bolt slot on the target first, matching rd-vanilla's own guard).
+`VK_ComputeGhoul2BoneRecursive`/`VK_ComputeGhoul2Pose` (tr_model.cpp) gained
+a `rootBase`/`attachBase` parameter (defaulting to `nullptr`, i.e. the
+normal fixed seed, for every existing call site) so the root-bone case can
+seed from an arbitrary matrix instead of always `s_g2RootRotation`.
+`VK_DrawGhoul2Entities`'s per-sub-model loop decodes `mModelBoltLink` (when
+set, and not sub-model 0), resolves the sibling's current bolt matrix, and
+passes it as that call's `attachBase` argument.
+
+**Verified**: full SP scene suite clean, no crashes, warning-free rebuild.
+Pixel-diffed a build with this fix against one without it: all 5 scenes
+stayed within this renderer's already-documented per-run noise floor
+(hoth2's usual snow-particle scatter, nothing structural) - expected, and
+not by itself meaningful confirmation, since none of this checkout's fixed
+spawn-camera captures happens to catch a moment where a saber is actually
+drawn (raising a saber is a player action, not something that happens
+automatically at spawn). This feature is therefore verified for code
+correctness and genuinely-exercised real-game-code call sites (above), but
+**not independently confirmed by eye** against a visible "saber now follows
+the hand" effect the way earlier features (e.g. flares, rgbGen const) were
+confirmed via a large, correctly-shaped diff - an honest gap consistent with
+how surface bolts' own *matrices* (as opposed to their resolution) were
+left unconfirmed by eye in the previous section, for the same underlying
+reason: this checkout's fixed test scenes don't happen to exercise the
+downstream visible effect.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3328,11 +3402,12 @@ that resolution succeeds and produces a matrix rather than failing.
   real cross-fade blending between an old and new animation over a real
   `blendTime`, and real sub-frame interpolation between adjacent whole
   frames - not a cruder single-whole-skeleton-track approximation. Real
-  per-instance surface on/off overrides (`SetSurfaceOnOff`) and real
+  per-instance surface on/off overrides (`SetSurfaceOnOff`), real
   surface bolts (a bolt naming a `*`-prefixed tag surface, not just a
-  bone) now too - see "Ghoul2 per-surface on/off overrides"/"Ghoul2
-  surface bolts" above. Still missing: bone-angle overrides/ragdoll/IK,
-  LOD selection, gore.
+  bone), and real model-to-model attachment (`AttachG2Model`) now too -
+  see "Ghoul2 per-surface on/off overrides"/"Ghoul2 surface bolts"/"Ghoul2
+  model-to-model attachment" above. Still missing: bone-angle overrides/
+  ragdoll/IK, LOD selection, gore.
 - Runtime polys (`RE_AddPolyToScene`, `tr_model.cpp`) - see "Runtime polys"
   above. Real per-scene queueing, CPU fan-to-triangle-list expansion, and a
   dedicated pipeline with the same three blend-mode variants (alpha/
@@ -3389,9 +3464,12 @@ that resolution succeeds and produces a matrix rather than failing.
   `_humanoid_academy1.gla`) are still stubs; every model always uses
   whichever single `.gla` `VK_LoadGhoul2Skeleton` first resolved for it.
   Also still missing: bone-angle overrides (`SetBoneAngles*`), ragdoll, IK,
-  LOD selection, gore, tags, and model-to-model attachment
-  (`AttachG2Model`/`AttachEnt`). Surface bolts (a bolt naming a *surface*
-  rather than a bone) are real now too - see "Ghoul2 surface bolts" above.
+  LOD selection, gore, and tags. Surface bolts (a bolt naming a *surface*
+  rather than a bone) and model-to-model attachment (`AttachG2Model`/
+  `DetachG2Model`) are real now too - see "Ghoul2 surface bolts"/"Ghoul2
+  model-to-model attachment" above. `AttachEnt` (cross-*entity* attachment,
+  a different and narrower mechanism - see "Ghoul2 model-to-model
+  attachment" above for why) is still a stub.
   See "Ghoul2 is not reused from rd-vanilla" below for why the animation
   system was a separate, larger task than the rest of this renderer.
 - `RE_SetRangedFog`, `R_SetTempGlobalFogColor`, and per-brush *local* fog
