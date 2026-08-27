@@ -89,6 +89,20 @@ struct vkShaderRgbConst_t
 };
 static std::unordered_map<std::string, vkShaderRgbConst_t> s_shaderRgbConst;
 
+// First stage's `rgbGen wave sin <base> <amp> <phase> <freq>`, keyed by
+// shader name - `sin` only (see VK_GetShaderRgbWave's own comment for why:
+// the only real wave function this checkout's own flare shaders use).
+// Unlike `rgbGen const`, this needs to be a real live per-frame value
+// (real rd-vanilla's own EvalWaveForm/RB_CalcWaveColor re-evaluate it every
+// draw, not a fixed colour baked once), so this only stores the raw wave
+// parameters - VK_DrawWorldFlares (tr_world.cpp) evaluates the actual
+// formula at draw time.
+struct vkShaderRgbWave_t
+{
+	float base, amp, phase, freq;
+};
+static std::unordered_map<std::string, vkShaderRgbWave_t> s_shaderRgbWave;
+
 // Whether the first stage declares ANY `tcGen` keyword at all, keyed by
 // shader name - not which kind. Exists purely as a safety gate for
 // RE_LoadWorldMap's map-image fallback (tr_world.cpp): `tcGen environment`
@@ -176,6 +190,8 @@ static void ParseShaderFile( const char *text )
 		float portalRange = 0.0f;
 		bool haveRgbConst = false;
 		vkShaderRgbConst_t rgbConst = {};
+		bool haveRgbWave = false;
+		vkShaderRgbWave_t rgbWave = {};
 		bool hasTcGen = false;
 		std::string mapImage;
 
@@ -303,11 +319,13 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
-			// `rgbGen const ( r g b )` - only this one rgbGen type is
-			// recorded (see s_shaderRgbConst's own comment); every other
-			// rgbGen keyword (`identityLighting`, `vertex`, `wave`, ...)
-			// falls through unconsumed like any other unrecognized token,
-			// same "not specifically intercepted" pattern as alphaGen above.
+			// `rgbGen const ( r g b )` and `rgbGen wave <func> <base> <amp>
+			// <phase> <freq>` (sin only - see s_shaderRgbWave's own
+			// comment) are recorded (see s_shaderRgbConst's own comment for
+			// const); every other rgbGen keyword (`identityLighting`,
+			// `vertex`, non-sin wave functions, ...) falls through
+			// unconsumed like any other unrecognized token, same "not
+			// specifically intercepted" pattern as alphaGen above.
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "rgbGen" ) )
 			{
 				std::string a = COM_ParseExt( &p, qfalse );
@@ -321,6 +339,22 @@ static void ParseShaderFile( const char *text )
 						rgbConst.color[2] = (float)atof( COM_ParseExt( &p, qfalse ) );
 						COM_ParseExt( &p, qfalse ); // closing ")"
 						haveRgbConst = true;
+					}
+				}
+				else if ( !Q_stricmp( a.c_str(), "wave" ) )
+				{
+					std::string func = COM_ParseExt( &p, qfalse );
+					float base = (float)atof( COM_ParseExt( &p, qfalse ) );
+					float amp = (float)atof( COM_ParseExt( &p, qfalse ) );
+					float phase = (float)atof( COM_ParseExt( &p, qfalse ) );
+					float freq = (float)atof( COM_ParseExt( &p, qfalse ) );
+					if ( !Q_stricmp( func.c_str(), "sin" ) )
+					{
+						rgbWave.base = base;
+						rgbWave.amp = amp;
+						rgbWave.phase = phase;
+						rgbWave.freq = freq;
+						haveRgbWave = true;
 					}
 				}
 				continue;
@@ -421,6 +455,10 @@ static void ParseShaderFile( const char *text )
 		if ( haveRgbConst && s_shaderRgbConst.find( name ) == s_shaderRgbConst.end() )
 		{
 			s_shaderRgbConst[name] = rgbConst;
+		}
+		if ( haveRgbWave && s_shaderRgbWave.find( name ) == s_shaderRgbWave.end() )
+		{
+			s_shaderRgbWave[name] = rgbWave;
 		}
 		if ( hasTcGen && s_shaderHasTcGen.find( name ) == s_shaderHasTcGen.end() )
 		{
@@ -580,12 +618,16 @@ float VK_GetShaderPortalRange( const char *name )
 	return it->second;
 }
 
-// Looks up a shader's first stage's `rgbGen const ( r g b )` colour (see
-// RE_LoadWorldMap's per-vertex colour overwrite, tr_world.cpp, the only
-// caller). Returns false (color left untouched) if the shader wasn't found
-// or never declared one - the common case, matching the caller's default
-// (whatever colour the surface already had - white, or real baked vertex
-// colour) exactly.
+// Looks up a shader's first stage's `rgbGen const ( r g b )` colour - two
+// real callers now: RE_LoadWorldMap's per-vertex colour overwrite for
+// ordinary world surfaces (tr_world.cpp), and VK_DrawWorldFlares
+// (tr_world.cpp) for flares, confirmed real via vjun1's own
+// `textures/flares/flare_bluehue` (29 of 45 real flare surfaces on that
+// map - see rd-vulkan/README.md). Returns false (color left untouched) if
+// the shader wasn't found or never declared one - the common case,
+// matching each caller's own default (whatever colour the surface already
+// had - white/baked vertex colour for ordinary surfaces, the flare's own
+// view-angle fade for flares) exactly.
 bool VK_GetShaderRgbGenConst( const char *name, float color[3] )
 {
 	VK_LoadShaderScripts();
@@ -598,6 +640,39 @@ bool VK_GetShaderRgbGenConst( const char *name, float color[3] )
 	color[0] = it->second.color[0];
 	color[1] = it->second.color[1];
 	color[2] = it->second.color[2];
+	return true;
+}
+
+// Looks up a shader's first stage's `rgbGen wave sin <base> <amp> <phase>
+// <freq>` (VK_DrawWorldFlares, tr_world.cpp, the only caller) - `sin` only:
+// a grep across every real flare shader in this checkout's own game data
+// found exactly one wave function ever used on a first-stage rgbGen wave
+// (`square`/`triangle`/`sawtooth`/`inverseSawtooth`/`noise` are all real
+// rd-vanilla features - G2_bones.cpp... no, tr_shade_calc.cpp's
+// TableForFunc - with zero exercised callers found here), so only that one
+// is implemented, matching this renderer's usual evidence-scoped approach.
+// Confirmed real and heavily exercised: hoth2's own
+// `textures/flares/flare_blue_pulse` (55 of 98 real flare surfaces on that
+// map, more than half - see rd-vulkan/README.md), `rgbGen wave sin 0.5 1
+// 0.2 0.5`. Returns false (all four out-params left untouched) if the
+// shader wasn't found or never declared a sine wave - the common case.
+// The caller evaluates the actual time-varying formula itself (this just
+// returns the raw parameters) - see VK_DrawWorldFlares's own comment for
+// why, unlike `rgbGen const`, this can't be resolved to a single fixed
+// value once here.
+bool VK_GetShaderRgbWave( const char *name, float *base, float *amp, float *phase, float *freq )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderRgbWave.find( VK_StripShaderNameExtension( name ) );
+	if ( it == s_shaderRgbWave.end() )
+	{
+		return false;
+	}
+	*base = it->second.base;
+	*amp = it->second.amp;
+	*phase = it->second.phase;
+	*freq = it->second.freq;
 	return true;
 }
 

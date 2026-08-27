@@ -202,6 +202,15 @@ struct WorldFlare
 	float normal[3];
 	image_t *image;
 	float radius;
+	// This flare's own real shader name (surf.shaderNum's shaders[].shader,
+	// not necessarily the same as image's own name - see
+	// RE_LoadWorldMap's own comment on why a flare's image often resolves
+	// through a different name entirely) - looked up once here, at load
+	// time, so VK_DrawWorldFlares doesn't need to re-derive it every frame.
+	// Used to resolve a real rgbGen const/wave override on top of the
+	// default view-angle-fade colour below - see VK_DrawWorldFlares's own
+	// comment for why most, but not all, real flare shaders need one.
+	std::string shaderName;
 };
 static std::vector<WorldFlare> s_worldFlares;
 
@@ -947,6 +956,7 @@ void RE_LoadWorldMap( const char *name )
 					// just the one (gfx/misc/flare) whose own blendFunc
 					// already says so.
 					flare.radius = VK_GetShaderPortalRange( shaders[surf.shaderNum].shader );
+					flare.shaderName = shaders[surf.shaderNum].shader;
 					s_worldFlares.push_back( flare );
 				}
 			}
@@ -1423,6 +1433,24 @@ static bool VK_AABBOutsideFrustum( const float mins[3], const float maxs[3], con
 // an intervening wall) - the depth-test mechanism itself is standard Vulkan
 // pipeline state already exercised correctly by every other draw call in
 // this renderer, not new or flare-specific.
+//
+// The view-angle fade `d` is only the DEFAULT colour, not the final one for
+// every real flare shader - a real, previously-mis-assumed gap this
+// renderer's own earlier comments got wrong (see WorldFlare's own history):
+// `RB_SurfaceFlare` writes `d` into the tessellation buffer's per-vertex
+// colour input, but that's only what real rd-vanilla's `rgbGen vertex`
+// actually reads back out - `rgbGen const`/`rgbGen wave` (real
+// `RB_IterateStagesGeneric`/`RB_CalcWaveColor`, tr_shade.cpp/
+// tr_shade_calc.cpp) *replace* the colour outright, discarding `d`
+// entirely, regardless of what RB_SurfaceFlare wrote. Confirmed which of
+// this checkout's 3 real flare shaders needs which: `gfx/misc/flare`
+// declares `rgbGen vertex` (the `d`-fade default below is exactly correct
+// for it), but `textures/flares/flare_blue_pulse` (55 of hoth2's 98 real
+// flare surfaces) declares `rgbGen wave sin 0.5 1 0.2 0.5` and
+// `textures/flares/flare_bluehue` (29 of vjun1's 45) declares `rgbGen
+// const ( 0.784314 0.843137 0.917647 )` - both majority cases on their
+// respective maps, both silently rendering the wrong (fade-based, not
+// pulsing/tinted) colour before this fix.
 void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd )
 {
 	if ( s_worldFlares.empty() || !vk.frameActive )
@@ -1438,6 +1466,10 @@ void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd )
 	uint32_t cursor = 0;
 	image_t *lastImage = nullptr;
 	uint32_t drawStart = 0;
+	// For rgbGen wave's own time-varying formula below - same seconds-since-
+	// map-start convention RE_RenderScene's own tcMod scroll offset already
+	// uses.
+	float timeSeconds = (float)fd->time / 1000.0f;
 
 	auto flushDraw = [&]( uint32_t drawEnd )
 	{
@@ -1486,6 +1518,32 @@ void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd )
 			d = -d;
 		}
 
+		// Real rgbGen const/wave override, when this flare's own shader
+		// declares one - see this function's own comment above for why
+		// most, but not all, real flare shaders need this. Falls back to
+		// the view-angle fade (d,d,d) computed above, correct for
+		// `gfx/misc/flare`'s own `rgbGen vertex` and for any flare shader
+		// with no rgbGen keyword at all.
+		float colorR = d, colorG = d, colorB = d;
+		float rgbConst[3];
+		float waveBase, waveAmp, wavePhase, waveFreq;
+		if ( VK_GetShaderRgbGenConst( flare.shaderName.c_str(), rgbConst ) )
+		{
+			colorR = rgbConst[0];
+			colorG = rgbConst[1];
+			colorB = rgbConst[2];
+		}
+		else if ( VK_GetShaderRgbWave( flare.shaderName.c_str(), &waveBase, &waveAmp, &wavePhase, &waveFreq ) )
+		{
+			// Real EvalWaveFormClamped/WAVEVALUE (tr_shade_calc.cpp):
+			// base + amp*sin(2*pi*(phase + time*freq)), clamped to [0,1] -
+			// not rederived, ported directly.
+			float glow = waveBase + waveAmp * sinf( 2.0f * (float)M_PI * ( wavePhase + waveFreq * timeSeconds ) );
+			if ( glow < 0.0f ) glow = 0.0f;
+			if ( glow > 1.0f ) glow = 1.0f;
+			colorR = colorG = colorB = glow;
+		}
+
 		float radius = flare.radius;
 		if ( dist < 512.0f )
 		{
@@ -1526,14 +1584,14 @@ void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd )
 			out[i].pos[2] = corners[c][2];
 			out[i].uv[0] = cornerUv[c][0];
 			out[i].uv[1] = cornerUv[c][1];
-			// alphaGen/rgbGen aren't applied (see s_worldFlares' own
-			// comment) - just the view-angle fade, in all 3 colour channels,
-			// with alpha left at 1.0 so the texture's own alpha (a flare
-			// glow's real falloff shape) survives the poly.frag modulate
-			// untouched.
-			out[i].color[0] = d;
-			out[i].color[1] = d;
-			out[i].color[2] = d;
+			// colorR/G/B already resolved above (real rgbGen const/wave
+			// override, or the view-angle fade default) - alphaGen still
+			// isn't applied (see s_worldFlares' own comment), alpha stays
+			// 1.0 so the texture's own alpha (a flare glow's real falloff
+			// shape) survives the poly.frag modulate untouched.
+			out[i].color[0] = colorR;
+			out[i].color[1] = colorG;
+			out[i].color[2] = colorB;
 			out[i].color[3] = 1.0f;
 		}
 		cursor += 6;

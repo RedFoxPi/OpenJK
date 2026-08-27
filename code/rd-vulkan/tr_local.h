@@ -680,9 +680,14 @@ const char *VK_GetShaderMapImage( const char *name );
 // (tr_world.cpp), the only caller.
 float VK_GetShaderPortalRange( const char *name );
 // First stage's `rgbGen const ( r g b )` colour - see this function's own
-// comment (tr_shader.cpp) and RE_LoadWorldMap's per-vertex colour overwrite
-// (tr_world.cpp), the only caller.
+// comment (tr_shader.cpp); two real callers now: RE_LoadWorldMap's
+// per-vertex colour overwrite for ordinary world surfaces, and
+// VK_DrawWorldFlares for flares (both tr_world.cpp).
 bool VK_GetShaderRgbGenConst( const char *name, float color[3] );
+// First stage's `rgbGen wave sin <base> <amp> <phase> <freq>` (sin only) -
+// see this function's own comment (tr_shader.cpp) and VK_DrawWorldFlares
+// (tr_world.cpp), the only caller.
+bool VK_GetShaderRgbWave( const char *name, float *base, float *amp, float *phase, float *freq );
 // Whether a shader's first stage declares any `tcGen` keyword at all - see
 // this function's own comment (tr_shader.cpp) and RE_LoadWorldMap's map-
 // image-fallback safety gate (tr_world.cpp), the only caller.

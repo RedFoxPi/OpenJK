@@ -2961,8 +2961,15 @@ sitting on a specific in-game light fixture - the diff evidence establishes
 "something new and flare-shaped appeared exactly where real flare data
 says it should," not a side-by-side visual match against rd-vanilla's own
 flare rendering (out of scope here, since this renderer doesn't attempt to
-match RB_TestZFlare's exact occlusion timing or `rgbGen`/`alphaGen` stage
-evaluation either).
+match RB_TestZFlare's exact occlusion timing). **Update, much later: real
+`rgbGen const`/`rgbGen wave` stage evaluation for flares is implemented
+now too, and this specific gap - assumed inapplicable to any of this
+checkout's 3 real flare shaders at the time this section was written, which
+turned out to be a genuine mistake - is closed** - see "Real rgbGen const/
+wave for flares" further below for the real formula and the confirmed-by-
+eye fix on hoth2's landing-beacon flares. `alphaGen` stage evaluation
+(beyond the already-real `alphaGen portal` radius, "Static flares" above)
+is still not matched.
 
 ## Ghoul2 per-surface on/off overrides (`G2API_SetSurfaceOnOff`)
 
@@ -3599,6 +3606,70 @@ particular fixed scenes, even though the underlying mechanism, real
 exercised shader data, and order-of-composition math are all directly
 verified.
 
+## Real rgbGen const/wave for flares (a genuine mis-assumption found and fixed)
+
+Not a new feature so much as a correction to an existing one: "Static
+flares" above documented every flare quad as always using a fixed
+view-angle-fade colour (`d,d,d`, `d = -dot(viewDir, normal)`), with a
+comment claiming "neither [`rgbGen const` nor anything else] appears on any
+of this checkout's 3 real flare shaders." That claim was wrong, and
+re-reading real rd-vanilla's actual flare rendering shows why: hoth2's
+`textures/flares/flare_blue_pulse` (55 of hoth2's 98 real flare surfaces,
+*more than half*) declares `rgbGen wave sin 0.5 1 0.2 0.5`, and vjun1's
+`textures/flares/flare_bluehue` (29 of vjun1's 45) declares `rgbGen const (
+0.784314 0.843137 0.917647 )` - both majority cases on their respective
+maps. Only the third real flare shader, `gfx/misc/flare` (an implicit,
+`.shader`-script-less texture reference resolving to `rgbGen vertex`), is
+actually correct with the fade-only assumption - real rd-vanilla's own
+`RB_SurfaceFlare` (`tr_surface.cpp`) only ever writes the fade colour into
+the tessellation buffer's per-vertex colour *input*; whether that input
+ever reaches the screen depends entirely on the shader's own `rgbGen`,
+evaluated generically downstream by the same `RB_IterateStagesGeneric`/
+`RB_CalcWaveColor` (`tr_shade.cpp`/`tr_shade_calc.cpp`) every other surface
+goes through - `rgbGen vertex` reads it back out, but `rgbGen const`/
+`rgbGen wave` *replace* the colour outright, discarding the fade entirely,
+regardless of what `RB_SurfaceFlare` computed. A real, previously-
+undiscovered gap, not a hypothetical one: two of this checkout's three real
+flare shaders - the majority-usage ones on both maps that have flares at
+all - were rendering the wrong colour.
+
+**Real formula ported** (`EvalWaveFormClamped`/`WAVEVALUE`,
+`tr_shade_calc.cpp`): `glow = clamp(base + amplitude * sin(2*pi*(phase +
+frequency*time)), 0, 1)`, applied identically to all three colour channels
+(alpha untouched - real `rgbGen wave`/`const` never touch alpha; that's
+`alphaGen`'s job, already separately handled for flares via `alphaGen
+portal`). Only the `sin` wave function is implemented - a grep across every
+first-stage `rgbGen wave` in this checkout's real flare shaders found
+`sin` and nothing else (`square`/`triangle`/`sawtooth`/`inverseSawtooth`/
+`noise` are all real rd-vanilla features with zero exercised callers here),
+so - this renderer's usual evidence-scoped approach - only that one is
+implemented; a non-`sin` wave function is a silent no-op, falling back to
+the existing fade-colour default, not a guess at unexercised behaviour.
+`rgbGen const` needed no new formula, just a new caller: `VK_GetShaderRgbGenConst`
+already existed for ordinary world surfaces (see "`rgbGen const` and a
+widened additive map-image fallback" above) and is now also checked for
+flares.
+
+**Implementation**: `WorldFlare` gained a `shaderName` field (the flare's
+real shader name, captured once at `RE_LoadWorldMap` load time - not
+necessarily the same name as its resolved image, per that section's own
+comment on why). `VK_DrawWorldFlares` now checks `VK_GetShaderRgbGenConst`
+first, then the new `VK_GetShaderRgbWave` (`sin`-only, tr_shader.cpp), and
+only falls back to the original view-angle fade if a flare's shader
+declares neither - correct for `gfx/misc/flare`'s real `rgbGen vertex` and
+for any flare shader with no `rgbGen` keyword at all.
+
+**Verified, and confirmed by eye**: full SP scene suite clean, warning-free
+rebuild. Pixel-diffed a build with this fix against one without it: hoth2
+produced the largest diff of any scene in this feature's history so far
+(1.27% mean difference) - and inspecting the actual before/after
+screenshots directly confirms it's real, not noise: the row of landing-
+beacon flares along the horizon are visibly, distinctly brighter/glowing
+in the "after" capture, caught mid-pulse at a bright point in their real
+sine cycle instead of their previous dim, static fade colour. academy1/
+yavin1 (zero real flare surfaces - see "Static flares" above) and menu
+stayed pixel-identical, exactly as expected.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -3784,10 +3855,12 @@ verified.
 - Flares (`MST_FLARE`) *are* drawn now (see "Static flares" above), but
   without rd-vanilla's real `RB_TestZFlare` occlusion pre-test specifically
   (a real per-pixel depth test is a side effect of the pipeline state reused
-  to draw them, not a port of that function) and without per-shader
-  `rgbGen`/`alphaGen` stage evaluation (always additive, always the same
-  view-angle fade formula, regardless of what a flare's own shader stages
-  declare).
+  to draw them, not a port of that function). Blend mode is still always
+  additive regardless of a flare's own `blendFunc` (see "Static flares"
+  above for why), and `rgbGen const`/`rgbGen wave sin` are real now too
+  (see "Real rgbGen const/wave for flares" above) - other `rgbGen` types
+  and all of `alphaGen` (beyond the already-real `alphaGen portal` radius)
+  still aren't evaluated.
   Curved surfaces (`MST_PATCH`) *are* tessellated now (see "3D world
   geometry" above), but only at a fixed subdivision level, not rd-vanilla's
   real adaptive one - large or nearly-flat patches get more triangles than
