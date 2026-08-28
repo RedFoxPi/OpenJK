@@ -946,6 +946,12 @@ struct VulkanStaticModel
 	VkDeviceMemory vertexBufferMemory = VK_NULL_HANDLE;
 	VkBuffer indexBuffer = VK_NULL_HANDLE;
 	VkDeviceMemory indexBufferMemory = VK_NULL_HANDLE;
+	// Real bind-pose bounding box, frame 0's md3Frame_t::bounds (already
+	// real-world float units, not vertex-scaled shorts like xyz/normal data
+	// - no MD3_XYZ_SCALE needed here) - see VK_ModelBounds's own comment
+	// (this file) for the real caller this exists for.
+	float mins[3] = { 0.0f, 0.0f, 0.0f };
+	float maxs[3] = { 0.0f, 0.0f, 0.0f };
 };
 // Index 0 reserved/invalid, same convention as s_ghoul2Models.
 static std::vector<VulkanStaticModel> s_staticModels;
@@ -1046,6 +1052,17 @@ int VK_LoadMD3Model( const char *fileName )
 		surf = (const md3Surface_t *)( (const byte *)surf + surf->ofsEnd );
 	}
 
+	// Real R_ModelBounds formula (rd-vanilla's tr_model.cpp): frame 0's
+	// md3Frame_t::bounds, the first entry at hdr->ofsFrames - read here,
+	// before the buffer is freed below, and stashed on VulkanStaticModel
+	// for VK_ModelBounds (this file's own comment there) to hand back later.
+	float mdlMins[3], mdlMaxs[3];
+	{
+		const md3Frame_t *frame0 = (const md3Frame_t *)( base + hdr->ofsFrames );
+		VectorCopy( frame0->bounds[0], mdlMins );
+		VectorCopy( frame0->bounds[1], mdlMaxs );
+	}
+
 	ri.FS_FreeFile( buffer );
 
 	if ( cpuVerts.empty() || cpuIndexes.empty() )
@@ -1056,6 +1073,8 @@ int VK_LoadMD3Model( const char *fileName )
 
 	VulkanStaticModel model;
 	model.surfaces = std::move( drawSurfaces );
+	VectorCopy( mdlMins, model.mins );
+	VectorCopy( mdlMaxs, model.maxs );
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
 		VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, &model.vertexBuffer, &model.vertexBufferMemory );
 	VK_UploadDeviceLocalBuffer( cpuIndexes.data(), cpuIndexes.size() * sizeof( uint32_t ),
@@ -1073,6 +1092,36 @@ int VK_LoadMD3Model( const char *fileName )
 		fileName, (int)s_staticModels[index].surfaces.size(), (int)cpuVerts.size(), (int)cpuIndexes.size() );
 
 	return index;
+}
+
+// Real R_ModelBounds (rd-vanilla's tr_model.cpp) dispatches on the model's
+// actual type - a real .md3 handle returns frame 0's baked bounds, a BSP
+// inline submodel (*N, not registered by this renderer at all - see
+// RE_RegisterModel's own comment, tr_init.cpp) returns its brush bounds,
+// and anything else (including every real Ghoul2 handle) falls through to
+// zero. Only the .md3 case is real here, matching VK_STATIC_MODEL_HANDLE_
+// BASE-offset handles from RE_RegisterModel - every other handle (Ghoul2,
+// the generic "1" fallback) correctly gets zero too, exactly like real
+// vanilla's own model->md3[0]==nullptr branch does for a genuine Ghoul2
+// model_t. Confirmed real, exercised caller: CG_CreateMiscEnts
+// (cg_main.cpp) computes every misc_model_static entity's cull radius from
+// this - e.g. vjun1's raven_cockpit.md3 (see VulkanStaticModel's own
+// comment for that model's story) - previously always zero regardless of
+// the model's real size.
+bool VK_ModelBounds( qhandle_t handle, float mins[3], float maxs[3] )
+{
+	if ( handle < VK_STATIC_MODEL_HANDLE_BASE )
+	{
+		return false;
+	}
+	int index = handle - VK_STATIC_MODEL_HANDLE_BASE;
+	if ( index <= 0 || (size_t)index >= s_staticModels.size() )
+	{
+		return false;
+	}
+	VectorCopy( s_staticModels[index].mins, mins );
+	VectorCopy( s_staticModels[index].maxs, maxs );
+	return true;
 }
 
 int VK_FindGhoul2Bone( int modelCacheIndex, const char *boneName )

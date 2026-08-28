@@ -3881,6 +3881,62 @@ against a real scene, since no real caller in this game currently uses
 it" - the same honest standard applied here to a real caller this harness
 just can't reach, not "no caller exists at all").
 
+## Real `R_ModelBounds` for static `.md3` models
+
+Closes another real gap this file's own "not implemented" list had carried
+as "model bounds/tag queries": `R_ModelBounds` was a stub always returning
+`(0,0,0)`-`(0,0,0)` regardless of which model handle was asked about.
+
+**Real caller, confirmed exercised on every one of this checkout's 4 test
+maps, not just the one already-documented cockpit case**: `CG_CreateMiscEnts`
+(`cg_main.cpp`) calls this for every `misc_model_static` map entity (a real,
+common Q3/JKA map-authoring primitive for static decorative props - crates,
+terminals, pipes, the vjun1 cockpit interior this file's "vjun1's missing
+cockpit" section already covers) to compute a per-entity cull radius
+(`DistanceSquared(mins*scale, maxs*scale)`) before `CG_DrawMiscEnts` draws
+it. A temporary debug print (removed before committing) confirmed real,
+substantial usage directly: 11 real calls on academy1, 191 on hoth2, 164 on
+yavin1, 166 on vjun1 - every one returning genuinely nonzero, plausible
+bounds after this fix (e.g. `mins=(-55.7 -72.2 -9.8) maxs=(50.1 72.4 34.5)`
+for one of hoth2's larger props), not the always-zero this renderer
+returned before.
+
+**Why this was never a visible bug on this checkout's own fixed test
+cameras, and won't become a visible fix either**: the radius only feeds a
+*distance* cull (`VectorLengthSquared(origin - vieworg) - radius <=
+8192*8192` - a genuinely enormous ~67 million-unit-squared threshold), and
+`gi.inPVS` is unconditionally `qtrue` in this renderer (no real PVS culling
+- see "What's not implemented yet" below), so a zero-vs-real radius could
+only ever change the outcome for a prop already within a few hundred units
+of that threshold's edge - never the case for any prop on any of these 4
+maps' fixed spawn cameras. This is a genuine correctness fix for the
+underlying API regardless (the *value* `R_ModelBounds` reports was simply
+wrong for every real caller, on every map, until now), just not one this
+harness's specific camera placements could ever make visibly different -
+same honest category as the `RE_DrawRotatePic`/`RE_DrawRotatePic2` fix
+directly above.
+
+**Real formula**, ported from rd-vanilla's own `R_ModelBounds`
+(`tr_model.cpp`): frame 0's `md3Frame_t::bounds[0]/[1]` - already real-world
+float units (unlike a surface's `xyz`/`normal` vertex data, which needs
+`MD3_XYZ_SCALE`) - read once at `VK_LoadMD3Model` load time (before the raw
+file buffer is freed) and cached on `VulkanStaticModel` for `R_ModelBounds`
+to hand back later by handle. Real vanilla's own function also handles two
+other cases - a genuine Ghoul2 `model_t` (falls through to zero, since its
+`md3[0]` pointer is null - checked directly in the source) and a BSP inline
+submodel (`*N`, real brush bounds) - the Ghoul2 case needed no new code
+here (this renderer's stub default already matches that exact real
+behaviour), and the inline-submodel case isn't reachable at all, since this
+renderer's own `RE_RegisterModel` doesn't recognize a leading `*` and never
+registers one in the first place (a separate, pre-existing gap, not
+something this fix could address without also implementing brush-model
+rendering itself).
+
+**Verified**: warning-free rebuild, full SP scene suite clean (all 5 scenes
+pixel-identical, exactly as the distance-cull-threshold analysis above
+predicts), plus the direct debug-log confirmation of real nonzero bounds on
+every map described above.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -4105,10 +4161,13 @@ just can't reach, not "no caller exists at all").
   shader specifically when it has no `tcGen` (see the `rgbGen const`
   section above for exactly why that's the safe line, not blend mode
   alone) - a `BLEND_ALPHA` shader needing the fallback is still unresolved.
-- Cinematics (`DrawStretchRaw`/`UploadCinematic`), dissolves, model bounds/
-  tag queries. Rotated pics (`RE_DrawRotatePic`/`RE_DrawRotatePic2`) *are*
-  real now - see "`RE_DrawRotatePic`/`RE_DrawRotatePic2` (rotated 2D pics)"
-  above.
+- Cinematics (`DrawStretchRaw`/`UploadCinematic`), dissolves, tag queries
+  (`R_LerpTag` - real vanilla's own MD3-only implementation already returns
+  identity/zero for every real Ghoul2 weapon model this game actually ships
+  with, the same as this renderer's existing stub, so there is no real gap
+  left to close there). Rotated pics (`RE_DrawRotatePic`/
+  `RE_DrawRotatePic2`) and static-`.md3` model bounds (`R_ModelBounds`)
+  *are* real now - see their own sections above.
 
 ## Ghoul2 is not reused from rd-vanilla
 

@@ -1597,7 +1597,19 @@ void R_LerpTag( orientation_t *tag, qhandle_t model, int startFrame, int endFram
 	AxisClear( tag->axis );
 	VectorClear( tag->origin );
 }
-void R_ModelBounds( qhandle_t model, vec3_t mins, vec3_t maxs ) { (void)model; VectorClear( mins ); VectorClear( maxs ); }
+void R_ModelBounds( qhandle_t model, vec3_t mins, vec3_t maxs )
+{
+	if ( VK_ModelBounds( model, mins, maxs ) )
+	{
+		return;
+	}
+	// Real vanilla's own fallback for anything it can't resolve either
+	// (a genuine Ghoul2 handle, the generic "1" placeholder, ...) - see
+	// VK_ModelBounds's own comment for why zero is correct here, not just
+	// convenient.
+	VectorClear( mins );
+	VectorClear( maxs );
+}
 void RE_GetLightStyle( int style, color4ub_t color ) { (void)style; color[0] = color[1] = color[2] = color[3] = 255; }
 void RE_SetLightStyle( int style, int color ) { (void)style; (void)color; }
 void RE_GetBModelVerts( int bmodelIndex, vec3_t *vec, vec3_t normal ) { (void)bmodelIndex; (void)vec; (void)normal; }

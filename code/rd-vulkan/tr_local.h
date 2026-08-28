@@ -534,6 +534,12 @@ void VK_ShutdownGhoul2Models( void );
 // VK_STATIC_MODEL_HANDLE_BASE before handing it back as a qhandle_t - see
 // that constant's own comment for why.
 int VK_LoadMD3Model( const char *fileName );
+// Real R_ModelBounds for a static .md3 handle (VK_STATIC_MODEL_HANDLE_BASE-
+// offset) - see this function's own comment (tr_model.cpp) and R_ModelBounds
+// (tr_init.cpp), the only caller, for what "real" means here and why every
+// other handle correctly still gets zero. Returns false (mins/maxs
+// untouched) for any handle this doesn't recognize.
+bool VK_ModelBounds( qhandle_t handle, float mins[3], float maxs[3] );
 // RE_RegisterModel's generic qhandle_t space previously meant nothing (every
 // call returned the same fake "1", see RE_RegisterModel's own comment) - now
 // that a real .md3 model cache index is sometimes returned instead, it needs
