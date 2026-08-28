@@ -359,6 +359,10 @@ typedef struct
 	VkPipeline worldPipelineAlpha = VK_NULL_HANDLE;    // BLEND_ALPHA
 	VkPipeline worldPipelineAdditive = VK_NULL_HANDLE; // BLEND_ADDITIVE
 	VkSampler worldSampler = VK_NULL_HANDLE;
+	// Real `clampmap` addressing - see VK_GetShaderClampMap's own comment
+	// (tr_shader.cpp) and VK_BuildWorldDescriptorSet (tr_world.cpp), the
+	// only place that picks this over worldSampler.
+	VkSampler worldSamplerClamp = VK_NULL_HANDLE;
 	// Separate pool, same vk.worldDescriptorSetLayout/vk.worldSampler -
 	// Ghoul2 model descriptor sets (tr_model.cpp) must NOT come from
 	// vk.worldDescriptorPool: that pool is reset on every RE_LoadWorldMap
@@ -481,7 +485,13 @@ void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd );
 // file header) rather than duplicated.
 void VK_UploadDeviceLocalBuffer( const void *data, VkDeviceSize size, VkBufferUsageFlags usage,
 	VkBuffer *outBuffer, VkDeviceMemory *outMemory );
-VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diffuse, image_t *lightmap );
+// diffuseClamp: use real clampmap addressing for the diffuse slot instead
+// of the default REPEAT (see VK_GetShaderClampMap's own comment, tr_shader.cpp,
+// and the world-geometry-only caller in tr_world.cpp that actually passes
+// true) - every other caller (sky, Ghoul2, static .md3) passes false, the
+// previous unconditional behaviour, since none of them resolve a shader
+// script the same way world surfaces do.
+VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diffuse, image_t *lightmap, bool diffuseClamp = false );
 // out = b * a when a/b/out are read as column-major matrices - see this
 // function's definition in tr_world.cpp for the full explanation of why the
 // argument order is backwards from what the name suggests.
@@ -698,6 +708,10 @@ bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed, fl
 // (tr_world.cpp) needs this as a fallback when a shader's own name isn't
 // directly a texture file.
 const char *VK_GetShaderMapImage( const char *name );
+// Whether a shader's first stage used `clampmap` rather than `map` - see
+// this function's own comment (tr_shader.cpp) and RE_LoadWorldMap
+// (tr_world.cpp), the only caller, for the real bug this fixes.
+bool VK_GetShaderClampMap( const char *name );
 // First stage's `alphaGen portal <range>` numeric argument, or rd-vanilla's
 // own RB_SurfaceFlare default (30) if absent - see this function's own
 // comment (tr_shader.cpp) and RE_LoadWorldMap's MST_FLARE handling

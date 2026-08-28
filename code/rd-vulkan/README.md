@@ -3937,6 +3937,71 @@ pixel-identical, exactly as the distance-cull-threshold analysis above
 predicts), plus the direct debug-log confirmation of real nonzero bounds on
 every map described above.
 
+## Real `clampmap` addressing for world geometry
+
+Closes a real, silent-wrong-texture bug: this renderer's world sampler was
+hardcoded to `VK_SAMPLER_ADDRESS_MODE_REPEAT` for every surface's diffuse
+texture, with no distinction for a shader's first stage declaring
+`clampmap` instead of plain `map` - real Quake3 gives `clampmap` real
+`GL_CLAMP(_TO_EDGE)` addressing instead, and this renderer's own `tr_shader.cpp`
+comment had actually mis-described `clampmap` as merely "the legacy synonym"
+for `map` (fixed alongside this - it isn't a spelling variant, it changes
+real GL wrap behaviour).
+
+**Real, substantial usage, confirmed on every one of this checkout's 4 test
+maps via a temporary debug print (removed before committing)**: 71 real
+surfaces on academy1, 199 on hoth2, 17 on yavin1, 297 on vjun1 - all real
+`textures/common/dark_dust`/`dark_orange`/`tan_gradient`/`blue_gradient`/
+`neonblue_gradient`/`gradient2` additive dust-cloud/light-shaft decal
+shaders (the same family "`rgbGen const` and a widened additive map-image
+fallback" above already found and fixed the *visibility* of - this closes
+a second, independent bug in how they render once visible). Every one of
+these declares `clampmap textures/common/gradient` (or a same-family
+sibling texture) on its first stage.
+
+**Why REPEAT-vs-CLAMP is a real, not theoretical, difference here**: checked
+these surfaces' actual baked UV coordinates directly against academy1's real
+BSP `LUMP_DRAWVERTS` data, not assumed - they range from -5.6 to 6.5 (U) and
+-10.25 to 11.75 (V), i.e. genuinely and substantially outside 0..1. With
+REPEAT addressing (this renderer's previous unconditional behaviour), that
+tiles the gradient texture 5-11 times across a single surface instead of
+real Quake3's CLAMP behaviour of stretching the texture's own edge pixel
+across the whole range - a real, structural rendering difference, not a
+subtle rounding one.
+
+**Implementation**: a second world sampler (`vk.worldSamplerClamp`,
+`VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE`, otherwise identical filtering/LOD
+settings to the existing `vk.worldSampler`) - `VK_BuildWorldDescriptorSet`
+(tr_world.cpp) gained a `diffuseClamp` parameter (default `false`, so every
+non-world caller - sky, Ghoul2, static `.md3` - keeps its previous
+unconditional REPEAT behaviour unchanged) and picks between the two
+samplers for the diffuse binding only; the lightmap binding always stays
+REPEAT (real vanilla never clamps `$lightmap`, and lightmap UVs are baked
+within 0..1 by construction anyway, so it wouldn't matter either way).
+`tr_shader.cpp`'s existing `map`/`clampmap` parsing block now also records
+*which* keyword was used (`VK_GetShaderClampMap`, independent of
+`VK_GetShaderMapImage`'s own fallback-resolution logic, since the
+addressing mode is a property of the shader regardless of which path
+actually resolves its image), and `RE_LoadWorldMap` passes that straight
+through to `VK_BuildWorldDescriptorSet` for every world surface.
+
+**Verified**: warning-free rebuild, full SP scene suite clean. The temporary
+debug print confirmed the fix is wired correctly and reaches exactly the
+intended real shaders on every map (counts above). Pixel-diffed a build
+with this fix against one without it: academy1 (which has no weather/
+particle system at all, so its diff is 100% attributable to real rendering
+changes, not this project's own previously-documented run-to-run noise
+floor - see "`tcGen environment`" above) showed a small but genuinely
+nonzero, fully deterministic diff (205 pixels, 0.025% of the frame) exactly
+where the light-shaft dust surfaces are - real but visually subtle for this
+specific camera framing and texture, not a sign the fix only partially
+worked. hoth2/vjun1 (199/297 real affected surfaces, the largest counts)
+showed larger diffs (32%/6.4%) but neither map's own existing noise floor
+(hoth2: ~47.6% run-to-run from snow-particle placement; vjun1: ~4.75%) can
+be fully separated from this fix's own real contribution from a whole-frame
+diff alone - the debug-log confirmation above, not the screenshot diff, is
+the primary evidence for this fix, same as several features above it.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render

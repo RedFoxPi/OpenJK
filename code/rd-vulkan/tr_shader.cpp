@@ -138,6 +138,23 @@ static std::unordered_map<std::string, bool> s_shaderTcGenEnvironment;
 // all in its first stage.
 static std::unordered_map<std::string, std::string> s_shaderMapImage;
 
+// Whether the first stage's base image keyword was specifically `clampmap`
+// (real GL_CLAMP(_TO_EDGE) addressing) rather than plain `map` (GL_REPEAT),
+// keyed by shader name. This renderer's world sampler was hardcoded to
+// REPEAT addressing for every surface regardless of this distinction until
+// now - a real, confirmed-exercised bug: `textures/common/dark_dust` and
+// its siblings (`tan_gradient`/`dark_orange`/`blue_gradient`, all `clampmap
+// textures/common/gradient` - see "World geometry blend modes"/"`rgbGen
+// const`..." above for how these additive light-shaft/dust-cloud surfaces
+// were found) declare real UVs that range far outside 0..1 on academy1's
+// actual BSP data (checked directly: U -5.6..6.5, V -10.25..11.75 across
+// all 71 real `dark_dust` surfaces there) - with REPEAT addressing, that
+// tiles the gradient texture 5-11 times across each surface instead of
+// stretching its edge pixel the one time real Quake3's CLAMP addressing
+// would. See VK_ShaderUsesClampMap and RE_LoadWorldMap/
+// VK_BuildWorldDescriptorSet (tr_world.cpp) for the actual fix.
+static std::unordered_map<std::string, bool> s_shaderClampMap;
+
 static vkBlendMode_t BlendFactorsToMode( const char *src, const char *dst )
 {
 	if ( !Q_stricmp( src, "GL_ONE" ) && !Q_stricmp( dst, "GL_ONE" ) )
@@ -207,6 +224,7 @@ static void ParseShaderFile( const char *text )
 		bool hasTcGen = false;
 		bool tcGenEnvironment = false;
 		std::string mapImage;
+		bool clampMap = false;
 
 		while ( depth > 0 )
 		{
@@ -258,20 +276,26 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
-			// `map <path>` (or the legacy synonym `clampmap`) is the stage's
-			// base image - only the first stage's, and only its first `map`/
-			// `clampmap` keyword if a stage somehow has more than one
-			// (real shaders don't). `$whiteimage`/`$lightmap`/`$lightmapgrid`
-			// are generated placeholders, not files - see mapImage's own
+			// `map <path>` or `clampmap <path>` is the stage's base image -
+			// only the first stage's, and only its first `map`/`clampmap`
+			// keyword if a stage somehow has more than one (real shaders
+			// don't). `$whiteimage`/`$lightmap`/`$lightmapgrid` are
+			// generated placeholders, not files - see mapImage's own
 			// comment (s_shaderMapImage) for why those are deliberately left
 			// unrecorded rather than treated as a (nonexistent) file path.
+			// `clampmap` is NOT just a spelling variant of `map` - real
+			// Quake3 gives it GL_CLAMP(_TO_EDGE) texture addressing instead
+			// of the default GL_REPEAT (see s_shaderClampMap's own comment
+			// for the real, confirmed-visible bug this distinction fixes).
 			if ( depth == 2 && inFirstStage && mapImage.empty() &&
 				( !Q_stricmp( tok, "map" ) || !Q_stricmp( tok, "clampmap" ) ) )
 			{
+				bool isClampMap = !Q_stricmp( tok, "clampmap" );
 				const char *path = COM_ParseExt( &p, qfalse );
 				if ( path[0] && path[0] != '$' )
 				{
 					mapImage = path;
+					clampMap = isClampMap;
 				}
 				continue;
 			}
@@ -452,6 +476,7 @@ static void ParseShaderFile( const char *text )
 		if ( !mapImage.empty() && s_shaderMapImage.find( name ) == s_shaderMapImage.end() )
 		{
 			s_shaderMapImage[name] = mapImage;
+			s_shaderClampMap[name] = clampMap;
 		}
 		if ( ( haveTcModScroll || haveTcModScale ) && s_shaderTcModScroll.find( name ) == s_shaderTcModScroll.end() )
 		{
@@ -753,4 +778,19 @@ const char *VK_GetShaderMapImage( const char *name )
 		return nullptr;
 	}
 	return it->second.c_str();
+}
+
+// Whether a shader's first stage used `clampmap` (real GL_CLAMP(_TO_EDGE)
+// addressing) rather than plain `map` (GL_REPEAT) - see s_shaderClampMap's
+// own comment for the real, confirmed-visible bug this drives the fix for.
+// Deliberately independent of whether the shader's own name happens to
+// resolve directly to a texture file or needs VK_GetShaderMapImage's
+// fallback above - the addressing mode is a property of the *shader*,
+// regardless of which path resolved its actual image.
+bool VK_GetShaderClampMap( const char *name )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderClampMap.find( VK_StripShaderNameExtension( name ) );
+	return it != s_shaderClampMap.end() && it->second;
 }

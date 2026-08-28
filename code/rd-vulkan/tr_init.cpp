@@ -882,6 +882,19 @@ static void VK_CreateWorldPipeline( void )
 	worldSamplerInfo.maxLod = VK_LOD_CLAMP_NONE;
 	VK_Check( vkCreateSampler( vk.device, &worldSamplerInfo, nullptr, &vk.worldSampler ), "vkCreateSampler (world)" );
 
+	// Real `clampmap` addressing (VK_GetShaderClampMap, tr_shader.cpp) - see
+	// that map's own comment for the real, confirmed-visible bug this fixes
+	// (academy1's dark_dust light-shaft/dust-cloud family tiling their
+	// gradient texture 5-11 times instead of clamping it once). Same
+	// filtering/LOD settings as vk.worldSampler, only the addressing mode
+	// differs - VK_BuildWorldDescriptorSet (tr_world.cpp) picks between the
+	// two per-surface based on that shader lookup.
+	VkSamplerCreateInfo worldSamplerClampInfo = worldSamplerInfo;
+	worldSamplerClampInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	worldSamplerClampInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	worldSamplerClampInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+	VK_Check( vkCreateSampler( vk.device, &worldSamplerClampInfo, nullptr, &vk.worldSamplerClamp ), "vkCreateSampler (world clamp)" );
+
 	VkPushConstantRange pushRange = {};
 	// Fragment stage needs camPos/fogColor too (world.frag does the actual
 	// fog mix), not just mvp - vertex and fragment share this one range
@@ -1325,6 +1338,7 @@ void VK_Shutdown( qboolean destroyWindow )
 	if ( vk.worldPipelineAdditive ) vkDestroyPipeline( vk.device, vk.worldPipelineAdditive, nullptr );
 	if ( vk.worldPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.worldPipelineLayout, nullptr );
 	if ( vk.worldSampler ) vkDestroySampler( vk.device, vk.worldSampler, nullptr );
+	if ( vk.worldSamplerClamp ) vkDestroySampler( vk.device, vk.worldSamplerClamp, nullptr );
 	if ( vk.ghoul2DescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.ghoul2DescriptorPool, nullptr );
 	if ( vk.worldDescriptorPool ) vkDestroyDescriptorPool( vk.device, vk.worldDescriptorPool, nullptr );
 	if ( vk.worldDescriptorSetLayout ) vkDestroyDescriptorSetLayout( vk.device, vk.worldDescriptorSetLayout, nullptr );

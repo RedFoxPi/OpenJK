@@ -373,7 +373,7 @@ static void VK_LoadLightmaps( const byte *lumpData, int lumpLen )
 // explicitly (rather than always using vk.worldDescriptorPool) since Ghoul2
 // models need their own pool with an independent lifetime - see
 // vkGlobals_t::ghoul2DescriptorPool's comment.
-VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diffuse, image_t *lightmap )
+VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diffuse, image_t *lightmap, bool diffuseClamp )
 {
 	VkDescriptorSetAllocateInfo alloc = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
 	alloc.descriptorPool = pool;
@@ -386,7 +386,12 @@ VkDescriptorSet VK_BuildWorldDescriptorSet( VkDescriptorPool pool, image_t *diff
 	VkDescriptorImageInfo imageInfos[2] = {};
 	imageInfos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	imageInfos[0].imageView = diffuse->view;
-	imageInfos[0].sampler = vk.worldSampler;
+	// Real `clampmap` addressing (VK_GetShaderClampMap's own comment,
+	// tr_shader.cpp) - only the diffuse image ever needs this; the lightmap
+	// slot always stays REPEAT (real vanilla never clamps `$lightmap`, and
+	// lightmap UVs are baked within 0..1 anyway so it wouldn't matter if it
+	// did).
+	imageInfos[0].sampler = diffuseClamp ? vk.worldSamplerClamp : vk.worldSampler;
 	imageInfos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	imageInfos[1].imageView = lightmap->view;
 	imageInfos[1].sampler = vk.worldSampler;
@@ -1267,7 +1272,8 @@ void RE_LoadWorldMap( const char *name )
 			}
 		}
 
-		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap );
+		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap,
+			VK_GetShaderClampMap( shaders[surf.shaderNum].shader ) );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
 			scrollS, scrollT, blendMode, scaleS, scaleT, envMap } );
