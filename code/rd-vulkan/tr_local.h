@@ -278,7 +278,25 @@ struct PolyVertex
 // safe to leave at a zero-initialized push's default 0.0 (ordinary UVs, no
 // alpha test - the correct behaviour for every call site except world
 // geometry's own per-batch loop, which sets both explicitly either way for
-// clarity).
+// clarity). turb.x is this batch's `tcMod turb` amplitude
+// (VK_GetShaderTcModTurb, tr_shader.cpp) - 0.0 (a true no-op, since the
+// real formula's offset is amplitude-scaled) for the common no-turb case;
+// turb.y is `phase + time*frequency`, already precomputed CPU-side once
+// per distinct value (RE_RenderScene), same "not a separate time uniform"
+// approach fogStart.yz already uses for tcMod scroll. turb.zw unused.
+// This field grows the push constant past 128 bytes (the Vulkan spec's
+// only *guaranteed* minimum) to 144 - a deliberate, evidence-based
+// tradeoff: real per-vertex world-position-dependent turbulence (`tcMod
+// turb`, confirmed real usage - vjun1's electric containment field and a
+// real water surface, yavin1's cloudlayer) needs its own 2 floats and
+// there was no room left in the existing 128 bytes without fragile
+// bit-packing into fields already spoken for (uvScale.z/w). Every desktop
+// Vulkan implementation this renderer has been tested against (and Mesa's
+// lavapipe, used for headless testing) supports well over 128 bytes in
+// practice; a hard failure here would show up immediately and loudly
+// (VK_Check's fatal error on device creation/pipeline layout, not a
+// silent visual bug), unlike every other pitfall this struct's own
+// comment documents.
 struct vkWorldPushConstants_t
 {
 	float mvp[16];
@@ -286,6 +304,7 @@ struct vkWorldPushConstants_t
 	float fogColor[4];
 	float fogStart[4];
 	float uvScale[4];
+	float turb[4];
 };
 
 typedef struct
@@ -709,6 +728,10 @@ bool VK_GetShaderFogParms( const char *name, float color[3], float *opaqueDist )
 // supported (`scroll` and `scale`, and how they compose when a stage has
 // both) and the real test cases that motivated each.
 bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed, float *scaleS, float *scaleT );
+// A shader's first stage's `tcMod turb` amplitude/phase/frequency - see
+// this function's own comment (tr_shader.cpp) and RE_LoadWorldMap/
+// RE_RenderScene/world.vert (the real consumers) for the actual fix.
+bool VK_GetShaderTcModTurb( const char *name, float *amplitude, float *phase, float *frequency );
 // First stage's `map`/`clampmap` file path, or nullptr - see this
 // function's own comment (tr_shader.cpp) for why RE_LoadWorldMap
 // (tr_world.cpp) needs this as a fallback when a shader's own name isn't

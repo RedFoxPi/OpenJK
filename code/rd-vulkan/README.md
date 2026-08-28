@@ -4075,6 +4075,93 @@ this fix's real contribution from that pre-existing noise in this specific
 camera framing, so the debug-log confirmation above (not the pixel diff)
 is the primary evidence for this fix, same as several features above it.
 
+## Real `tcMod turb` for world geometry
+
+Closes another real gap, and along the way caught and fixed a genuine
+methodology bug in how this project verifies "real per-map usage" when a
+shader name is defined more than once.
+
+**The methodology bug, found before implementing anything**: the same
+`assets1.pk3` contains *two* different definitions of `textures/
+impdetention/deathcon1a` (vjun1's electric containment field, already real
+for `tcMod scroll`/`scale` - see "World-geometry tcMod scroll" above) - one
+in `imp_mine.shader` with no `tcMod` at all, and one in `test.shader` with
+`tcMod scroll`/`scale`/`turb` all three. A shader-name collision like this
+resolves to whichever file wins under this renderer's own real
+`ri.FS_ListFiles` enumeration order (not a script's `glob()` order, which
+has no relationship to it) - so before implementing `tcMod turb` "because a
+naive text search found it," a temporary debug print (removed before
+committing) confirmed directly which definition *this renderer's own
+already-running code* actually resolves: `scrollS=0 scrollT=0.2 scaleS=2
+scaleT=2` for `deathcon1a` - which only matches `test.shader`'s numbers
+(`0.1*2=0.2` from the real scroll-before-scale composition this project's
+own `tcMod scale` work already established), confirming `test.shader`'s
+version - the one with `tcMod turb` - is genuinely the one in effect, not a
+naive keyword hit that would never actually run.
+
+**Real, substantial usage** (re-confirmed against real per-map BSP data
+after the methodology fix): vjun1's `textures/impdetention/deathcon1a`/
+`deathcon1` (the electric containment field, `tcMod turb 0 0.1 0 2`/`tcMod
+turb 0 0.4 0 1` respectively - a real per-vertex wobble layered on top of
+the scroll/scale this renderer already had), `textures/common/
+water2_water1_vjun1` (a real water surface, `tcMod turb 2 0.05 0 0.1` on
+its own first stage), and `textures/skies/cloudlayer_yavin` (a real yavin1
+world surface, not the skybox itself, `tcMod turb 1 0.01 0.1 0.1`). Ruled
+out one apparent match as a false positive from this renderer's existing
+first-stage-only scope: `textures/h_evil/lakewater`'s `tcMod turb` only
+appears on its *second and third* stages - its first stage is plain
+`tcMod scroll`, so this shader needed no change at all, same "the
+match has to actually land on stage one" discipline the `tcGen environment`
+investigation established.
+
+**Real formula**, ported directly from rd-vanilla's own
+`RB_CalcTurbulentTexCoords` (`tr_shade_calc.cpp`): `now = phase +
+time*frequency`; `s' = s + sin(2*PI*((x+z)/128*0.125 + now)) * amplitude`;
+`t' = t + sin(2*PI*(y/128*0.125 + now)) * amplitude` - note `base` (the
+first of the four `tcMod turb` numbers) is parsed but genuinely never used
+by the real function, and the real "(x+z) drives s, y alone drives t" axis
+asymmetry is exactly what rd-vanilla's own code does, not a simplification
+introduced here. Applied as an additive offset after whatever `fragUV` the
+existing scroll/scale/tcGen-environment logic already produced, matching
+real Quake3's own "each tcMod transforms the previous stage's output"
+composition (confirmed correct for all 3 real shaders here, which all
+declare `turb` last).
+
+**Implementation**: needed two new per-batch values (`amplitude` and the
+precomputed `now`) with no room left in the existing 128-byte push
+constant without fragile bit-packing into fields already spoken for
+(`uvScale.z`/`.w`) - `vkWorldPushConstants_t` gained a new `turb` `vec4`
+(only `.xy` used), growing the push constant to 144 bytes. This is a
+deliberate, evidence-based tradeoff, not an oversight: 128 bytes is only
+the Vulkan spec's *guaranteed minimum*, every real target this renderer is
+tested against (desktop GPUs, and Mesa's lavapipe for headless testing)
+supports well over that in practice, and a genuine failure here is loud
+(`VK_Check`'s fatal error on pipeline layout creation) rather than the
+usual silent-wrong-pixels failure shape this struct's own comment warns
+about for its other fields - confirmed by this exact build succeeding
+against lavapipe. `tr_shader.cpp` gained `tcMod turb` recognition
+(`VK_GetShaderTcModTurb`); `WorldSurfaceBatch` gained `turbAmplitude`/
+`turbPhase`/`turbFrequency` fields (amplitude 0.0 is a true no-op, same
+identity-default convention as every other per-batch field here);
+`RE_RenderScene`'s existing per-batch tracking loop precomputes `now`
+once per distinct value, same "not a separate time uniform" approach
+already used for `tcMod scroll`'s own offset; `world.vert` performs the
+real per-vertex `sin()` evaluation.
+
+**Verified**: warning-free rebuild (including the modified vertex shader),
+full SP scene suite clean on all 5 scenes, confirmed running correctly
+against lavapipe despite the larger push constant. A temporary debug print
+(removed before committing) confirmed the exact real amplitude/phase/
+frequency values for both `deathcon1`/`deathcon1a` match `test.shader`'s
+real declarations precisely (`amp=0.4 freq=1` and `amp=0.1 freq=2`
+respectively). Pixel-diffed a build with this fix against one without it:
+academy1 (zero real matches) came back essentially unchanged (0.017%,
+consistent with unrelated noise). vjun1 showed a diff in roughly the same
+range as this project's own separately-measured run-to-run noise floor for
+that scene, so - same as several features immediately above - the
+debug-log confirmation is the primary evidence here, not the whole-frame
+screenshot diff.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -4279,21 +4366,21 @@ is the primary evidence for this fix, same as several features above it.
   feature from the base skybox).
 - Full `.shader` script parsing: only a defined shader's first stage's
   `map`/`clampmap`/`blendFunc`/`alphaFunc`/`tcMod scroll`/`tcMod scale`/
-  `rgbGen const`/`rgbGen wave sin`/`alphaGen portal <range>`/`tcGen
-  environment` (see "World-geometry tcMod scroll"/"`tcMod scale` for world
-  geometry"/"`rgbGen const` and a widened additive map-image fallback"/
-  "Static flares"/"Real rgbGen const/wave for flares"/"`tcGen environment`
-  (reflection-mapped UV generation)"/"Real `clampmap` addressing"/"Real
-  `alphaFunc` alpha-testing" above for those), whether it declares any
-  `tcGen` at all (not which kind otherwise - see the `rgbGen const`
-  section), and (for fog shaders specifically, see "3D world geometry"
-  above) a top-level `fogparms` line, are read - later stages, every other
-  `tcMod` type (`rotate`/`stretch`/`turb`/`transform`/`entityTranslate`),
-  every other `tcGen` type (`tcGen lightmap`/`tcGen vector` - no real
-  per-map match on this checkout's test maps for either, see the `tcMod
-  rotate` investigation's methodology), `rgbGen identityLighting`/`vertex`/
-  non-`sin` wave functions, `alphaGen` waves, and `skyparms` are still
-  ignored. World geometry does now get real
+  `tcMod turb`/`rgbGen const`/`rgbGen wave sin`/`alphaGen portal <range>`/
+  `tcGen environment` (see "World-geometry tcMod scroll"/"`tcMod scale` for
+  world geometry"/"`rgbGen const` and a widened additive map-image
+  fallback"/"Static flares"/"Real rgbGen const/wave for flares"/"`tcGen
+  environment` (reflection-mapped UV generation)"/"Real `clampmap`
+  addressing"/"Real `alphaFunc` alpha-testing"/"Real `tcMod turb`" above for
+  those), whether it declares any `tcGen` at all (not which kind otherwise -
+  see the `rgbGen const` section), and (for fog shaders specifically, see
+  "3D world geometry" above) a top-level `fogparms` line, are read - later
+  stages, every other `tcMod` type (`rotate`/`stretch`/`transform`/
+  `entityTranslate`), every other `tcGen` type (`tcGen lightmap`/`tcGen
+  vector` - no real per-map match on this checkout's test maps for either,
+  see the `tcMod rotate` investigation's methodology), `rgbGen
+  identityLighting`/`vertex`/non-`sin` wave functions, `alphaGen` waves,
+  and `skyparms` are still ignored. World geometry does now get real
   blend-mode selection (see "World geometry blend modes" above) for a
   shader whose own
   name directly resolves to a texture file, and the map-image fallback (see

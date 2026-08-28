@@ -26,8 +26,13 @@ layout(push_constant) uniform PushConstants {
     // already pre-scaled at parse time when a shader's tcMod order needs
     // that). z = tcGen-environment flag (1.0 = generate reflection UVs
     // below instead of using inUV at all, 0.0 = the common ordinary-UV
-    // case). w unused.
+    // case). w = this batch's real alphaFunc mode (world.frag reads it,
+    // not read here).
     vec4 uvScale;
+    // x = this batch's tcMod-turb amplitude (0 = a true no-op, the common
+    // case); y = precomputed `phase + time*frequency` (see
+    // vkWorldPushConstants_t's own comment, tr_local.h). zw unused.
+    vec4 turb;
 } pc;
 
 void main() {
@@ -59,6 +64,21 @@ void main() {
         // independently of the surface itself.
         fragUV = inUV * pc.uvScale.xy + pc.fogStart.yz;
     }
+    // Real per-vertex `tcMod turb` UV wobble - ports rd-vanilla's own
+    // RB_CalcTurbulentTexCoords (tr_shade_calc.cpp) exactly, including its
+    // real "(x+z) drives s, y alone drives t" axis convention (not a
+    // simplification - the real function does exactly this). Declared last
+    // in every real shader that combines it with scroll/scale (checked
+    // directly, not assumed), so applying it as an additive offset on top
+    // of whatever fragUV the branch above already produced matches real
+    // Quake3's own "each tcMod transforms the previous stage's output"
+    // composition. amplitude 0 (the common no-turb case) makes this an
+    // exact no-op - real GLSL sin() replaces rd-vanilla's quantized
+    // tr.sinTable lookup, a strictly more precise equivalent, not an
+    // approximation of it.
+    float turbNow = pc.turb.y;
+    fragUV.x += sin( 6.283185307 * ( ( inPos.x + inPos.z ) * ( 1.0 / 128.0 ) * 0.125 + turbNow ) ) * pc.turb.x;
+    fragUV.y += sin( 6.283185307 * ( inPos.y * ( 1.0 / 128.0 ) * 0.125 + turbNow ) ) * pc.turb.x;
     fragLightmapUV = inLightmapUV;
     fragColor = inColor;
     // World-space Euclidean camera distance - a simplified stand-in for

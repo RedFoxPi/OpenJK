@@ -155,6 +155,16 @@ struct WorldSurfaceBatch
 	// See world.frag's real discard logic. Deliberately appended last, same
 	// positional-aggregate-init reason as scaleS/scaleT/envMap above.
 	int alphaFunc = 0;
+	// This surface's shader's first-stage `tcMod turb` amplitude/phase/
+	// frequency (VK_GetShaderTcModTurb, tr_shader.cpp) - amplitude 0.0 (a
+	// true no-op, see vkWorldPushConstants_t's own comment) for the common
+	// no-turb case. Confirmed real usage: vjun1's electric containment
+	// field (`textures/impdetention/deathcon1a`/`deathcon1`, already real
+	// for scroll/scale - this closes the remaining per-vertex wobble) and
+	// a real water surface, plus yavin1's `cloudlayer_yavin`. Deliberately
+	// appended last, same positional-aggregate-init reason as scaleS/
+	// scaleT/envMap/alphaFunc above.
+	float turbAmplitude = 0.0f, turbPhase = 0.0f, turbFrequency = 0.0f;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -1283,10 +1293,16 @@ void RE_LoadWorldMap( const char *name )
 
 		VkDescriptorSet descriptorSet = VK_BuildWorldDescriptorSet( vk.worldDescriptorPool, img, lightmap,
 			VK_GetShaderClampMap( shaders[surf.shaderNum].shader ) );
+		// See WorldSurfaceBatch::turbAmplitude's own comment - 0,0,0 (no
+		// lookup hit) is exactly correct for the vast majority of shaders
+		// that never declare a tcMod turb at all.
+		float turbAmplitude = 0.0f, turbPhase = 0.0f, turbFrequency = 0.0f;
+		VK_GetShaderTcModTurb( shaders[surf.shaderNum].shader, &turbAmplitude, &turbPhase, &turbFrequency );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
 			scrollS, scrollT, blendMode, scaleS, scaleT, envMap,
-			VK_GetShaderAlphaFunc( shaders[surf.shaderNum].shader ) } );
+			VK_GetShaderAlphaFunc( shaders[surf.shaderNum].shader ),
+			turbAmplitude, turbPhase, turbFrequency } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1798,6 +1814,13 @@ void RE_RenderScene( const refdef_t *fd )
 	// the correct starting state here, same explicit-not-implicit-zero
 	// discipline as uvScale.xy/z above.
 	worldPush.uvScale[3] = 0.0f;
+	// turb.xy is this batch's tcMod-turb amplitude/precomputed-now (see the
+	// per-batch loop below, and vkWorldPushConstants_t's own comment) - 0,0
+	// (amplitude 0 is a true no-op regardless of the second component) is
+	// the correct starting state here, same explicit-not-implicit-zero
+	// discipline as uvScale above.
+	worldPush.turb[0] = 0.0f;
+	worldPush.turb[1] = 0.0f;
 	vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		0, sizeof( worldPush ), &worldPush );
 
@@ -1828,6 +1851,7 @@ void RE_RenderScene( const refdef_t *fd )
 	float currentScaleS = 1.0f, currentScaleT = 1.0f;
 	bool currentEnvMap = false;
 	int currentAlphaFunc = 0;
+	float currentTurbAmplitude = 0.0f, currentTurbPhase = 0.0f, currentTurbFrequency = 0.0f;
 	float timeSeconds = (float)fd->time / 1000.0f;
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
@@ -1849,7 +1873,9 @@ void RE_RenderScene( const refdef_t *fd )
 		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex ||
 			batch.scrollS != currentScrollS || batch.scrollT != currentScrollT ||
 			batch.scaleS != currentScaleS || batch.scaleT != currentScaleT ||
-			batch.envMap != currentEnvMap || batch.alphaFunc != currentAlphaFunc )
+			batch.envMap != currentEnvMap || batch.alphaFunc != currentAlphaFunc ||
+			batch.turbAmplitude != currentTurbAmplitude || batch.turbPhase != currentTurbPhase ||
+			batch.turbFrequency != currentTurbFrequency )
 		{
 			currentPushIsVertexLit = batch.vertexLit;
 			currentFogIndex = batch.fogIndex;
@@ -1859,6 +1885,9 @@ void RE_RenderScene( const refdef_t *fd )
 			currentScaleT = batch.scaleT;
 			currentEnvMap = batch.envMap;
 			currentAlphaFunc = batch.alphaFunc;
+			currentTurbAmplitude = batch.turbAmplitude;
+			currentTurbPhase = batch.turbPhase;
+			currentTurbFrequency = batch.turbFrequency;
 			worldPush.camPos[3] = currentPushIsVertexLit ? 1.0f : 2.0f;
 			worldPush.uvScale[0] = currentScaleS;
 			worldPush.uvScale[1] = currentScaleT;
@@ -1872,6 +1901,12 @@ void RE_RenderScene( const refdef_t *fd )
 			// comment, tr_shader.cpp) - world.frag discards fragments that
 			// fail the corresponding real per-mode alpha comparison.
 			worldPush.uvScale[3] = (float)currentAlphaFunc;
+			// turb.x/y are this batch's real tcMod-turb amplitude and
+			// precomputed `phase + time*frequency` (real rd-vanilla's own
+			// RB_CalcTurbulentTexCoords, tr_shade_calc.cpp) - see
+			// vkWorldPushConstants_t's own comment (tr_local.h).
+			worldPush.turb[0] = currentTurbAmplitude;
+			worldPush.turb[1] = currentTurbPhase + currentTurbFrequency * timeSeconds;
 			if ( currentFogIndex >= 0 )
 			{
 				const WorldFogEntry &fog = s_worldFogs[currentFogIndex];

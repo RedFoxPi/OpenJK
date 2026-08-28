@@ -67,6 +67,34 @@ struct vkShaderTcModScroll_t
 };
 static std::unordered_map<std::string, vkShaderTcModScroll_t> s_shaderTcModScroll;
 
+// First stage's `tcMod turb <base> <amplitude> <phase> <frequency>`, keyed
+// by shader name - `base` is parsed but never stored/used, matching real
+// rd-vanilla's own RB_CalcTurbulentTexCoords (tr_shade_calc.cpp), which
+// only ever reads amplitude/phase/frequency. Confirmed real, substantial
+// usage on this renderer's own test maps after correcting a duplicate-
+// shader-name resolution-order bug in the cross-reference methodology
+// (two different assets*.pk3 shader files - imp_mine.shader and
+// test.shader - both define `textures/impdetention/deathcon1a`; only a
+// runtime check of which one this renderer's own real `ri.FS_ListFiles`
+// order actually resolves settled it - test.shader's version, the one
+// with real tcMod scroll/scale/turb, matching this project's own already-
+// shipped tcMod-scroll work for this exact shader): vjun1's
+// `textures/impdetention/deathcon1a`/`deathcon1` (the level's electric
+// containment field - scroll/scale already real, this closes the
+// remaining wobble), `textures/common/water2_water1_vjun1` (a real water
+// surface), and `textures/skies/cloudlayer_yavin` (a real yavin1 world
+// surface, not the skybox itself). `now = phase + time*frequency` is
+// precomputed on the CPU side per distinct value (RE_RenderScene,
+// tr_world.cpp), same "compute once per frame, not per vertex" approach
+// already used for tcMod scroll's own offset - only `amplitude` and that
+// precomputed `now` need to reach world.vert, which does the actual real
+// per-vertex sin() evaluation.
+struct vkShaderTcModTurb_t
+{
+	float amplitude = 0.0f, phase = 0.0f, frequency = 0.0f;
+};
+static std::unordered_map<std::string, vkShaderTcModTurb_t> s_shaderTcModTurb;
+
 // First stage's `alphaGen portal <range>` numeric argument, keyed by shader
 // name - the only alphaGen this renderer reads. It exists purely to drive
 // VK_GetShaderPortalRange's flare-quad radius (see that function's comment
@@ -238,6 +266,8 @@ static void ParseShaderFile( const char *text )
 		// of the two is present.
 		bool tcModScaleBeforeScroll = false;
 		vkShaderTcModScroll_t tcModScroll = {};
+		bool haveTcModTurb = false;
+		vkShaderTcModTurb_t tcModTurb = {};
 		bool havePortalRange = false;
 		float portalRange = 0.0f;
 		bool haveRgbConst = false;
@@ -357,6 +387,20 @@ static void ParseShaderFile( const char *text )
 					tcModScroll.scaleS = (float)atof( COM_ParseExt( &p, qfalse ) );
 					tcModScroll.scaleT = (float)atof( COM_ParseExt( &p, qfalse ) );
 					haveTcModScale = true;
+				}
+				else if ( !Q_stricmp( modType.c_str(), "turb" ) )
+				{
+					// `tcMod turb <base> <amplitude> <phase> <frequency>` -
+					// base is parsed (to advance past it correctly) but never
+					// used, matching real rd-vanilla's own
+					// RB_CalcTurbulentTexCoords (tr_shade_calc.cpp), which
+					// only ever reads wf->amplitude/phase/frequency - see
+					// s_shaderTcModTurb's own comment for the real formula.
+					(void)COM_ParseExt( &p, qfalse );
+					tcModTurb.amplitude = (float)atof( COM_ParseExt( &p, qfalse ) );
+					tcModTurb.phase = (float)atof( COM_ParseExt( &p, qfalse ) );
+					tcModTurb.frequency = (float)atof( COM_ParseExt( &p, qfalse ) );
+					haveTcModTurb = true;
 				}
 				continue;
 			}
@@ -546,6 +590,10 @@ static void ParseShaderFile( const char *text )
 			}
 			s_shaderTcModScroll[name] = tcModScroll;
 		}
+		if ( haveTcModTurb && s_shaderTcModTurb.find( name ) == s_shaderTcModTurb.end() )
+		{
+			s_shaderTcModTurb[name] = tcModTurb;
+		}
 		if ( havePortalRange && s_shaderPortalRange.find( name ) == s_shaderPortalRange.end() )
 		{
 			s_shaderPortalRange[name] = portalRange;
@@ -703,6 +751,25 @@ bool VK_GetShaderTcModScroll( const char *name, float *sSpeed, float *tSpeed, fl
 	*tSpeed = it->second.tSpeed;
 	*scaleS = it->second.scaleS;
 	*scaleT = it->second.scaleT;
+	return true;
+}
+
+// A shader's first stage's `tcMod turb` amplitude/phase/frequency (see
+// s_shaderTcModTurb's own comment for the real formula and confirmed real
+// users) - RE_LoadWorldMap (tr_world.cpp), the only caller, stores these
+// per-batch for RE_RenderScene to precompute `now` from each frame.
+bool VK_GetShaderTcModTurb( const char *name, float *amplitude, float *phase, float *frequency )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderTcModTurb.find( VK_StripShaderNameExtension( name ) );
+	if ( it == s_shaderTcModTurb.end() )
+	{
+		return false;
+	}
+	*amplitude = it->second.amplitude;
+	*phase = it->second.phase;
+	*frequency = it->second.frequency;
 	return true;
 }
 
