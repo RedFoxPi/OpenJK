@@ -146,6 +146,15 @@ struct WorldSurfaceBatch
 	// Deliberately appended last, same positional-aggregate-init reason as
 	// scaleS/scaleT above.
 	bool envMap = false;
+	// This surface's shader's first-stage `alphaFunc` mode
+	// (VK_GetShaderAlphaFunc, tr_shader.cpp) - 0 (no test, the common case)
+	// for most surfaces. Confirmed real, substantial usage: 7 real yavin1
+	// surfaces with NO `blendFunc` at all (grass/vines/tree foliage -
+	// previously drawn fully opaque, solid rectangular sprites instead of
+	// alpha-tested cutout shapes) plus several hoth2/vjun1 grate shaders.
+	// See world.frag's real discard logic. Deliberately appended last, same
+	// positional-aggregate-init reason as scaleS/scaleT/envMap above.
+	int alphaFunc = 0;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -1276,7 +1285,8 @@ void RE_LoadWorldMap( const char *name )
 			VK_GetShaderClampMap( shaders[surf.shaderNum].shader ) );
 		s_worldSurfaces.push_back( { descriptorSet, firstIndex, (uint32_t)( cpuIndexes.size() - firstIndex ),
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
-			scrollS, scrollT, blendMode, scaleS, scaleT, envMap } );
+			scrollS, scrollT, blendMode, scaleS, scaleT, envMap,
+			VK_GetShaderAlphaFunc( shaders[surf.shaderNum].shader ) } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1783,6 +1793,11 @@ void RE_RenderScene( const refdef_t *fd )
 	// correct starting state here, same explicit-not-implicit-zero
 	// discipline as uvScale.xy above.
 	worldPush.uvScale[2] = 0.0f;
+	// uvScale.w is this batch's alphaFunc mode (see the per-batch loop
+	// below, and vkWorldPushConstants_t's own comment) - 0.0 (no test) is
+	// the correct starting state here, same explicit-not-implicit-zero
+	// discipline as uvScale.xy/z above.
+	worldPush.uvScale[3] = 0.0f;
 	vkCmdPushConstants( cmd, vk.worldPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
 		0, sizeof( worldPush ), &worldPush );
 
@@ -1812,6 +1827,7 @@ void RE_RenderScene( const refdef_t *fd )
 	float currentScrollS = 0.0f, currentScrollT = 0.0f;
 	float currentScaleS = 1.0f, currentScaleT = 1.0f;
 	bool currentEnvMap = false;
+	int currentAlphaFunc = 0;
 	float timeSeconds = (float)fd->time / 1000.0f;
 	for ( const WorldSurfaceBatch &batch : s_worldSurfaces )
 	{
@@ -1833,7 +1849,7 @@ void RE_RenderScene( const refdef_t *fd )
 		if ( batch.vertexLit != currentPushIsVertexLit || batch.fogIndex != currentFogIndex ||
 			batch.scrollS != currentScrollS || batch.scrollT != currentScrollT ||
 			batch.scaleS != currentScaleS || batch.scaleT != currentScaleT ||
-			batch.envMap != currentEnvMap )
+			batch.envMap != currentEnvMap || batch.alphaFunc != currentAlphaFunc )
 		{
 			currentPushIsVertexLit = batch.vertexLit;
 			currentFogIndex = batch.fogIndex;
@@ -1842,6 +1858,7 @@ void RE_RenderScene( const refdef_t *fd )
 			currentScaleS = batch.scaleS;
 			currentScaleT = batch.scaleT;
 			currentEnvMap = batch.envMap;
+			currentAlphaFunc = batch.alphaFunc;
 			worldPush.camPos[3] = currentPushIsVertexLit ? 1.0f : 2.0f;
 			worldPush.uvScale[0] = currentScaleS;
 			worldPush.uvScale[1] = currentScaleT;
@@ -1850,6 +1867,11 @@ void RE_RenderScene( const refdef_t *fd )
 			// generate reflection UVs in world.vert, ignoring uvScale.xy/inUV
 			// entirely; 0.0 = the common ordinary-UV case).
 			worldPush.uvScale[2] = currentEnvMap ? 1.0f : 0.0f;
+			// uvScale.w is this batch's real alphaFunc mode (0=none, 1=GT0,
+			// 2=LT128, 3=GE128, 4=GE192 - see VK_GetShaderAlphaFunc's own
+			// comment, tr_shader.cpp) - world.frag discards fragments that
+			// fail the corresponding real per-mode alpha comparison.
+			worldPush.uvScale[3] = (float)currentAlphaFunc;
 			if ( currentFogIndex >= 0 )
 			{
 				const WorldFogEntry &fog = s_worldFogs[currentFogIndex];

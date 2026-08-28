@@ -4002,6 +4002,79 @@ be fully separated from this fix's own real contribution from a whole-frame
 diff alone - the debug-log confirmation above, not the screenshot diff, is
 the primary evidence for this fix, same as several features above it.
 
+## Real `alphaFunc` alpha-testing for world geometry
+
+Closes a real, substantial, high-visual-impact gap: this renderer ignored
+`alphaFunc` entirely, so any world surface relying on it for a hard
+per-pixel cutout (rather than blending) rendered as a fully solid rectangle
+- most strikingly, real cutout foliage (grass/vines/tree billboards) with
+no `blendFunc` at all fell through to this renderer's default
+`BLEND_OPAQUE` classification and drew as solid opaque image rectangles
+instead of alpha-tested leaf/grass/vine shapes.
+
+**Real, substantial usage, checked the same way as every other feature in
+this file** (cross-referencing `alphaFunc` hits against each test map's
+real `LUMP_SHADERS` string table): zero on academy1, 3 real grate shaders
+on hoth2 (`textures/imperial/grate02`/`grate02_broke`, `textures/vjun/
+grate2`), 3 on vjun1 (`textures/imperial/grate02`, `textures/vjun/grate`/
+`grate1`), and **9 real matches on yavin1** - a jungle level, so this makes
+complete sense once you look: `models/map_objects/yavin/plant`/`grass_b`/
+`vines`/`tree09a`/`tree09b`/`tree09d`, `textures/yavin/s_rock1_vines`,
+`textures/yavin/ground_grasssprite_phong_vertex`, `textures/factory/
+t2_wedge_floorgrate`. Critically, **7 of yavin1's 9** (the foliage family)
+declare no `blendFunc` keyword at all in their only stage - just `map` +
+`alphaFunc` + `rgbGen lightingDiffuse` - so they were taking this
+renderer's plain `BLEND_OPAQUE` path with zero alpha handling of any kind
+before this fix, not merely a "soft edges instead of hard cutout"
+approximation error.
+
+**Real threshold values**, checked directly against rd-vanilla's own
+`tr_backend.cpp` `qglAlphaFunc` calls (not the `GLS_ATEST_*` macro names
+alone, which don't say what threshold each one actually uses): `GT0`
+discards alpha `<= 0.0`, `LT128` discards alpha `>= 0.5`, `GE128` discards
+alpha `< 0.5`, `GE192` discards alpha `< 0.75` - a real hard cutoff via
+GLSL `discard`, not blending, matching real vanilla's fixed-function
+`GL_ALPHA_TEST` exactly (Vulkan/modern GL has no equivalent fixed-function
+stage, so a fragment-shader `discard` is the standard real replacement).
+
+**Implementation**: `tr_shader.cpp`'s parser gained `alphaFunc` recognition
+(`VK_GetShaderAlphaFunc`, an `int` mode: 0=none/1=GT0/2=LT128/3=GE128/
+4=GE192) alongside the existing `map`/`blendFunc`/etc. keywords.
+`WorldSurfaceBatch` gained an `alphaFunc` field (appended last, default 0,
+same positional-aggregate-init convention as `envMap`/`scaleS` above) and
+`RE_RenderScene`'s existing per-batch push-constant tracking loop gained
+`uvScale.w` as the mode selector - reusing what was previously genuinely
+unused padding in `vkWorldPushConstants_t` (see that struct's own comment).
+`world.frag` performs the actual real per-mode discard, immediately after
+sampling the diffuse texture and before any lightmap/fog work, so a
+discarded fragment costs nothing beyond that one sample.
+
+**Verified**: warning-free rebuild (including the modified fragment shader,
+recompiled via `glslangValidator`), full SP scene suite clean on all 5
+scenes. A temporary debug print (removed before committing) confirmed
+programmatically that exactly the intended shaders take the new path, with
+the exact real mode and existing blend-mode classification each one
+actually has: `textures/imperial/grate02` (mode 3/GE128, `BLEND_ALPHA` -
+matches its real `blendFunc GL_SRC_ALPHA GL_ONE_MINUS_SRC_ALPHA`) and
+`grate02_broke` (mode 2/LT128, `BLEND_OPAQUE` - matches its real
+`blendFunc GL_ONE GL_ZERO`, this renderer's own "blending explicitly
+disabled" spelling) on hoth2; `textures/vjun/grate`/`grate1` (mode 4/
+GE192, `BLEND_OPAQUE`) plus `grate02` again on vjun1; and, most
+importantly, 6 of yavin1's 7 real no-`blendFunc` foliage shaders (`grass_b`/
+`plant`/`vines`/`tree09a`/`tree09b`/`tree09d`, all mode 3/GE128,
+`BLEND_OPAQUE`) actually visible from that scene's fixed spawn camera.
+Pixel-diffed a build with this fix against one without it: academy1 (zero
+real matches) came back essentially unchanged (0.027% of the frame,
+consistent with unrelated floating-point noise, not a sign anything was
+missed). yavin1/vjun1 showed diffs in roughly the same range as this
+project's own separately-measured run-to-run noise floor for those two
+scenes (re-confirmed here by diffing two runs of the identical fixed
+binary against each other: yavin1 varies ~1.8% purely from run-to-run
+NPC-pose jitter) - the whole-frame screenshot diff can't cleanly separate
+this fix's real contribution from that pre-existing noise in this specific
+camera framing, so the debug-log confirmation above (not the pixel diff)
+is the primary evidence for this fix, same as several features above it.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -4205,20 +4278,22 @@ the primary evidence for this fix, same as several features above it.
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
 - Full `.shader` script parsing: only a defined shader's first stage's
-  `map`/`blendFunc`/`tcMod scroll`/`tcMod scale`/`rgbGen const`/`rgbGen wave
-  sin`/`alphaGen portal <range>`/`tcGen environment` (see "World-geometry
-  tcMod scroll"/"`tcMod scale` for world geometry"/"`rgbGen const` and a
-  widened additive map-image fallback"/"Static flares"/"Real rgbGen const/
-  wave for flares"/"`tcGen environment` (reflection-mapped UV generation)"
-  above for those), whether it declares any `tcGen` at all (not which kind
-  otherwise - see the `rgbGen const` section), and (for fog shaders
-  specifically, see "3D world geometry" above) a top-level `fogparms` line,
-  are read - later stages, every other `tcMod` type (`rotate`/`stretch`/
-  `turb`/`transform`/`entityTranslate`), every other `tcGen` type (`tcGen
-  lightmap`/`tcGen vector` - no real per-map match on this checkout's test
-  maps for either, see the `tcMod rotate` investigation's methodology),
-  `rgbGen identityLighting`/`vertex`/non-`sin` wave functions, `alphaGen`
-  waves, and `skyparms` are still ignored. World geometry does now get real
+  `map`/`clampmap`/`blendFunc`/`alphaFunc`/`tcMod scroll`/`tcMod scale`/
+  `rgbGen const`/`rgbGen wave sin`/`alphaGen portal <range>`/`tcGen
+  environment` (see "World-geometry tcMod scroll"/"`tcMod scale` for world
+  geometry"/"`rgbGen const` and a widened additive map-image fallback"/
+  "Static flares"/"Real rgbGen const/wave for flares"/"`tcGen environment`
+  (reflection-mapped UV generation)"/"Real `clampmap` addressing"/"Real
+  `alphaFunc` alpha-testing" above for those), whether it declares any
+  `tcGen` at all (not which kind otherwise - see the `rgbGen const`
+  section), and (for fog shaders specifically, see "3D world geometry"
+  above) a top-level `fogparms` line, are read - later stages, every other
+  `tcMod` type (`rotate`/`stretch`/`turb`/`transform`/`entityTranslate`),
+  every other `tcGen` type (`tcGen lightmap`/`tcGen vector` - no real
+  per-map match on this checkout's test maps for either, see the `tcMod
+  rotate` investigation's methodology), `rgbGen identityLighting`/`vertex`/
+  non-`sin` wave functions, `alphaGen` waves, and `skyparms` are still
+  ignored. World geometry does now get real
   blend-mode selection (see "World geometry blend modes" above) for a
   shader whose own
   name directly resolves to a texture file, and the map-image fallback (see

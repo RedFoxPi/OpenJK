@@ -155,6 +155,29 @@ static std::unordered_map<std::string, std::string> s_shaderMapImage;
 // VK_BuildWorldDescriptorSet (tr_world.cpp) for the actual fix.
 static std::unordered_map<std::string, bool> s_shaderClampMap;
 
+// First stage's `alphaFunc` mode, keyed by shader name - 0 = none (the
+// common case), 1 = GT0, 2 = LT128, 3 = GE128, 4 = GE192 (real rd-vanilla
+// threshold values, checked directly against tr_backend.cpp's own
+// qglAlphaFunc calls: GT0 discards alpha<=0, LT128 discards alpha>=0.5,
+// GE128 discards alpha<0.5, GE192 discards alpha<0.75). This renderer
+// previously ignored `alphaFunc` entirely - a real, confirmed-substantial
+// bug: yavin1 alone has 7 real world surfaces using it with NO `blendFunc`
+// at all (`models/map_objects/yavin/grass_b`/`plant`/`vines`/`tree09a`/
+// `tree09b`/`tree09d`, `textures/yavin/ground_grasssprite_phong_vertex`),
+// meaning they were drawn through this renderer's default BLEND_OPAQUE
+// path with no alpha handling whatsoever - solid rectangular sprites
+// instead of alpha-tested cutout grass/vines/tree foliage. hoth2/vjun1 add
+// several real grate shaders (`textures/imperial/grate02_broke`, `textures/
+// vjun/grate`/`grate1`/`grate2`) that combine `alphaFunc` with a real
+// `blendFunc GL_ONE GL_ZERO` (already classified BLEND_OPAQUE, since that
+// exact pair is real Quake3's own "blending explicitly disabled" spelling -
+// see BlendFactorsToMode's comment) - same underlying gap, just already
+// correctly opaque-classified rather than needing a blend-mode fix too.
+// See VK_GetShaderAlphaFunc and world.frag's real discard logic (gated on
+// the shared `uvScale.w` push-constant slot, previously unused padding -
+// see vkWorldPushConstants_t's own comment, tr_local.h) for the actual fix.
+static std::unordered_map<std::string, int> s_shaderAlphaFunc;
+
 static vkBlendMode_t BlendFactorsToMode( const char *src, const char *dst )
 {
 	if ( !Q_stricmp( src, "GL_ONE" ) && !Q_stricmp( dst, "GL_ONE" ) )
@@ -225,6 +248,7 @@ static void ParseShaderFile( const char *text )
 		bool tcGenEnvironment = false;
 		std::string mapImage;
 		bool clampMap = false;
+		int alphaFuncMode = 0;
 
 		while ( depth > 0 )
 		{
@@ -417,6 +441,34 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
+			// `alphaFunc <GT0|LT128|GE128|GE192>` - real per-pixel alpha
+			// testing (a hard discard, not blending) real Quake3 uses for
+			// cutout foliage/grates. See s_shaderAlphaFunc's own comment for
+			// the real, confirmed-visible bug this fixes and the exact
+			// threshold values (matched against rd-vanilla's own
+			// NameToAFunc/qglAlphaFunc calls, not guessed).
+			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "alphaFunc" ) )
+			{
+				const char *func = COM_ParseExt( &p, qfalse );
+				if ( !Q_stricmp( func, "GT0" ) )
+				{
+					alphaFuncMode = 1;
+				}
+				else if ( !Q_stricmp( func, "LT128" ) )
+				{
+					alphaFuncMode = 2;
+				}
+				else if ( !Q_stricmp( func, "GE128" ) )
+				{
+					alphaFuncMode = 3;
+				}
+				else if ( !Q_stricmp( func, "GE192" ) )
+				{
+					alphaFuncMode = 4;
+				}
+				continue;
+			}
+
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "blendFunc" ) )
 			{
 				// COM_ParseExt returns a pointer into its own single static
@@ -513,6 +565,10 @@ static void ParseShaderFile( const char *text )
 		if ( tcGenEnvironment && s_shaderTcGenEnvironment.find( name ) == s_shaderTcGenEnvironment.end() )
 		{
 			s_shaderTcGenEnvironment[name] = true;
+		}
+		if ( alphaFuncMode != 0 && s_shaderAlphaFunc.find( name ) == s_shaderAlphaFunc.end() )
+		{
+			s_shaderAlphaFunc[name] = alphaFuncMode;
 		}
 	}
 
@@ -793,4 +849,16 @@ bool VK_GetShaderClampMap( const char *name )
 
 	auto it = s_shaderClampMap.find( VK_StripShaderNameExtension( name ) );
 	return it != s_shaderClampMap.end() && it->second;
+}
+
+// A shader's first stage's `alphaFunc` mode (0 = none) - see
+// s_shaderAlphaFunc's own comment for what each nonzero value means and the
+// real bug this fixes. RE_LoadWorldMap (tr_world.cpp), the only caller,
+// stores this per-batch for world.frag's real discard logic.
+int VK_GetShaderAlphaFunc( const char *name )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderAlphaFunc.find( VK_StripShaderNameExtension( name ) );
+	return it != s_shaderAlphaFunc.end() ? it->second : 0;
 }

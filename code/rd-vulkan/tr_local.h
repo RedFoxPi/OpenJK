@@ -263,16 +263,22 @@ struct PolyVertex
 // - 1.0 makes world.vert ignore inUV/uvScale.xy entirely and instead
 // generate UVs per-vertex from the vertex normal and camPos (real
 // RB_CalcEnvironmentTexCoords, rd-vanilla's tr_shade_calc.cpp); 0.0 (the
-// common case) draws ordinary UVs exactly as before. uvScale.w is unused
-// padding. Every call site must set camPos[3] AND uvScale.xy explicitly -
-// a zero-initialized push (`= {}`) defaults camPos[3] to 0.0 (multiplies
-// the surface to solid black, not "no overbright") and uvScale.xy to
-// 0.0,0.0 (multiplies every UV to (0,0), not "no rescale") - both are
-// silent-black/silent-wrong-texture bugs, not crashes, so a missed call
-// site is easy to overlook without a direct screenshot check. uvScale.z
-// is safe to leave at a zero-initialized push's default 0.0 (ordinary UVs,
-// the correct behaviour for every call site except world geometry's own
-// per-batch loop, which sets it explicitly either way for clarity).
+// common case) draws ordinary UVs exactly as before. uvScale.w is this
+// batch's `alphaFunc` mode (VK_GetShaderAlphaFunc, tr_shader.cpp: 0=none,
+// 1=GT0, 2=LT128, 3=GE128, 4=GE192 - real rd-vanilla threshold values,
+// see that function's own comment) - world.frag discards a fragment
+// whose diffuse alpha fails the real per-mode comparison; 0.0 (the common
+// case) skips the test entirely, drawing exactly as before. Every call
+// site must set camPos[3] AND uvScale.xy explicitly - a zero-initialized
+// push (`= {}`) defaults camPos[3] to 0.0 (multiplies the surface to solid
+// black, not "no overbright") and uvScale.xy to 0.0,0.0 (multiplies every
+// UV to (0,0), not "no rescale") - both are silent-black/silent-wrong-
+// texture bugs, not crashes, so a missed call site is easy to overlook
+// without a direct screenshot check. uvScale.z and uvScale.w are both
+// safe to leave at a zero-initialized push's default 0.0 (ordinary UVs, no
+// alpha test - the correct behaviour for every call site except world
+// geometry's own per-batch loop, which sets both explicitly either way for
+// clarity).
 struct vkWorldPushConstants_t
 {
 	float mvp[16];
@@ -712,6 +718,10 @@ const char *VK_GetShaderMapImage( const char *name );
 // this function's own comment (tr_shader.cpp) and RE_LoadWorldMap
 // (tr_world.cpp), the only caller, for the real bug this fixes.
 bool VK_GetShaderClampMap( const char *name );
+// A shader's first stage's `alphaFunc` mode (0=none, 1=GT0, 2=LT128,
+// 3=GE128, 4=GE192) - see this function's own comment (tr_shader.cpp) and
+// RE_LoadWorldMap/world.frag (the real consumer) for the actual fix.
+int VK_GetShaderAlphaFunc( const char *name );
 // First stage's `alphaGen portal <range>` numeric argument, or rd-vanilla's
 // own RB_SurfaceFlare default (30) if absent - see this function's own
 // comment (tr_shader.cpp) and RE_LoadWorldMap's MST_FLARE handling

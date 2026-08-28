@@ -17,6 +17,12 @@ layout(push_constant) uniform PushConstants {
     // scroll UV offset, already applied to fragUV in world.vert - not read
     // here
     vec4 fogStart;
+    // xyz not read here (tcMod scale/tcGen-environment flag, both fully
+    // handled in world.vert already - see vkWorldPushConstants_t's own
+    // comment, tr_local.h). w = this batch's real alphaFunc mode (0=none,
+    // 1=GT0, 2=LT128, 3=GE128, 4=GE192) - see VK_GetShaderAlphaFunc's own
+    // comment (tr_shader.cpp) for what each real mode means.
+    vec4 uvScale;
 } pc;
 
 void main() {
@@ -43,6 +49,20 @@ void main() {
     // default is correct rather than a placeholder, and why no shader-side
     // branch is needed to tell the two cases apart.
     vec4 diffuse = texture(diffuseTex, fragUV);
+
+    // Real per-pixel alpha testing (rd-vanilla's qglAlphaFunc, not
+    // blending) - a hard discard, applied before any lightmap/fog work so a
+    // discarded fragment costs nothing beyond the diffuse sample above.
+    // Real threshold values, checked directly against tr_backend.cpp's own
+    // GLS_ATEST_* cases (tr_shader.cpp's alphaFunc parsing comment has the
+    // full story) - 0 (the common case, no test) never enters any branch
+    // below.
+    int alphaFuncMode = int(pc.uvScale.w + 0.5);
+    if ( alphaFuncMode == 1 && diffuse.a <= 0.0 ) discard;
+    else if ( alphaFuncMode == 2 && diffuse.a >= 0.5 ) discard;
+    else if ( alphaFuncMode == 3 && diffuse.a < 0.5 ) discard;
+    else if ( alphaFuncMode == 4 && diffuse.a < 0.75 ) discard;
+
     vec4 lightmap = texture(lightmapTex, fragLightmapUV);
     vec3 shaded = diffuse.rgb * lightmap.rgb * fragColor.rgb * pc.camPos.w;
 
