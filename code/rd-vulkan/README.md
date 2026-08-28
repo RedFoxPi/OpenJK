@@ -3807,6 +3807,80 @@ a wrong-static-texture bug for `basicltgray_shiny` and an outright-invisible
 bug for `env_glass`/`glass_security_*`, without touching any of the 23
 already-correct surfaces).
 
+## `RE_DrawRotatePic`/`RE_DrawRotatePic2` (rotated 2D pics)
+
+Closes a real gap: both were stubs that silently dropped the rotation angle
+and fell back to an ordinary unrotated `RE_StretchPic`, so any caller
+relying on the rotation would draw its quad in the wrong place/orientation
+rather than crash or look obviously broken - the "silently wrong, not
+loud" failure shape this project has hit before (`camPos[3]`/`uvScale`, see
+their own comments).
+
+**Real callers, checked directly rather than assumed unused**: three call
+sites across the SP `cgame` module, all real gameplay HUD elements, not
+menu/UI-script driven: the seeker-missile lock-on warning (`cg_draw.cpp`,
+`CG_DrawRotatePic` - up to 8 `gfx/2d/wedge` slices stepped 45 degrees apart,
+building up as a seeker missile's lock gets closer) and the Disruptor
+rifle's zoomed-scope overlay (`CG_DrawRotatePic2`, twice - the full-screen
+`disruptorInsert` reticle graphic rotated by the current zoom level, plus a
+ring of small `disruptorInsertTick` ammo-count marks each rotated to face
+outward around a circle). All three are real, substantial, visually
+distinct uses - not a corner case.
+
+**Why this couldn't be screenshot-verified the way most other features in
+this file are**: all three are gated on a transient gameplay state (an
+active seeker-missile lock, or actually being zoomed in with the Disruptor
+equipped) that this renderer's fixed test harness - `+devmap <map>` then a
+timed wait then a screenshot, no live input - never reaches; none of the 4
+regression scenes' spawn-camera screenshots call either function at all,
+so a before/after pixel diff of those scenes is guaranteed pixel-identical
+regardless of whether this fix is correct (confirmed: full regression suite
+unaffected, all 5 scenes identical). Attempted to force the state directly
+for a real screenshot (`+give all`/`+weapon 4`/`+altattack` via the same
+`setviewpos`-style manual console-command approach used for `tcGen
+environment` above) - `+altattack` reports "Unknown command" this early in
+the real client's command-buffer sequence in this headless configuration
+(input command registration ordering, not a renderer issue), and forcing
+`cg.zoomMode` any other way needs real per-frame held-button `usercmd`
+simulation this harness has no support for. Not pursued further given the
+verification basis below is already strong for a self-contained, formula-
+exact port.
+
+**Real formula**, ported directly from rd-vanilla's `RB_RotatePic`/
+`RB_RotatePic2` (`tr_backend.cpp`), algebraically re-derived and checked
+term-by-term against the source rather than approximated: both build a 2x3
+rotation-plus-translation matrix (`c,s,0 / -s,c,0 / tx,ty,1`, `c`/`s` =
+`cos`/`sin` of the angle in radians) and apply it to the quad's 4 corners.
+`RotatePic` pivots around the corner `(x+w, y)` (vertex 1 always lands
+exactly on the pivot; angle 0 reproduces `RE_StretchPic`'s own 4 corners
+exactly, confirmed by substitution). `RotatePic2` pivots around the quad's
+own *center* `(x, y)` instead, with corners offset by `±w/2`/`±h/2` before
+rotation - the natural convention for something that should visually spin
+in place, like the disruptor scope.
+
+**Implementation**: `RE_StretchPic` (`tr_cmds.cpp`) already built its 6
+vertices from 4 corner positions and pushed them through one small,
+self-contained block (pipeline selection by blend mode, descriptor bind,
+push-constant color, draw call) - refactored that block out into a new
+`VK_DrawQuad( x0,y0,u0,v0, x1,y1,u1,v1, x2,y2,u2,v2, x3,y3,u3,v3, hShader )`
+taking 4 arbitrary corners instead of an implicit axis-aligned rect, with
+`RE_StretchPic` itself becoming a 1-line caller. `RE_DrawRotatePic`/
+`RE_DrawRotatePic2` (`tr_init.cpp`) compute the real rotated corners per
+the formulas above and call the same `VK_DrawQuad` - no new pipeline, no
+new vertex format, this is a pure geometry change reusing 100% of the
+existing 2D UI draw path.
+
+**Verified**: warning-free rebuild, full SP scene suite clean (all 5
+scenes pixel-unaffected, as expected given none of them call either
+function - see above for why). Correctness rests on the exact algebraic
+match against real rd-vanilla source (shown above), not a screenshot - the
+same verification tier this project has already used elsewhere for a
+real, ported-but-unexercised code path (`VK_Ghoul2TimingModel`'s reverse-
+speed playback, "Live animation" above: "ported faithfully...but untested
+against a real scene, since no real caller in this game currently uses
+it" - the same honest standard applied here to a real caller this harness
+just can't reach, not "no caller exists at all").
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -4031,8 +4105,10 @@ already-correct surfaces).
   shader specifically when it has no `tcGen` (see the `rgbGen const`
   section above for exactly why that's the safe line, not blend mode
   alone) - a `BLEND_ALPHA` shader needing the fallback is still unresolved.
-- Cinematics (`DrawStretchRaw`/`UploadCinematic`), rotated pics, dissolves,
-  model bounds/tag queries.
+- Cinematics (`DrawStretchRaw`/`UploadCinematic`), dissolves, model bounds/
+  tag queries. Rotated pics (`RE_DrawRotatePic`/`RE_DrawRotatePic2`) *are*
+  real now - see "`RE_DrawRotatePic`/`RE_DrawRotatePic2` (rotated 2D pics)"
+  above.
 
 ## Ghoul2 is not reused from rd-vanilla
 

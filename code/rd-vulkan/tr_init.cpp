@@ -1513,16 +1513,58 @@ qboolean RE_GetLighting( const vec3_t org, vec3_t ambientLight, vec3_t directedL
 	VectorSet( lightDir, 0.f, 0.f, 1.f );
 	return qfalse;
 }
+// Real formula ported directly from rd-vanilla's RB_RotatePic (tr_backend.cpp),
+// not a guess: rotates a w*h quad by `a1` degrees around the pivot (x+w, y) -
+// the same "one corner of the unrotated rect stays fixed" convention real
+// vanilla uses (a1=0 reproduces RE_StretchPic's own 4 corners exactly, since
+// vertex1 always lands on the pivot itself). Real callers: the seeker-missile
+// lock-on warning wedges (cg_draw.cpp, CG_DrawRotatePic - 8 wedges stepped 45
+// degrees apart) - only active while an actual seeker missile is tracking the
+// player, a transient gameplay condition this renderer's fixed spawn-screenshot
+// regression scenes never trigger, so this couldn't be verified via that
+// harness; verified instead by exact formula match against the real source
+// plus a clean warning-free build and full regression suite pass (no crashes,
+// no visible change to any of the 4 fixed scenes, none of which call this).
 void RE_DrawRotatePic( float x, float y, float w, float h, float s1, float t1, float s2, float t2, float a1, qhandle_t hShader )
 {
-	// not implemented yet - falls back to an unrotated stretch pic so callers still see *something*
-	(void)a1;
-	RE_StretchPic( x, y, w, h, s1, t1, s2, t2, hShader );
+	float angle = DEG2RAD( a1 );
+	float c = cosf( angle );
+	float s = sinf( angle );
+	float tx = x + w;
+	float ty = y;
+
+	float v0x = c * -w + tx, v0y = s * -w + ty;
+	float v1x = tx, v1y = ty;
+	float v2x = -s * h + tx, v2y = c * h + ty;
+	float v3x = c * -w - s * h + tx, v3y = s * -w + c * h + ty;
+
+	VK_DrawQuad( v0x, v0y, s1, t1, v1x, v1y, s2, t1, v2x, v2y, s2, t2, v3x, v3y, s1, t2, hShader );
 }
+// Real formula ported directly from rd-vanilla's RB_RotatePic2
+// (tr_backend.cpp) - rotates a w*h quad by `a1` degrees around its own
+// *center* (x, y), unlike RE_DrawRotatePic's corner pivot above. Real
+// callers: the Disruptor rifle's zoomed-scope overlay (cg_draw.cpp - the
+// full-screen `disruptorInsert` reticle graphic, rotated by the current zoom
+// level, plus a ring of small `disruptorInsertTick` ammo marks each rotated
+// to face outward) - only active while actually zoomed in with that specific
+// weapon equipped, again a transient gameplay state this renderer's fixed
+// spawn-screenshot scenes never reach, so not directly screenshot-verified -
+// same verification basis as RE_DrawRotatePic above (exact formula match,
+// clean build, full regression suite unaffected).
 void RE_DrawRotatePic2( float x, float y, float w, float h, float s1, float t1, float s2, float t2, float a1, qhandle_t hShader )
 {
-	(void)a1;
-	RE_StretchPic( x, y, w, h, s1, t1, s2, t2, hShader );
+	float angle = DEG2RAD( a1 );
+	float c = cosf( angle );
+	float s = sinf( angle );
+	float halfW = w * 0.5f;
+	float halfH = h * 0.5f;
+
+	float v0x = c * -halfW + -s * -halfH + x, v0y = s * -halfW + c * -halfH + y;
+	float v1x = c * halfW + -s * -halfH + x, v1y = s * halfW + c * -halfH + y;
+	float v2x = c * halfW + -s * halfH + x, v2y = s * halfW + c * halfH + y;
+	float v3x = c * -halfW + -s * halfH + x, v3y = s * -halfW + c * halfH + y;
+
+	VK_DrawQuad( v0x, v0y, s1, t1, v1x, v1y, s2, t1, v2x, v2y, s2, t2, v3x, v3y, s1, t2, hShader );
 }
 void RE_LAGoggles( void ) {}
 void RE_Scissor( float x, float y, float w, float h ) { (void)x; (void)y; (void)w; (void)h; }

@@ -52,7 +52,18 @@ void RE_SetColor( const float *rgba )
 	}
 }
 
-void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, float s2, float t2, qhandle_t hShader )
+// Shared quad submission for every 2D draw path (RE_StretchPic and, below,
+// RE_DrawRotatePic/RE_DrawRotatePic2 - tr_init.cpp) - the only difference
+// between them is how the 4 corner positions are computed; the pipeline
+// selection/descriptor/push-constant/draw-call mechanics are identical.
+// Corners are wound 0-1-2-3 (the same order RE_StretchPic always used) -
+// harmless regardless of actual winding, since every 2D pipeline draws with
+// VK_CULL_MODE_NONE (see VK_CreateUIPipeline's comment, tr_init.cpp).
+void VK_DrawQuad( float x0, float y0, float u0, float v0,
+	float x1, float y1, float u1, float v1,
+	float x2, float y2, float u2, float v2,
+	float x3, float y3, float u3, float v3,
+	qhandle_t hShader )
 {
 	if ( !vk.frameActive )
 	{
@@ -72,12 +83,12 @@ void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, floa
 	}
 
 	UiVertex *verts = (UiVertex *)vk.uiVertexBufferMapped + s_uiVertexCursor;
-	verts[0] = { { x,     y     }, { s1, t1 } };
-	verts[1] = { { x + w, y     }, { s2, t1 } };
-	verts[2] = { { x + w, y + h }, { s2, t2 } };
-	verts[3] = { { x,     y     }, { s1, t1 } };
-	verts[4] = { { x + w, y + h }, { s2, t2 } };
-	verts[5] = { { x,     y + h }, { s1, t2 } };
+	verts[0] = { { x0, y0 }, { u0, v0 } };
+	verts[1] = { { x1, y1 }, { u1, v1 } };
+	verts[2] = { { x2, y2 }, { u2, v2 } };
+	verts[3] = { { x0, y0 }, { u0, v0 } };
+	verts[4] = { { x2, y2 }, { u2, v2 } };
+	verts[5] = { { x3, y3 }, { u3, v3 } };
 
 	VkCommandBuffer cmd = vk.activeCommandBuffer;
 
@@ -111,6 +122,11 @@ void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, floa
 	vkCmdDraw( cmd, 6, 1, 0, 0 );
 
 	s_uiVertexCursor += 6;
+}
+
+void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, float s2, float t2, qhandle_t hShader )
+{
+	VK_DrawQuad( x, y, s1, t1, x + w, y, s2, t1, x + w, y + h, s2, t2, x, y + h, s1, t2, hShader );
 }
 
 void RE_BeginFrame( stereoFrame_t stereoFrame )

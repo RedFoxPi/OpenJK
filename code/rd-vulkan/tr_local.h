@@ -782,6 +782,14 @@ qhandle_t RE_RegisterShader( const char *name );
 
 // tr_cmds.cpp
 void RE_StretchPic( float x, float y, float w, float h, float s1, float t1, float s2, float t2, qhandle_t hShader );
+// Shared 2D quad submission (arbitrary 4 corners, not just axis-aligned) -
+// RE_StretchPic's own real implementation, and RE_DrawRotatePic/
+// RE_DrawRotatePic2's real callers (tr_init.cpp), both reduce to this.
+void VK_DrawQuad( float x0, float y0, float u0, float v0,
+	float x1, float y1, float u1, float v1,
+	float x2, float y2, float u2, float v2,
+	float x3, float y3, float u3, float v3,
+	qhandle_t hShader );
 void RE_SetColor( const float *rgba );
 void RE_BeginFrame( stereoFrame_t stereoFrame );
 void RE_EndFrame( int *frontEndMsec, int *backEndMsec );
