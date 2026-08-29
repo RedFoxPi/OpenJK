@@ -4547,7 +4547,22 @@ to several features above (e.g. `tcMod turb`'s vjun1 hit).
   themselves" as documented, and a finer per-shader `sort` value would only
   refine that same already-accepted simplification rather than close a
   distinct gap, so it wasn't pursued further), and `skyparms` are still
-  ignored. `rgbGen lightingDiffuse` has real
+  ignored. `alphaGen wave` and non-`sin` `rgbGen wave` functions were
+  checked directly (first-stage-only, all 4 test maps) and have zero real
+  matches, cleanly ruling both out the same way `tcMod rotate`'s
+  investigation did. `deformVertexes` has exactly one real match on this
+  checkout's test maps - vjun1's `textures/flares/flare_bluehue`,
+  `deformVertexes autoSprite` (turn independent quads into camera-facing
+  billboards) - and needs no separate implementation: this renderer's real
+  flare draw path (`VK_DrawWorldFlares`, see "Static flares" above) already
+  constructs each flare as a per-pixel depth-tested camera-facing quad by
+  design, which is exactly what `autoSprite` asks for, confirmed by reading
+  that function's own quad-orientation math rather than assumed. `skyparms`'s
+  basename-mismatch scenario (see "Proper sky rendering" below) was also
+  checked directly against every real sky shader definition in this
+  checkout's shader library - none of the 4 test maps' own sky shaders
+  hit it, so implementing `skyparms` parsing now would fix nothing
+  observable on any scene this project currently verifies against. `rgbGen lightingDiffuse` has real
   per-map matches but was investigated and explicitly declined, not just
   left alone - see "`rgbGen lightingDiffuse` investigated and declined"
   above for why (a real BSP `LUMP_LIGHTGRID` subsystem this renderer
