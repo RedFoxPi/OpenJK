@@ -4162,6 +4162,78 @@ that scene, so - same as several features immediately above - the
 debug-log confirmation is the primary evidence here, not the whole-frame
 screenshot diff.
 
+## `rgbGen lightingDiffuse` investigated and declined (real usage exists, but not a safe or well-scoped fix)
+
+Same evidence bar as `rgbGen exactVertex` and `tcMod rotate` above: real
+per-map usage exists, but implementing it correctly is either architecturally
+out of scope for one step or would deliberately make a currently-fine-looking
+surface render solid black, and neither risk is worth taking without much
+stronger evidence than this project's own harness can currently produce.
+
+**Real usage found** (BSP `LUMP_SHADERS`, first-stage-only, same
+methodology as every feature above): hoth2's `models/map_objects/hoth/
+ion_nut` and `textures/hoth/instance_stack`; yavin1's `models/map_objects/
+danger/ship_item01`/`ship_item04` and `textures/yavin/grass_b` (one of the
+foliage shaders `alphaFunc` above already fixed). The first group
+(`map_objects/...`) are static `.md3` props with a real per-instance
+ref-entity in this renderer already (see "Real `R_ModelBounds`" above);
+`instance_stack` and `grass_b` are plain `textures/...`-named surfaces
+compiled directly into the BSP, with no per-entity concept at all in this
+renderer's `RE_LoadWorldMap`/`RE_RenderScene` path.
+
+**Real formula**, read directly from rd-vanilla's own `RB_CalcDiffuseColor`
+(`tr_shade_calc.cpp`): per vertex, `incoming = dot(normal, ent->lightDir)`;
+if `incoming <= 0`, the vertex colour is just `ent->ambientLightInt` (a
+packed RGBA); otherwise it's `ent->ambientLight + incoming *
+ent->directedLight` per channel, clamped to 255. `ent->ambientLight`/
+`directedLight`/`lightDir` come from `R_SetupEntityLightingGrid`
+(`tr_light.cpp`) - a trilinear sample of the BSP's `LUMP_LIGHTGRID` at the
+entity's world-space origin, decoding a packed lat/long normal for
+`lightDir` and looking up per-lightgrid-cell ambient/directed colours.
+This renderer parses no BSP lump named `LIGHTGRID` at all today - it would
+be a genuinely new subsystem (grid-origin/size/bounds header fields, the
+per-cell ambient/directed/latLong data, and the trilinear sampling itself),
+not a one-file addition like every gap closed so far this window.
+
+**The surprising real finding, worth recording on its own**: tracing where
+`ent->ambientLight`/`directedLight`/`lightDir` actually get set for *world*
+BSP-surface draws (as opposed to real ref-entities) turned up something not
+obvious from reading `RB_CalcDiffuseColor` in isolation. `RB_RenderDrawSurfList`
+(`tr_backend.cpp`) points `backEnd.currentEntity` straight at `&tr.worldEntity`
+for any surface whose `entityNum == REFENTITYNUM_WORLD` - it never calls
+`R_SetupEntityLighting` on it. Grepping all of `rd-vanilla` for every write to
+`tr.worldEntity`'s fields turns up exactly two places, both just the pointer
+assignment (`tr_backend.cpp:671,799`) - nothing ever populates its
+`ambientLight`/`directedLight`/`lightDir`/`ambientLightInt`, so they sit at
+their static zero-initialized values for the entire life of the process.
+Fed back into the real formula above: `lightDir = (0,0,0)` makes
+`incoming = dot(normal, lightDir) = 0` for literally every vertex, on every
+world surface, always taking the `incoming <= 0` branch, and
+`ambientLightInt` is `0` (RGBA all zero, including alpha). That means real
+vanilla's own `rgbGen lightingDiffuse`, applied to a plain world-BSP surface
+like `grass_b` or `instance_stack`, evaluates to a fully transparent black
+vertex colour for every vertex - a real, load-bearing quirk of the engine's
+entity/world lighting split, not a hypothetical edge case.
+
+**Why this isn't shipped**: two very different fixes hide under one
+keyword, and neither clears this project's own bar cleanly. For the
+`map_objects/...` static-prop matches, a correct implementation needs the
+full light-grid subsystem above - real, but too large to land as one
+"small step," and speculative without first confirming a real vanilla
+screenshot actually shows visibly different (grid-sampled, non-flat)
+shading on `ion_nut`/`ship_item01` today. For the plain-world-surface
+matches, a *literal* port of the real formula would turn `grass_b` and
+`instance_stack` solid black - which may well be exactly what real vanilla
+does (the trace above is direct, not inferred), but shipping a change that
+makes currently-reasonable-looking geometry render black, on the strength
+of source-reading alone with no real-vanilla screenshot confirming the
+BSP surfaces in question look that way, is the kind of poorly-evidenced
+change this project's own rules say to decline rather than ship. Revisit
+if a later `LUMP_LIGHTGRID` pass (undertaken for its own sake, e.g. for
+real Ghoul2/static-model ambient lighting generally) makes the grid data
+available and a real-vanilla screenshot of `grass_b`/`instance_stack`
+can be captured and inspected directly.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -4380,7 +4452,13 @@ screenshot diff.
   vector` - no real per-map match on this checkout's test maps for either,
   see the `tcMod rotate` investigation's methodology), `rgbGen
   identityLighting`/`vertex`/non-`sin` wave functions, `alphaGen` waves,
-  and `skyparms` are still ignored. World geometry does now get real
+  and `skyparms` are still ignored. `rgbGen lightingDiffuse` has real
+  per-map matches but was investigated and explicitly declined, not just
+  left alone - see "`rgbGen lightingDiffuse` investigated and declined"
+  above for why (a real BSP `LUMP_LIGHTGRID` subsystem this renderer
+  doesn't have, plus a genuine risk of matching real vanilla's own
+  degenerate solid-black output for plain world-BSP surfaces without
+  screenshot confirmation that's actually correct). World geometry does now get real
   blend-mode selection (see "World geometry blend modes" above) for a
   shader whose own
   name directly resolves to a texture file, and the map-image fallback (see
