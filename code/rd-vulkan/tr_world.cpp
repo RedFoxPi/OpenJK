@@ -165,6 +165,18 @@ struct WorldSurfaceBatch
 	// appended last, same positional-aggregate-init reason as scaleS/
 	// scaleT/envMap/alphaFunc above.
 	float turbAmplitude = 0.0f, turbPhase = 0.0f, turbFrequency = 0.0f;
+	// This surface's shader's first-stage real `depthWrite` override
+	// (VK_GetShaderDepthWrite, tr_shader.cpp) - false (the default
+	// depth-write-off-while-blended behaviour, see vk.worldPipelineAlpha's
+	// own comment) for the common case. Confirmed real, if narrow, usage -
+	// see s_shaderDepthWrite's own comment (tr_shader.cpp) for the exact
+	// shaders and how each was confirmed. Only ever true for a BLEND_ALPHA
+	// batch on this checkout's test maps (see
+	// vk.worldPipelineAlphaDepthWrite's own comment for why there's no
+	// additive equivalent) - RE_RenderScene's pipeline selection reflects
+	// that. Deliberately appended last, same positional-aggregate-init
+	// reason as scaleS/scaleT/envMap/alphaFunc/turb above.
+	bool depthWrite = false;
 };
 
 static std::vector<WorldSurfaceBatch> s_worldSurfaces;
@@ -1302,7 +1314,8 @@ void RE_LoadWorldMap( const char *name )
 			{ mins[0], mins[1], mins[2] }, { maxs[0], maxs[1], maxs[2] }, lightmapNum < 0, fogIndex,
 			scrollS, scrollT, blendMode, scaleS, scaleT, envMap,
 			VK_GetShaderAlphaFunc( shaders[surf.shaderNum].shader ),
-			turbAmplitude, turbPhase, turbFrequency } );
+			turbAmplitude, turbPhase, turbFrequency,
+			VK_GetShaderDepthWrite( shaders[surf.shaderNum].shader ) } );
 	}
 
 	ri.FS_FreeFile( buffer );
@@ -1329,7 +1342,16 @@ void RE_LoadWorldMap( const char *name )
 		[]( const WorldSurfaceBatch &a, const WorldSurfaceBatch &b )
 		{
 			auto rank = []( vkBlendMode_t m ) { return m == BLEND_OPAQUE ? 0 : ( m == BLEND_ALPHA ? 1 : 2 ); };
-			return rank( a.blendMode ) < rank( b.blendMode );
+			if ( rank( a.blendMode ) != rank( b.blendMode ) )
+			{
+				return rank( a.blendMode ) < rank( b.blendMode );
+			}
+			// Secondary key: group real `depthWrite` batches (see
+			// WorldSurfaceBatch::depthWrite's own comment) to the end of the
+			// BLEND_ALPHA run, keeping RE_RenderScene's pipeline-switch count
+			// close to its documented handful-per-frame bound instead of
+			// scattering worldPipelineAlphaDepthWrite switches throughout it.
+			return a.depthWrite < b.depthWrite;
 		} );
 
 	VK_UploadDeviceLocalBuffer( cpuVerts.data(), cpuVerts.size() * sizeof( WorldVertex ),
@@ -1861,9 +1883,17 @@ void RE_RenderScene( const refdef_t *fd )
 			continue;
 		}
 		// s_worldSurfaces is sorted by blend mode (RE_LoadWorldMap), so this
-		// switches at most twice per frame in practice, not per-batch - see
-		// WorldSurfaceBatch::blendMode's own comment.
-		VkPipeline pipeline = ( batch.blendMode == BLEND_ALPHA ) ? vk.worldPipelineAlpha
+		// switches at most a handful of times per frame in practice, not
+		// per-batch - see WorldSurfaceBatch::blendMode's own comment. Real
+		// `depthWrite` batches (WorldSurfaceBatch::depthWrite - see its own
+		// comment) aren't separately sorted out from the rest of the
+		// BLEND_ALPHA range, so on a map with one of the 3 real matches this
+		// closes, expect one or two extra switches into/out of
+		// worldPipelineAlphaDepthWrite rather than a strict two-total bound -
+		// an accepted, minor cost for how rare real usage is, not worth a
+		// second sort key over.
+		VkPipeline pipeline = ( batch.blendMode == BLEND_ALPHA )
+			? ( batch.depthWrite ? vk.worldPipelineAlphaDepthWrite : vk.worldPipelineAlpha )
 			: ( batch.blendMode == BLEND_ADDITIVE ) ? vk.worldPipelineAdditive : vk.worldPipeline;
 		if ( pipeline != vk.lastBoundPipeline )
 		{

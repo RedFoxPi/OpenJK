@@ -376,13 +376,28 @@ typedef struct
 	// VkPipeline, selected per-batch in RE_RenderScene the same way
 	// vertexLit/fogIndex/scroll already are. Depth-tested against opaque
 	// geometry (so a translucent surface is still occluded by a wall in
-	// front of it) but doesn't write depth itself - the common, simple
-	// approximation for translucent geometry this renderer already uses
-	// for runtime polys (vk.polyPipeline's own comment), not per-shader
-	// real depth-write control or back-to-front sorting between
-	// translucent surfaces.
+	// front of it) but doesn't write depth itself by default - the common,
+	// simple approximation for translucent geometry this renderer already
+	// uses for runtime polys (vk.polyPipeline's own comment), not a full
+	// back-to-front sort between translucent surfaces themselves. A real
+	// per-shader `depthWrite` keyword override *is* implemented now though
+	// (see "Real `depthWrite` for world geometry" in README.md) -
+	// worldPipelineAlphaDepthWrite below.
 	VkPipeline worldPipelineAlpha = VK_NULL_HANDLE;    // BLEND_ALPHA
 	VkPipeline worldPipelineAdditive = VK_NULL_HANDLE; // BLEND_ADDITIVE
+	// Same blend factors as worldPipelineAlpha, but depth-tests AND writes
+	// depth (like the opaque worldPipeline) - real shaders that declare both
+	// `blendFunc` and `depthWrite` together (e.g. hoth2's `textures/
+	// imperial/grate02`, yavin1's `textures/bounty/flag2` - alpha-tested/
+	// blended grates and a hanging flag that still need to occlude geometry
+	// behind them) need this, not worldPipelineAlpha's default
+	// depth-write-off behavior. No real BLEND_ADDITIVE + depthWrite match
+	// exists on this checkout's test maps, so there's no equivalent additive
+	// variant - see VK_GetShaderDepthWrite's/s_shaderDepthWrite's own
+	// comments (tr_shader.cpp) for the full list of real matches (including
+	// one, `T2_Wedge_floorgrate`, that's a documented no-op here for an
+	// unrelated reason).
+	VkPipeline worldPipelineAlphaDepthWrite = VK_NULL_HANDLE;
 	VkSampler worldSampler = VK_NULL_HANDLE;
 	// Real `clampmap` addressing - see VK_GetShaderClampMap's own comment
 	// (tr_shader.cpp) and VK_BuildWorldDescriptorSet (tr_world.cpp), the
@@ -745,6 +760,10 @@ bool VK_GetShaderClampMap( const char *name );
 // 3=GE128, 4=GE192) - see this function's own comment (tr_shader.cpp) and
 // RE_LoadWorldMap/world.frag (the real consumer) for the actual fix.
 int VK_GetShaderAlphaFunc( const char *name );
+// A shader's first stage's real `depthWrite` override (false=none, the
+// common case) - see this function's own comment (tr_shader.cpp) and
+// RE_LoadWorldMap/RE_RenderScene (the real consumers) for the actual fix.
+bool VK_GetShaderDepthWrite( const char *name );
 // First stage's `alphaGen portal <range>` numeric argument, or rd-vanilla's
 // own RB_SurfaceFlare default (30) if absent - see this function's own
 // comment (tr_shader.cpp) and RE_LoadWorldMap's MST_FLARE handling

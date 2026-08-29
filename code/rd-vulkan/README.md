@@ -4234,6 +4234,94 @@ real Ghoul2/static-model ambient lighting generally) makes the grid data
 available and a real-vanilla screenshot of `grass_b`/`instance_stack`
 can be captured and inspected directly.
 
+## Real `depthWrite` for world geometry
+
+Closes another real gap, found while investigating `sort` (draw-order
+override) and `depthWrite` as the next candidates after `rgbGen
+lightingDiffuse` above - `sort` turned out to duplicate a simplification
+this renderer already documents and accepts (see
+`vk.worldPipelineAlpha`'s own comment: no full back-to-front sort between
+translucent surfaces, same as the existing runtime-poly rendering), so it
+wasn't pursued further, but `depthWrite` turned up real, previously-unhandled
+usage.
+
+**Real formula**, read directly from rd-vanilla's own shader parser
+(`tr_shader.cpp` `ParseStage`): a stage's default is `depthMaskBits =
+GLS_DEPTHMASK_TRUE` (write depth), but the moment a real `blendFunc` is
+parsed, `depthMaskBits` is reset to `0` (no write) *unless* `depthWrite` was
+already declared earlier in the same stage, in which case it stays on. In
+other words: `depthWrite` is specifically for a blended stage that still
+needs to write depth (so it correctly occludes geometry drawn after it),
+overriding the "blended surfaces don't write depth" default.
+
+**Real usage found** (BSP `LUMP_SHADERS`, first-stage-only, cross-referenced
+against the real `.shader` scripts): hoth2's `textures/imperial/grate02`
+and yavin1's `textures/bounty/flag2`/`models/map_objects/danger/
+ship_item01`/`models/map_objects/yavin/plant` genuinely combine a real
+`blendFunc` with `depthWrite` and needed this fix - confirmed live, not just
+by reading the `.shader` text, via a temporary debug print (removed before
+committing) inside `RE_LoadWorldMap` that logs exactly which shaders this
+renderer's own code resolves `depthWrite=true` for at real map-load time.
+That same debug print incidentally confirmed two things beyond the basic
+gap: `ship_item01` is a genuine BSP-compiled world surface, not merely an
+entity-instanced static prop (it fired from inside the world-surface loading
+loop itself); and `models/map_objects/yavin/plant` - a shader name defined
+three different ways across `models.shader` (twice) and `yavin.shader` (once
+each with a different `rgbGen` and no `blendFunc`/`depthWrite` for the
+`models.shader` two) - resolves through this renderer's own real
+`ri.FS_ListFiles` order to `yavin.shader`'s `blendFunc`+`depthWrite`
+version, the one that actually needs this fix, matching real rd-vanilla's
+own identical resolution mechanism (same "first definition wins" rule
+already documented for `tcMod turb`'s `deathcon1a` collision above).
+Several other apparent `depthWrite` hits were checked and ruled out as false
+positives: `textures/imperial/grate02_broke`, `textures/vjun/grate`/
+`grate1` all pair `depthWrite` with `blendFunc GL_ONE GL_ZERO`, which real
+Quake3 already treats as "blending implicitly disabled" (`BlendFactorsToMode`
+already classifies this exact pair as `BLEND_OPAQUE` - a fix from an earlier
+pass, see "`rgbGen const` and a widened additive map-image fallback" above)
+- opaque surfaces already write depth by default, nothing to override. One
+real match, yavin1's `textures/factory/T2_Wedge_floorgrate`, is a documented
+no-op here for a *different*, pre-existing reason unrelated to this fix: its
+first stage's `map` path (`textures/imperial/floorgrate`) doesn't match its
+own shader name, and the existing map-image-fallback safety gate only covers
+`BLEND_OPAQUE`/`BLEND_ADDITIVE`, not `BLEND_ALPHA` - so this surface is
+currently skipped outright regardless (confirmed absent from the same debug
+print), a gap this fix doesn't touch.
+
+**Implementation**: since this renderer bakes each blend/depth combination
+into a separate `VkPipeline` object rather than toggling depth-write as
+Vulkan dynamic state, a real per-shader override needs its own pipeline
+variant rather than a per-draw flag - `vk.worldPipelineAlphaDepthWrite`
+(`tr_init.cpp`), same blend-attachment state as `vk.worldPipelineAlpha` but
+reusing the opaque pipeline's own depth-stencil state (test *and* write
+both on). No `BLEND_ADDITIVE` equivalent exists, matching the complete
+absence of real additive+depthWrite usage above - adding one now would be
+exactly the kind of speculative, never-exercised code this project avoids.
+`tr_shader.cpp` gained `depthWrite` keyword recognition
+(`VK_GetShaderDepthWrite`), stored only when the shader is genuinely
+`BLEND_ALPHA`/`BLEND_ADDITIVE` (an opaque shader already writes depth, so
+storing `true` for one would be meaningless - and would incorrectly suggest
+the additive pipeline needs a depth-write variant it doesn't).
+`WorldSurfaceBatch` gained a `depthWrite` field (deliberately appended last,
+same positional-aggregate-init convention as every other per-batch field
+here); `RE_LoadWorldMap`'s existing `stable_sort` gained a secondary sort
+key grouping `depthWrite` batches to the end of the `BLEND_ALPHA` run, so
+`RE_RenderScene`'s pipeline-switch count stays close to its documented
+handful-per-frame bound instead of scattering `worldPipelineAlphaDepthWrite`
+switches throughout the alpha range; `RE_RenderScene`'s existing pipeline
+selection now checks `batch.depthWrite` before falling back to the default
+`worldPipelineAlpha`.
+
+**Verified**: warning-free rebuild, full SP scene suite clean on all 5
+scenes (no crashes, no Vulkan validation complaints from the new 5th
+pipeline). The debug-log confirmation above is the primary evidence for
+which real shaders this fixes - `grate02`/`flag2`/`ship_item01`/`plant` are
+narrow, small-area surfaces (a grate, a hanging flag, a prop, a foliage
+clump) whose depth-write correctness affects occlusion ordering against
+other translucent geometry rather than producing a large, easily-diffable
+whole-frame pixel change, the same evidence-tier reasoning already applied
+to several features above (e.g. `tcMod turb`'s vjun1 hit).
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
@@ -4437,14 +4525,15 @@ can be captured and inspected directly.
   (a portal showing a miniature separate scene - a distinct, unimplemented
   feature from the base skybox).
 - Full `.shader` script parsing: only a defined shader's first stage's
-  `map`/`clampmap`/`blendFunc`/`alphaFunc`/`tcMod scroll`/`tcMod scale`/
-  `tcMod turb`/`rgbGen const`/`rgbGen wave sin`/`alphaGen portal <range>`/
-  `tcGen environment` (see "World-geometry tcMod scroll"/"`tcMod scale` for
-  world geometry"/"`rgbGen const` and a widened additive map-image
-  fallback"/"Static flares"/"Real rgbGen const/wave for flares"/"`tcGen
-  environment` (reflection-mapped UV generation)"/"Real `clampmap`
-  addressing"/"Real `alphaFunc` alpha-testing"/"Real `tcMod turb`" above for
-  those), whether it declares any `tcGen` at all (not which kind otherwise -
+  `map`/`clampmap`/`blendFunc`/`alphaFunc`/`depthWrite`/`tcMod scroll`/
+  `tcMod scale`/`tcMod turb`/`rgbGen const`/`rgbGen wave sin`/`alphaGen
+  portal <range>`/`tcGen environment` (see "World-geometry tcMod scroll"/
+  "`tcMod scale` for world geometry"/"`rgbGen const` and a widened additive
+  map-image fallback"/"Static flares"/"Real rgbGen const/wave for flares"/
+  "`tcGen environment` (reflection-mapped UV generation)"/"Real `clampmap`
+  addressing"/"Real `alphaFunc` alpha-testing"/"Real `tcMod turb`"/"Real
+  `depthWrite` for world geometry" above for those), whether it declares any
+  `tcGen` at all (not which kind otherwise -
   see the `rgbGen const` section), and (for fog shaders specifically, see
   "3D world geometry" above) a top-level `fogparms` line, are read - later
   stages, every other `tcMod` type (`rotate`/`stretch`/`transform`/
@@ -4452,7 +4541,13 @@ can be captured and inspected directly.
   vector` - no real per-map match on this checkout's test maps for either,
   see the `tcMod rotate` investigation's methodology), `rgbGen
   identityLighting`/`vertex`/non-`sin` wave functions, `alphaGen` waves,
-  and `skyparms` are still ignored. `rgbGen lightingDiffuse` has real
+  `sort` (a real per-shader draw-order override - considered, not just
+  skipped, but this renderer's existing opaque/alpha/additive rank sort
+  already accepts "no full depth sort between translucent surfaces
+  themselves" as documented, and a finer per-shader `sort` value would only
+  refine that same already-accepted simplification rather than close a
+  distinct gap, so it wasn't pursued further), and `skyparms` are still
+  ignored. `rgbGen lightingDiffuse` has real
   per-map matches but was investigated and explicitly declined, not just
   left alone - see "`rgbGen lightingDiffuse` investigated and declined"
   above for why (a real BSP `LUMP_LIGHTGRID` subsystem this renderer

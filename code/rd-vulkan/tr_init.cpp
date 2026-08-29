@@ -1018,7 +1018,7 @@ static void VK_CreateWorldPipeline( void )
 	dynState.dynamicStateCount = 2;
 	dynState.pDynamicStates = dynStates;
 
-	VkGraphicsPipelineCreateInfo pipeInfos[4] = {};
+	VkGraphicsPipelineCreateInfo pipeInfos[5] = {};
 	pipeInfos[0] = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
 	pipeInfos[0].stageCount = 2;
 	pipeInfos[0].pStages = stages;
@@ -1045,12 +1045,21 @@ static void VK_CreateWorldPipeline( void )
 	pipeInfos[3].pDepthStencilState = &blendDepthStencil;
 	pipeInfos[3].pColorBlendState = &colorBlendAdditive;
 
-	VkPipeline pipelines[4] = {};
-	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 4, pipeInfos, nullptr, pipelines ), "vkCreateGraphicsPipelines (world)" );
+	// Real `depthWrite` keyword override (see vkGlobals_t::worldPipelineAlphaDepthWrite's
+	// own comment) - same alpha blend factors as pipeInfos[2], but reuses the
+	// opaque pipeline's own `depthStencil` (test AND write both on) instead
+	// of `blendDepthStencil`.
+	pipeInfos[4] = pipeInfos[0];
+	pipeInfos[4].pDepthStencilState = &depthStencil;
+	pipeInfos[4].pColorBlendState = &colorBlendAlpha;
+
+	VkPipeline pipelines[5] = {};
+	VK_Check( vkCreateGraphicsPipelines( vk.device, VK_NULL_HANDLE, 5, pipeInfos, nullptr, pipelines ), "vkCreateGraphicsPipelines (world)" );
 	vk.worldPipeline = pipelines[0];
 	vk.skyPipeline = pipelines[1];
 	vk.worldPipelineAlpha = pipelines[2];
 	vk.worldPipelineAdditive = pipelines[3];
+	vk.worldPipelineAlphaDepthWrite = pipelines[4];
 
 	vkDestroyShaderModule( vk.device, vertModule, nullptr );
 	vkDestroyShaderModule( vk.device, fragModule, nullptr );
@@ -1336,6 +1345,7 @@ void VK_Shutdown( qboolean destroyWindow )
 	if ( vk.skyPipeline ) vkDestroyPipeline( vk.device, vk.skyPipeline, nullptr );
 	if ( vk.worldPipelineAlpha ) vkDestroyPipeline( vk.device, vk.worldPipelineAlpha, nullptr );
 	if ( vk.worldPipelineAdditive ) vkDestroyPipeline( vk.device, vk.worldPipelineAdditive, nullptr );
+	if ( vk.worldPipelineAlphaDepthWrite ) vkDestroyPipeline( vk.device, vk.worldPipelineAlphaDepthWrite, nullptr );
 	if ( vk.worldPipelineLayout ) vkDestroyPipelineLayout( vk.device, vk.worldPipelineLayout, nullptr );
 	if ( vk.worldSampler ) vkDestroySampler( vk.device, vk.worldSampler, nullptr );
 	if ( vk.worldSamplerClamp ) vkDestroySampler( vk.device, vk.worldSamplerClamp, nullptr );

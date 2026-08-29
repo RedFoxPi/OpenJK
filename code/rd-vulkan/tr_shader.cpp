@@ -206,6 +206,49 @@ static std::unordered_map<std::string, bool> s_shaderClampMap;
 // see vkWorldPushConstants_t's own comment, tr_local.h) for the actual fix.
 static std::unordered_map<std::string, int> s_shaderAlphaFunc;
 
+// First stage declares `depthWrite` together with a real (non-`GL_ONE
+// GL_ZERO`) `blendFunc` - real rd-vanilla's own default is to turn depth
+// writing OFF the moment a stage blends, unless this keyword forces it back
+// on (see tr_shader.cpp's real ParseStage: `depthMaskBits = 0` right after
+// parsing `blendFunc`, unless `depthMaskExplicit` was already set by an
+// earlier `depthWrite` line). Real, confirmed-substantial matches on this
+// checkout's test maps, first-stage-only (same discipline as every other
+// keyword here), confirmed by a temporary debug print (removed before
+// committing) of exactly which shaders this renderer's own RE_LoadWorldMap
+// resolves `depthWrite=true` for at real map-load time: hoth2's `textures/
+// imperial/grate02` (alpha-tested AND alpha-blended, but still needs to
+// write depth so it occludes geometry behind it - without this it would
+// depth-sort incorrectly against other translucent surfaces and never
+// occlude opaque geometry drawn after it), yavin1's `textures/bounty/flag2`,
+// `models/map_objects/danger/ship_item01` (a real BSP-compiled surface, not
+// just an entity-instanced prop - confirmed by that same debug print firing
+// from inside RE_LoadWorldMap's own surface loop), and `models/map_objects/
+// yavin/plant` (one of three real definitions of this shader name across
+// `models.shader`/`yavin.shader` - the debug print confirms this renderer's
+// own real `ri.FS_ListFiles` file-enumeration order resolves it to
+// `yavin.shader`'s `blendFunc`+`depthWrite` version, not either of
+// `models.shader`'s alphaFunc-only ones, matching real rd-vanilla's own
+// same-mechanism resolution). One shader with a real `depthWrite`+
+// `blendFunc` combo, yavin1's `textures/factory/T2_Wedge_floorgrate`, is a
+// documented no-op here for an unrelated, pre-existing reason: its first
+// stage's `map` doesn't match its own shader name (`textures/imperial/
+// floorgrate` instead), and the existing map-image-fallback safety gate
+// (RE_LoadWorldMap) only covers BLEND_OPAQUE/BLEND_ADDITIVE, not
+// BLEND_ALPHA - see "What's not implemented yet"'s own note on that gap -
+// so this surface is currently skipped outright (confirmed absent from the
+// same debug print) regardless of this fix. Several other real `depthWrite`
+// hits (`textures/imperial/grate02_broke`, `textures/vjun/grate`/`grate1`)
+// turned out to be false positives once checked: they combine `depthWrite`
+// with `blendFunc GL_ONE GL_ZERO`, which - per BlendFactorsToMode's own
+// comment above - already collapses to BLEND_OPAQUE, where depth write is
+// already the true default with no override needed at all. Only stored when
+// the shader is actually BLEND_ALPHA/BLEND_ADDITIVE for that reason - see
+// the `blendMode != BLEND_OPAQUE` guard below. No real BLEND_ADDITIVE +
+// depthWrite match exists on any of the 4 test maps, so there's no
+// worldPipelineAdditiveDepthWrite variant - see
+// vkGlobals_t::worldPipelineAlphaDepthWrite's own comment (tr_local.h).
+static std::unordered_map<std::string, bool> s_shaderDepthWrite;
+
 static vkBlendMode_t BlendFactorsToMode( const char *src, const char *dst )
 {
 	if ( !Q_stricmp( src, "GL_ONE" ) && !Q_stricmp( dst, "GL_ONE" ) )
@@ -279,6 +322,7 @@ static void ParseShaderFile( const char *text )
 		std::string mapImage;
 		bool clampMap = false;
 		int alphaFuncMode = 0;
+		bool depthWriteKeyword = false;
 
 		while ( depth > 0 )
 		{
@@ -513,6 +557,15 @@ static void ParseShaderFile( const char *text )
 				continue;
 			}
 
+			// `depthWrite` - see s_shaderDepthWrite's own comment for what
+			// real gap this closes and why it only matters combined with a
+			// real (non-`GL_ONE GL_ZERO`) `blendFunc`.
+			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "depthWrite" ) )
+			{
+				depthWriteKeyword = true;
+				continue;
+			}
+
 			if ( depth == 2 && inFirstStage && !Q_stricmp( tok, "blendFunc" ) )
 			{
 				// COM_ParseExt returns a pointer into its own single static
@@ -617,6 +670,15 @@ static void ParseShaderFile( const char *text )
 		if ( alphaFuncMode != 0 && s_shaderAlphaFunc.find( name ) == s_shaderAlphaFunc.end() )
 		{
 			s_shaderAlphaFunc[name] = alphaFuncMode;
+		}
+		// Only meaningful when the shader is actually blended - see
+		// s_shaderDepthWrite's own comment for why BLEND_OPAQUE (including
+		// the `blendFunc GL_ONE GL_ZERO` idiom) is deliberately excluded
+		// here: it already writes depth by default, with nothing to
+		// override.
+		if ( depthWriteKeyword && blendMode != BLEND_OPAQUE && s_shaderDepthWrite.find( name ) == s_shaderDepthWrite.end() )
+		{
+			s_shaderDepthWrite[name] = true;
 		}
 	}
 
@@ -928,4 +990,17 @@ int VK_GetShaderAlphaFunc( const char *name )
 
 	auto it = s_shaderAlphaFunc.find( VK_StripShaderNameExtension( name ) );
 	return it != s_shaderAlphaFunc.end() ? it->second : 0;
+}
+
+// A shader's first stage's real `depthWrite` override (false = none, the
+// common case - see s_shaderDepthWrite's own comment for what real gap this
+// closes). RE_LoadWorldMap (tr_world.cpp), the only caller, stores this
+// per-batch to pick vk.worldPipelineAlphaDepthWrite over the default
+// vk.worldPipelineAlpha.
+bool VK_GetShaderDepthWrite( const char *name )
+{
+	VK_LoadShaderScripts();
+
+	auto it = s_shaderDepthWrite.find( VK_StripShaderNameExtension( name ) );
+	return it != s_shaderDepthWrite.end() && it->second;
 }
