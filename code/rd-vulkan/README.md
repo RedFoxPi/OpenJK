@@ -4454,6 +4454,102 @@ real interior with no hole. All four fixes are narrow and root-caused, not
 speculative - each was confirmed with a targeted temporary debug print
 before being fixed, and every print was removed before committing.
 
+## Hoth2's atmospheric fog: four compounding real bugs
+
+A direct follow-up question - "what about the fog on hoth?" - about a
+difference already visible in the very same comparison screenshots above:
+rd-vanilla's hoth2 shows a near-uniform, heavy, hazy whiteout from ground to
+sky; this renderer showed a much clearer scene, a crisp horizon line, a
+distinctly blue-grey sky, and - worst of all - a sharp-edged, fully
+unfogged distant mountain silhouette visible above the horizon. Not one
+bug but four independent ones, each compounding the others, each found by
+reading real rd-vanilla source for the exact mechanism rather than guessing
+from the pixels:
+
+**1. A local-fog-only bug**: `WorldSurfaceBatch::fogIndex` was only ever set
+from a surface's raw `dsurface_t.fogNum` when it was `>= 0`. Real
+rd-vanilla's own `tr_bsp.cpp` (`ParseFace`/`ParseTriSurf`/`ParseMesh`/
+`ParseFlare`, all four identical in this respect) does something this
+renderer's own code comment had wrongly assumed the *BSP compiler* already
+did: `surf->fogIndex = ds->fogNum + 1; if (!surf->fogIndex &&
+tr.world->globalFog != -1) surf->fogIndex = worldData.globalFog;` - i.e.
+real vanilla's own *engine*, at map-load time, substitutes the map's global
+fog for any surface with no specific local fog brush over it. Since the
+overwhelming majority of any outdoor map's geometry has no local fog brush,
+this substitution *is* how a map's atmospheric fog reaches ordinary
+terrain at all - hoth2's real global fog (`worldspawn "fog" "textures/fogs/
+Hoth2fog"`, colour `(0.7 0.7 0.7)`, opaque distance `1800`) was being
+parsed correctly the entire time (confirmed by its own existing, correct
+log line) but never actually *applied* to anything beyond a handful of
+mapper-placed local fog volumes. Fixed with the same fallback rd-vanilla's
+own code performs.
+
+**2. No fog-coloured framebuffer clear**: real rd-vanilla's `RB_DrawBuffer`
+(`tr_backend.cpp`) clears the colour buffer to the map's own global fog
+colour every frame whenever one exists, instead of a fixed background
+colour (`if (tr.world->globalFog != -1) qglClearColor(fog->parms.color[0],
+...)`). This renderer's own `vk.clearColor` was hardcoded to black and
+never touched. Fixed by setting it once, at map load, when
+`VK_LoadWorldFog` finds a global fog (equivalent in effect to doing it
+every frame, since neither the colour nor whether a map has one changes
+after load) - and explicitly reset to the real default black in
+`VK_ShutdownWorld` so a map with no global fog doesn't inherit a
+previously-loaded map's leftover tint.
+
+**3. No far-distance culling**: real rd-vanilla's `R_SetupFrustum`
+(`tr_main.cpp`) builds its far culling plane *independently* of the
+projection matrix's own (much more generous) `zFar` - a plane
+perpendicular to the view direction at `distanceCull*1.02` (the real
+`*1.02` is rd-vanilla's own "a little slack so we don't cull stuff"),
+where `distanceCull` comes from the map's own `"distancecull"` worldspawn
+key (hoth2: `1850`) or a `12000` default. This renderer's frustum planes
+were extracted straight from the projection matrix instead, inheriting
+whatever generous `zFar` the projection actually used and losing this
+separate, tighter real cull distance entirely - directly explaining the
+crisp, fully-unfogged, un-culled distant mountain visible above the
+horizon (real vanilla simply never draws it at all past 1850*1.02 units).
+`s_distanceCull` was already being parsed from the worldspawn key
+(`VK_LoadWorldspawnFogKeys`) but, until now, only ever consumed by this
+renderer's own ranged-fog `fStart` computation - never for actual culling.
+Fixed by replacing the projection-matrix-derived far plane with one built
+the same way rd-vanilla's own `R_SetupFrustum` does, from the real camera
+origin/forward axis and `s_distanceCull*1.02` directly. Applied
+unconditionally (matching real vanilla, which does this for every scene,
+fogged or not) - confirmed by the full SP scene suite staying clean on all
+5 scenes, not just hoth2.
+
+**4. A non-map-aware sky fallback colour**: hoth2's real
+`textures/skies/hoth` shader declares `skyParms - 512 -` - a literal dash
+for the farbox parameter, real Quake3 syntax for "no textured skybox at
+all" (confirmed directly: no `hoth_rt`/`hoth_lf`/etc. face files exist in
+any of this checkout's real `assets*.pk3` files - not a missing-asset bug,
+the shader genuinely has none). An earlier pass through this renderer
+already correctly identified this exact case and chose a flat, hardcoded
+overcast-grey `(140,150,160)` box rather than leaving pure black showing
+through, reasoning at the time that this renderer "doesn't parse
+`.shader` `skyParms`... [and] can't recover that shader's real fog
+colour." That reasoning no longer holds now that fix #2 above exists: when
+a shader has no real farbox, what real vanilla's own screen actually shows
+*is* the fog-coloured clear from #2, with nothing drawn over it - so the
+map's own already-loaded global fog colour (available at exactly the
+point `VK_LoadSky` needs a fallback) is the *real* colour to use, not a
+generic guess. Fixed by having this fallback read `s_worldFogs
+[s_globalFogIndex]` directly, falling back to the old generic grey only
+for a sky-less map with no global fog at all - confirmed by vjun1's own
+two windows (previously one correct, one showing the old generic
+blue-grey guess) now matching each other, a real improvement on a second
+map this fix wasn't specifically chasing.
+
+**Verified**: warning-free rebuild, full SP scene suite clean on all 5
+scenes. A fresh hoth2 screenshot against rd-vanilla, taken after all four
+fixes together, is a close match - the same near-uniform hazy whiteout,
+no visible horizon seam, no unfogged distant geometry. Re-checked all 4
+maps for regressions from the frustum/clear-colour/sky changes
+specifically (not just hoth2, since none of the four fixes are
+hoth2-specific): academy1 and yavin1 unchanged from their own
+already-documented state, vjun1 improved (see #4 above), no new artifacts
+on any of them.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render

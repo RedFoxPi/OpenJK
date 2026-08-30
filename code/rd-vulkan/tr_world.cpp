@@ -323,6 +323,14 @@ void VK_ShutdownWorld( void )
 	s_rangedFog = 0.0f;
 	s_oldRangedFog = 0.0f;
 	s_distanceCull = 12000.0f;
+	// Reset to the real default (tr_local.h's own member initializer) so a
+	// map with no global fog doesn't inherit a previously-loaded map's
+	// fog-tinted clear colour - see VK_LoadWorldFog's own comment for why
+	// this gets overwritten below when a global fog is actually found.
+	vk.clearColor[0] = 0.0f;
+	vk.clearColor[1] = 0.0f;
+	vk.clearColor[2] = 0.0f;
+	vk.clearColor[3] = 1.0f;
 	// Descriptor sets allocated per-batch below come from this pool, not
 	// individually tracked - reclaim them all at once rather than freeing
 	// one by one (vk.worldDescriptorPool wasn't created with
@@ -514,14 +522,39 @@ static void VK_LoadSky( const char *baseName )
 		// would have clipped any real map's actual sky texture to solid
 		// white - exactly the "much brighter than rd-vanilla" symptom a user
 		// directly reported.
-		static image_t *s_skyFallbackFace = nullptr;
-		if ( !s_skyFallbackFace )
+		// Now uses the map's own real global fog colour when it has one,
+		// instead of a fixed generic blue-grey guess: hoth2's own worldspawn
+		// `"fog" "textures/fogs/Hoth2fog"` (colour (0.7,0.7,0.7), confirmed
+		// loading correctly - see VK_LoadWorldFog's own log line) IS exactly
+		// what real vanilla's own screen looks like here, because real
+		// rd-vanilla's RB_DrawBuffer clears the colour buffer to that same
+		// fog colour every frame whenever a map has a global fog (see
+		// vk.clearColor's own comment, VK_LoadWorldFog) - with no real
+		// farbox texture for this shader to draw over that clear, the
+		// "sky" real vanilla shows *is* the fog-coloured clear itself. This
+		// renderer draws an actual flat-coloured sky box rather than
+		// leaving the clear colour to show through unobstructed (see this
+		// function's own comment above for why - a real void/black sky for
+		// every OTHER shader missing its own real face textures would look
+		// far worse), so matching that same real colour here is what makes
+		// the two converge instead of this renderer's sky reading as a
+		// distinctly different, cooler blue-grey than the terrain's own
+		// fog-tinted horizon. Falls back to the old generic overcast grey
+		// only for a map with no global fog at all. Not cached across calls
+		// (unlike a real named image) since the right colour can now differ
+		// per map - VK_CreateSolidImage's own 1x1-texture cost here is
+		// negligible next to a real face texture regardless.
+		int r = 140, g = 150, b = 160;
+		if ( s_globalFogIndex >= 0 && (size_t)s_globalFogIndex < s_worldFogs.size() )
 		{
-			s_skyFallbackFace = VK_CreateSolidImage( "*skyFallback", 140, 150, 160, 255 );
+			r = (int)( s_worldFogs[s_globalFogIndex].color[0] * 255.0f + 0.5f );
+			g = (int)( s_worldFogs[s_globalFogIndex].color[1] * 255.0f + 0.5f );
+			b = (int)( s_worldFogs[s_globalFogIndex].color[2] * 255.0f + 0.5f );
 		}
+		image_t *skyFallbackFace = VK_CreateSolidImage( "*skyFallback", r, g, b, 255 );
 		for ( int i = 0; i < 6; i++ )
 		{
-			faces[i] = s_skyFallbackFace;
+			faces[i] = skyFallbackFace;
 		}
 	}
 
@@ -638,6 +671,25 @@ static void VK_LoadWorldFog( const byte *fogData, int fogDataLen )
 		if ( fogs[i].brushNum == -1 )
 		{
 			s_globalFogIndex = i;
+			// Real rd-vanilla's own RB_DrawBuffer (tr_backend.cpp) clears the
+			// colour buffer to the global fog's own colour every frame,
+			// instead of a fixed background colour, whenever a map has one:
+			// `if (tr.world->globalFog != -1) qglClearColor(fog->parms.
+			// color[0], ...)`. Real, confirmed-visible effect: for a sky
+			// shader with no real farbox textures at all (a literal `-` for
+			// the parameter, e.g. hoth2's own `textures/skies/hoth` -
+			// VK_LoadSky's own comment), what real vanilla's screen actually
+			// shows for "sky" *is* this fog-coloured clear, with nothing
+			// drawn over it - see VK_LoadSky's own comment for how this
+			// renderer's flat-coloured sky-box fallback now uses this same
+			// colour instead of a generic guess, closing that gap using the
+			// same real mechanism. Set once here (map load), not every frame
+			// like real vanilla - equivalent in effect, since neither the
+			// fog's colour nor whether a map has a global fog at all ever
+			// changes after a map finishes loading.
+			vk.clearColor[0] = color[0];
+			vk.clearColor[1] = color[1];
+			vk.clearColor[2] = color[2];
 			ri.Printf( PRINT_ALL, "rd-vulkan: loaded global fog '%s' colour (%.2f %.2f %.2f) opaque dist %.0f\n",
 				fogs[i].shader, color[0], color[1], color[2], opaqueDist );
 		}
@@ -1218,13 +1270,38 @@ void RE_LoadWorldMap( const char *name )
 		}
 
 		// dsurface_t.fogNum directly indexes s_worldFogs (see VK_LoadWorldFog's
-		// comment) - -1 means "not in any fog volume", and an out-of-range or
-		// opaqueDist==0 entry (shader had no real fogparms) is treated the
-		// same way, so RE_RenderScene only ever needs to check fogIndex >= 0.
+		// comment) - -1 means "not in any local fog volume", and an
+		// out-of-range or opaqueDist==0 entry (shader had no real fogparms) is
+		// treated the same way, so RE_RenderScene only ever needs to check
+		// fogIndex >= 0.
+		//
+		// Real, confirmed bug this fallback fixes: a raw -1 does NOT mean "no
+		// fog at all" in real rd-vanilla - tr_bsp.cpp's real ParseFace/
+		// ParseTriSurf/ParseMesh/ParseFlare (`surf->fogIndex = ds->fogNum + 1;
+		// if (!surf->fogIndex && tr.world->globalFog != -1) surf->fogIndex =
+		// worldData.globalFog;`) substitutes the map's global fog for exactly
+		// this case, at load time, in the *engine's* own code - not something
+		// the BSP compiler bakes into dsurface_t itself. Every ordinary
+		// outdoor surface with no specific local fog brush over it (the
+		// overwhelming majority of any outdoor map's geometry) has a raw
+		// fogNum of -1 and was relying entirely on this substitution to pick
+		// up the map's atmospheric fog at all. Without it, hoth2's real global
+		// fog (`worldspawn "fog" "textures/fogs/Hoth2fog"`, confirmed loading
+		// correctly with its real colour/opaque-distance - see
+		// VK_LoadWorldFog's own log line) was parsed and available the whole
+		// time, but never actually applied to any ordinary terrain surface -
+		// only to the handful of surfaces a mapper explicitly bounded with a
+		// local fog brush. Confirmed the real, concrete cause of hoth2's
+		// distant terrain rendering with crisp, fully unfogged detail instead
+		// of vanilla's heavy, hazy whiteout.
 		int fogIndex = -1;
 		if ( surf.fogNum >= 0 && (size_t)surf.fogNum < s_worldFogs.size() && s_worldFogs[surf.fogNum].opaqueDist > 0.0f )
 		{
 			fogIndex = surf.fogNum;
+		}
+		else if ( s_globalFogIndex >= 0 )
+		{
+			fogIndex = s_globalFogIndex;
 		}
 
 		// See WorldSurfaceBatch::scrollS/scrollT/scaleS/scaleT's own
@@ -1884,6 +1961,41 @@ void RE_RenderScene( const refdef_t *fd )
 
 	float frustumPlanes[6][4];
 	VK_ExtractFrustumPlanes( mvp, frustumPlanes );
+
+	// Real rd-vanilla's own R_SetupFrustum (tr_main.cpp) doesn't derive its
+	// far plane from the projection matrix's own zFar at all - that's set
+	// separately, generously, from the farthest visible BSP-model corner
+	// (R_SetupProjection: `zFar = Com_Clamp(2048, distanceCull*1.732,
+	// sqrt(farthestCornerDistance))`), specifically so shadow/other passes
+	// that need real depth range aren't clipped early. The far *culling*
+	// plane real vanilla actually tests scene geometry against is a
+	// completely separate, tighter one: a plane perpendicular to the view
+	// direction at `distanceCull*1.02` (the `*1.02` is real vanilla's own
+	// "a little slack so we don't cull stuff" - see that function's own
+	// comment). Extracting this renderer's far plane from the projection
+	// matrix instead inherited whatever generous zFar the projection
+	// actually used, silently losing this real, separate far-cull distance
+	// entirely - confirmed the real, concrete cause of hoth2's distant
+	// terrain (visible in the sky above the near horizon) rendering with
+	// full unfogged detail instead of real vanilla's real behavior: not
+	// drawing it at all past its own real `distancecull` "1850" worldspawn
+	// key (`s_distanceCull`, parsed by VK_LoadWorldspawnFogKeys already,
+	// but until now only consumed by this renderer's own ranged-fog
+	// `fStart` computation, never for actual culling). Real vanilla applies
+	// this to every scene, not just fogged ones - `s_distanceCull` defaults
+	// to 12000 (matching real vanilla's own `DEFAULT_DISTANCE_CULL`) when a
+	// map has no explicit key, so replacing the matrix-derived far plane
+	// unconditionally, rather than only when a map sets one, matches real
+	// vanilla exactly rather than only fixing hoth2 specifically.
+	{
+		float cullDist = s_distanceCull * 1.02f;
+		const float *forward = fd->viewaxis[0];
+		float originDotForward = fd->vieworg[0] * forward[0] + fd->vieworg[1] * forward[1] + fd->vieworg[2] * forward[2];
+		frustumPlanes[5][0] = -forward[0];
+		frustumPlanes[5][1] = -forward[1];
+		frustumPlanes[5][2] = -forward[2];
+		frustumPlanes[5][3] = originDotForward + cullDist;
+	}
 
 	static int s_debugCullLogsRemaining = 3;
 	int culledCount = 0;
