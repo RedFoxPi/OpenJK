@@ -1256,14 +1256,19 @@ bool VK_GetGhoul2BoneBasePoseMat( int modelCacheIndex, int boneIndex, mdxaBone_t
 // never explicitly precached at all (most non-"_humanoid" models), or the
 // offset doesn't resolve to a loaded skeleton (points past whatever was
 // actually registered).
-static int VK_ResolveGhoul2SkeletonIndex( const VulkanGhoul2Model &model, const CGhoul2Info *ghlInfo )
+// Explicit-offset core of the resolution - factored out so a caller that
+// needs to resolve against an offset *other* than ghlInfo's current live
+// value (VK_ResolveGhoul2BonePose, per-bone-track resolution - see that
+// function's own comment) can do so without a fake CGhoul2Info to read
+// from.
+static int VK_ResolveGhoul2SkeletonIndexForOffset( const VulkanGhoul2Model &model, int animIndexOffset )
 {
-	if ( ghlInfo && ghlInfo->animModelIndexOffset != 0 )
+	if ( animIndexOffset != 0 )
 	{
 		int baseHandle = VK_FindGhoul2AnimHandle( model.baseAnimName.c_str() );
 		if ( baseHandle > 0 )
 		{
-			int altSkeletonIndex = VK_Ghoul2AnimHandleSkeletonIndex( baseHandle + ghlInfo->animModelIndexOffset );
+			int altSkeletonIndex = VK_Ghoul2AnimHandleSkeletonIndex( baseHandle + animIndexOffset );
 			if ( altSkeletonIndex > 0 )
 			{
 				return altSkeletonIndex;
@@ -1272,6 +1277,15 @@ static int VK_ResolveGhoul2SkeletonIndex( const VulkanGhoul2Model &model, const 
 	}
 	return model.skeletonIndex;
 }
+static int VK_ResolveGhoul2SkeletonIndex( const VulkanGhoul2Model &model, const CGhoul2Info *ghlInfo )
+{
+	return VK_ResolveGhoul2SkeletonIndexForOffset( model, ghlInfo ? ghlInfo->animModelIndexOffset : 0 );
+}
+
+// Defined further below (needs VulkanGhoul2BonePose/VulkanGhoul2AnimState,
+// which come later in file order) - forward declared here since this is its
+// first use. See its own definition for the real math/scope-cut comment.
+static void VK_ComputeGhoul2Pose( const VulkanGhoul2Model &model, int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones, const mdxaBone_t *attachBase = nullptr );
 
 // Same contract as VK_GetGhoul2BoneBasePoseMat, but the bone's *currently
 // animated* world-space (relative to model root) matrix instead of its
@@ -1291,13 +1305,14 @@ bool VK_GetGhoul2BoneCurrentPoseMat( int modelCacheIndex, const CGhoul2Info *ghl
 	{
 		return false;
 	}
-	int skeletonIndex = VK_ResolveGhoul2SkeletonIndex( s_ghoul2Models[modelCacheIndex], ghlInfo );
+	const VulkanGhoul2Model &model = s_ghoul2Models[modelCacheIndex];
+	int skeletonIndex = VK_ResolveGhoul2SkeletonIndex( model, ghlInfo );
 	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
 	{
 		return false;
 	}
 	std::vector<mdxaBone_t> pose;
-	VK_ComputeGhoul2Pose( skeletonIndex, ghlInfo, currentTime, pose );
+	VK_ComputeGhoul2Pose( model, skeletonIndex, ghlInfo, currentTime, pose );
 	if ( boneIndex < 0 || (size_t)boneIndex >= pose.size() )
 	{
 		return false;
@@ -1344,7 +1359,7 @@ bool VK_GetGhoul2SurfaceBoltMatrix( int modelCacheIndex, int surfIndex, const CG
 		return false;
 	}
 	std::vector<mdxaBone_t> pose;
-	VK_ComputeGhoul2Pose( skeletonIndex, ghlInfo, currentTime, pose );
+	VK_ComputeGhoul2Pose( model, skeletonIndex, ghlInfo, currentTime, pose );
 
 	float pTri[3][3];
 	for ( int t = 0; t < 3; t++ )
@@ -1464,6 +1479,21 @@ struct VulkanGhoul2BonePose
 	int blendLerpFrame = 0;  // the old animation's captured "next" frame
 	float blendFrameLerp = 0.0f; // fractional part of the captured position
 	float blendWeight = 0.0f;    // 0 = fully old pose, 1 = fully new pose
+	// Which .gla's frame data currentFrame/newFrame/blendFrame/blendLerpFrame
+	// above actually index into - resolved per bone-track (from that track's
+	// own captured VulkanGhoul2AnimState::animIndexOffset), NOT the same
+	// header/numFrames for every bone in the skeleton the way this used to
+	// work. See VK_ResolveGhoul2BonePose's own comment for the real bug this
+	// fixes: two bone regions (e.g. torso vs legs) can legitimately have an
+	// active track sourced from two *different* "_humanoid" family .gla
+	// files at the same instant, and each one's stored frame numbers only
+	// mean anything against the specific file they were set against.
+	// Defaults to the model's own base skeleton's file (set by
+	// VK_ResolveGhoul2BonePose before the per-track lookup, so a bone with no
+	// track at all - the frame-0 static fallback - still resolves to
+	// something valid).
+	const mdxaHeader_t *header = nullptr;
+	int numFrames = 0;
 	// Bone-angle override (G2API_SetBoneAngles/Index, BONE_ANGLES_POSTMULT -
 	// see VK_SetGhoul2BoneAngles's own comment) - applied in
 	// VK_ComputeGhoul2BoneRecursive as a post-multiply on top of the normal
@@ -1478,8 +1508,13 @@ struct VulkanGhoul2BonePose
 // Defined further below, alongside the rest of the live per-bone animation
 // state it reads (VulkanGhoul2AnimState/s_ghoul2AnimState) - forward
 // declared here since VK_ComputeGhoul2Pose needs it and this function
-// (bone-matrix composition) predates that state in file order.
-static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime );
+// (bone-matrix composition) predates that state in file order. `skel`/
+// `defaultHeader` are the model's own base skeleton (the hierarchy - bone
+// names/parents/bind pose - which every "_humanoid" family .gla variant
+// shares, so this part never needs to change per bone); `model` is what
+// lets a per-bone override resolve a *different* file's frame data - see
+// VulkanGhoul2BonePose::header's own comment.
+static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel, const mdxaHeader_t *defaultHeader, const VulkanGhoul2Model &model, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime );
 
 // Uncompresses one bone's pool entry for one frame - just
 // VK_GetGhoul2BonePoolIndex + MC_UnCompressQuat, factored out since the
@@ -1520,7 +1555,7 @@ static void VK_LerpGhoul2BoneMatrix( mdxaBone_t &out, const mdxaBone_t &a, const
 // sub-model - see that function's own comment.
 static const mdxaBone_t s_g2RootRotation = { { { 0.0f, -1.0f, 0.0f, 0.0f }, { 1.0f, 0.0f, 0.0f, 0.0f }, { 0.0f, 0.0f, 1.0f, 0.0f } } };
 
-static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdxaHeader_t *header, const std::vector<VulkanGhoul2BonePose> &bonePose,
+static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const std::vector<VulkanGhoul2BonePose> &bonePose,
 	int boneIndex, std::vector<mdxaBone_t> &outBones, std::vector<bool> &computed, const mdxaBone_t &rootBase )
 {
 	if ( computed[boneIndex] )
@@ -1529,7 +1564,11 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 	}
 
 	const VulkanGhoul2BonePose &pose = bonePose[boneIndex];
-	int numFrames = skel.numFrames;
+	// This bone's own resolved frame-data source (VK_ResolveGhoul2BonePose) -
+	// not necessarily the same file every other bone in this same skeleton
+	// is using this frame - see VulkanGhoul2BonePose::header's own comment.
+	const mdxaHeader_t *header = pose.header;
+	int numFrames = pose.numFrames;
 
 	// New animation's pose right now - a straight uncompress if this frame
 	// falls exactly on a whole frame (backlerp == 0, e.g. a paused anim or
@@ -1599,7 +1638,7 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 	}
 	else
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, parent, outBones, computed, rootBase );
+		VK_ComputeGhoul2BoneRecursive( skel, bonePose, parent, outBones, computed, rootBase );
 		VK_Multiply3x4Matrix( &outBones[boneIndex], &outBones[parent], &delta );
 	}
 
@@ -1617,7 +1656,7 @@ static void VK_ComputeGhoul2BoneRecursive( const VulkanSkeleton &skel, const mdx
 	computed[boneIndex] = true;
 }
 
-void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones, const mdxaBone_t *attachBase )
+static void VK_ComputeGhoul2Pose( const VulkanGhoul2Model &model, int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones, const mdxaBone_t *attachBase )
 {
 	const mdxaBone_t &rootBase = attachBase ? *attachBase : s_g2RootRotation;
 	outBones.clear();
@@ -1642,15 +1681,20 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int cu
 	// bone's parent is composed using the parent's own (possibly
 	// different) resolved pose, not the child's - exactly the real
 	// engine's per-region behavior, not a single flattened frame applied
-	// uniformly to every bone.
+	// uniformly to every bone. `skel`/`header` here (this call's own
+	// resolved skeleton) is only the *fallback* frame source and the
+	// hierarchy (bone names/parents/bind pose, shared by every "_humanoid"
+	// family variant) - VK_ResolveGhoul2BonePose may resolve a *different*
+	// file's frame data per bone-track (`model`, passed through for that
+	// lookup) - see VulkanGhoul2BonePose::header's own comment.
 	std::vector<VulkanGhoul2BonePose> bonePose( numBones );
 	for ( int i = 0; i < numBones; i++ )
 	{
-		bonePose[i] = VK_ResolveGhoul2BonePose( skel, ghlInfo, i, currentTime );
+		bonePose[i] = VK_ResolveGhoul2BonePose( skel, header, model, ghlInfo, i, currentTime );
 	}
 	for ( int i = 0; i < numBones; i++ )
 	{
-		VK_ComputeGhoul2BoneRecursive( skel, header, bonePose, i, outBones, computed, rootBase );
+		VK_ComputeGhoul2BoneRecursive( skel, bonePose, i, outBones, computed, rootBase );
 	}
 }
 
@@ -1694,6 +1738,19 @@ struct VulkanGhoul2AnimState
 	int pauseTime = 0; // 0 = not paused
 	float animSpeed = 0.0f;
 	int flags = 0;
+	// CGhoul2Info::animModelIndexOffset (G2API_SetAnimIndex) *as it stood at
+	// the exact moment this track's SetBoneAnim call was made* - captured
+	// once, same as every other field here, NOT read live from ghlInfo at
+	// pose-compute time. See VK_ResolveGhoul2BonePose's own comment for why
+	// this is load-bearing: bg_panimate.cpp calls G2API_SetAnimIndex
+	// immediately before *each* body-region's own SetBoneAnimIndex call
+	// (torso, then legs, as two separate calls that can land at genuinely
+	// different times), but animModelIndexOffset is a single field shared by
+	// the whole CGhoul2Info instance - reading it live would let whichever
+	// region's call happened *last* silently decide which .gla's frame table
+	// *every other region's* already-set, still-playing track gets sampled
+	// against too, a real, confirmed bug (see that comment for the fix).
+	int animIndexOffset = 0;
 	// Blend-from state (BONE_ANIM_BLEND, game/ghoul2_shared.h 0x0080) -
 	// captured once, in VK_SetGhoul2BoneAnim, at the exact moment a new
 	// animation is set on top of an already-animating bone with a nonzero
@@ -1918,19 +1975,26 @@ static float VK_Ghoul2CurrentFramePosition( const VulkanGhoul2AnimState &state, 
 // frame-index clamp meaningful when capturing a blend snapshot; 0 (an
 // otherwise-invalid frame count) is a safe "don't clamp" sentinel for a not
 // -yet-resolvable model, matching VK_Ghoul2TimingModel's own `numFrames > 0`
-// guard.
-static int VK_GetGhoul2NumFrames( const CGhoul2Info *ghlInfo )
+// guard. Explicit-offset variant - see VK_ResolveGhoul2SkeletonIndexForOffset's
+// own comment for why VK_SetGhoul2BoneAnim needs this instead of the plain
+// (ghlInfo's-current-offset) version when clamping an *old*, about-to-be-
+// replaced track's blend snapshot.
+static int VK_GetGhoul2NumFramesForOffset( const CGhoul2Info *ghlInfo, int animIndexOffset )
 {
 	if ( !ghlInfo || ghlInfo->mModel <= 0 || (size_t)ghlInfo->mModel >= s_ghoul2Models.size() )
 	{
 		return 0;
 	}
-	int skeletonIndex = VK_ResolveGhoul2SkeletonIndex( s_ghoul2Models[ghlInfo->mModel], ghlInfo );
+	int skeletonIndex = VK_ResolveGhoul2SkeletonIndexForOffset( s_ghoul2Models[ghlInfo->mModel], animIndexOffset );
 	if ( skeletonIndex <= 0 || (size_t)skeletonIndex >= s_skeletons.size() )
 	{
 		return 0;
 	}
 	return s_skeletons[skeletonIndex].numFrames;
+}
+static int VK_GetGhoul2NumFrames( const CGhoul2Info *ghlInfo )
+{
+	return VK_GetGhoul2NumFramesForOffset( ghlInfo, ghlInfo ? ghlInfo->animModelIndexOffset : 0 );
 }
 
 // setFrame/blendTime are real parameters now (previously discarded by
@@ -1965,7 +2029,6 @@ void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startF
 	}
 	auto &boneMap = s_ghoul2AnimState[ghlInfo];
 	auto existing = boneMap.find( boneIndex );
-	int numFrames = VK_GetGhoul2NumFrames( ghlInfo );
 
 	float blendFrame = 0.0f;
 	int blendLerpFrame = 0;
@@ -1988,7 +2051,15 @@ void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startF
 			}
 			else
 			{
-				float currentFrame = VK_Ghoul2CurrentFramePosition( old, startTime, numFrames );
+				// The *old* track's own captured animIndexOffset, not
+				// ghlInfo's current one (which, by the time this runs, may
+				// already have been overwritten for the *new* track being
+				// set - see VulkanGhoul2AnimState::animIndexOffset's own
+				// comment) - this snapshot must be clamped against whichever
+				// .gla the old, about-to-be-replaced animation was actually
+				// sampling frames from.
+				int oldNumFrames = VK_GetGhoul2NumFramesForOffset( ghlInfo, old.animIndexOffset );
+				float currentFrame = VK_Ghoul2CurrentFramePosition( old, startTime, oldNumFrames );
 				if ( old.animSpeed < 0.0f )
 				{
 					blendFrame = floorf( currentFrame );
@@ -2021,6 +2092,7 @@ void VK_SetGhoul2BoneAnim( const CGhoul2Info *ghlInfo, int boneIndex, int startF
 	state.animSpeed = animSpeed;
 	state.pauseTime = 0;
 	state.flags = flags;
+	state.animIndexOffset = ghlInfo->animModelIndexOffset;
 	state.blendFrame = blendFrame;
 	state.blendLerpFrame = blendLerpFrame;
 	state.blendStartTime = blendStartTime;
@@ -2223,9 +2295,11 @@ bool VK_SetGhoul2BoneAngles( const CGhoul2Info *ghlInfo, int boneIndex, const ve
 // bone near the skeleton root). Falls back to a static frame-0 pose (this
 // renderer's original "never animated" default) if no bone from boneIndex
 // up to the root has any track at all - see README.md's frame-0 caveat.
-static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime )
+static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel, const mdxaHeader_t *defaultHeader, const VulkanGhoul2Model &model, const CGhoul2Info *ghlInfo, int boneIndex, int currentTime )
 {
 	VulkanGhoul2BonePose pose;
+	pose.header = defaultHeader;
+	pose.numFrames = skel.numFrames;
 	auto instIt = s_ghoul2AnimState.find( ghlInfo );
 	if ( instIt != s_ghoul2AnimState.end() )
 	{
@@ -2236,7 +2310,23 @@ static VulkanGhoul2BonePose VK_ResolveGhoul2BonePose( const VulkanSkeleton &skel
 			if ( boneIt != instIt->second.end() )
 			{
 				const VulkanGhoul2AnimState &state = boneIt->second;
-				VK_Ghoul2TimingModel( state, currentTime, skel.numFrames, pose.currentFrame, pose.newFrame, pose.backlerp );
+
+				// This track's own captured animIndexOffset (see that
+				// field's own comment) picks which .gla's frame data
+				// currentFrame/newFrame/blendFrame/blendLerpFrame below
+				// actually index into - stays at this call's default (the
+				// model's base skeleton, set above) when the offset is 0,
+				// unresolved, or points past what's actually loaded, the
+				// same fallback semantics as VK_ResolveGhoul2SkeletonIndex.
+				int frameSkeletonIndex = VK_ResolveGhoul2SkeletonIndexForOffset( model, state.animIndexOffset );
+				if ( frameSkeletonIndex > 0 && (size_t)frameSkeletonIndex < s_skeletons.size() )
+				{
+					const VulkanSkeleton &frameSkel = s_skeletons[frameSkeletonIndex];
+					pose.header = (const mdxaHeader_t *)frameSkel.fileData.data();
+					pose.numFrames = frameSkel.numFrames;
+				}
+
+				VK_Ghoul2TimingModel( state, currentTime, pose.numFrames, pose.currentFrame, pose.newFrame, pose.backlerp );
 
 				// A blend is only actually applied for the window of time it
 				// covers - once elapsed time reaches blendDurationMs the
@@ -4014,7 +4104,7 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 			// tied to the base skeleton regardless.
 			int poseSkeletonIndex = VK_ResolveGhoul2SkeletonIndex( model, &g2Instance );
 			std::vector<mdxaBone_t> pose;
-			VK_ComputeGhoul2Pose( poseSkeletonIndex, &g2Instance, currentTime, pose, hasAttachBase ? &attachBase : nullptr );
+			VK_ComputeGhoul2Pose( model, poseSkeletonIndex, &g2Instance, currentTime, pose, hasAttachBase ? &attachBase : nullptr );
 			VK_SkinGhoul2Model( model, pose, skinSlot );
 			VK_DebugLogGhoul2Anim( ent, &g2Instance,
 				( poseSkeletonIndex > 0 && (size_t)poseSkeletonIndex < s_skeletons.size() ) ? &s_skeletons[poseSkeletonIndex] : nullptr,

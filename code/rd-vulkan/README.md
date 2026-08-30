@@ -4612,6 +4612,83 @@ completed cleanly end to end with no assertion and a clean shutdown -
 `_humanoid_yavin1.gla` (yavin1) all loaded successfully in that one run,
 the exact precache sequence that used to fail.
 
+## A real, pre-existing wrong-animation bug (`animModelIndexOffset` shared across bone regions)
+
+Same user, immediately after the crash fix above: "Before the fix the
+animations were fine - after the fix they are not the right ones." A
+misleading symptom to chase, because it turned out to have nothing to do
+with the crash fix at all - two clarifying questions confirmed the wrong
+clip shows up even on the very first map of a session, which rules out
+anything about `VK_ResetGhoul2AnimHandles` (that only changes behavior from
+the *second* map onward - resetting an already-empty cache on the first map
+is a no-op). What actually changed for the user was simply that the crash
+fix let a real campaign playthrough run long enough, through enough
+scripted cutscenes, to *notice* a bug that predates this whole session's
+work: "Implement Ghoul2 SetAnimIndex/GetAnimIndex" (an earlier checkpoint).
+
+**Root cause**: `CGhoul2Info::animModelIndexOffset` (set by
+`G2API_SetAnimIndex`) picks which "_humanoid" family `.gla` file a live pose
+samples its animation frames from - 0 for the ordinary base
+`_humanoid.gla`, 1 for that map's own cinematic-only
+`_humanoid_<mapname>.gla` override (see `VK_PrecacheGhoul2AnimHandle`'s own
+comment). It is one field on the whole `CGhoul2Info` instance. But
+`game/bg_panimate.cpp` calls `G2API_SetAnimIndex` up to *twice* per
+`PM_SetAnimFinal` invocation - once immediately before torso's own
+`G2API_SetBoneAnimIndex(torsBone, ...)`, again immediately before legs' own
+`G2API_SetBoneAnimIndex(bodyBone, ...)` - and these two body regions'
+animations change independently over time (a torso gesture can still be
+mid-playback frames after legs already moved on to a new walk cycle, or
+vice versa). `VK_ResolveGhoul2SkeletonIndex` used to read
+`ghlInfo->animModelIndexOffset` live, once, for the *entire* skeleton's pose
+computation - so whichever body region's `SetAnimIndex` call happened most
+recently silently decided which `.gla`'s frame table *every other region's*
+already-set, still-playing track got sampled against too. A torso gesture
+sourced from a map's cinematic `.gla` (offset 1) landing after legs'
+ordinary walk cycle (whose stored `startFrame`/`endFrame` only mean
+something against the *base* `.gla`'s frame table) would make legs play
+back whatever frame numbers happen to land at those indices in the
+*cinematic* file instead - a genuinely different, wrong animation clip, not
+a corrupted mesh or a frozen pose (matching exactly what the user
+described).
+
+**Fix**: `VulkanGhoul2AnimState` (the per-bone live animation-state struct,
+tr_model.cpp) gained `animIndexOffset`, captured once at
+`VK_SetGhoul2BoneAnim` call time from `ghlInfo->animModelIndexOffset` -
+exactly the same "frozen snapshot" pattern this struct's `blendFrame`/
+`blendStartTime` fields already used for the same reason (a value that can
+change out from under an in-flight animation must be captured when the
+track is set, not re-read live later). `VulkanGhoul2BonePose` (one bone's
+resolved per-frame pose data) gained `header`/`numFrames`, now resolved
+*per bone-track* in `VK_ResolveGhoul2BonePose` from that track's own
+captured offset (via a new `VK_ResolveGhoul2SkeletonIndexForOffset`,
+factored out of the existing per-instance resolver) instead of one shared
+header for the whole skeleton computed once in `VK_ComputeGhoul2Pose`.
+`VK_ComputeGhoul2BoneRecursive` now reads each bone's own resolved
+`header`/`numFrames` from its `VulkanGhoul2BonePose` rather than a
+parameter shared across the whole hierarchy walk. The bone *hierarchy*
+itself (names/parents/bind pose) still comes from one fixed skeleton for
+the whole call, unchanged - every "_humanoid" family `.gla` variant shares
+byte-identical hierarchy by real-game convention (that's the whole
+precondition the offset-swap mechanism relies on to begin with), only the
+*animation frame data* a given bone-track samples needed to vary
+per-track. Also fixed the same class of staleness in
+`VK_SetGhoul2BoneAnim`'s own blend-snapshot capture: the frame count used
+to clamp a blend-from snapshot now comes from the *old*, about-to-be-
+replaced track's own captured offset (a new
+`VK_GetGhoul2NumFramesForOffset`), not `ghlInfo`'s current offset - which,
+by the time a blend snapshot is captured, may already have been overwritten
+for the *new* track being set on a different bone region.
+
+**Verified**: warning-free rebuild, full SP scene suite clean on all 5
+scenes. Directly re-ran the same academy1 → yavin1 multi-map reproduction
+used to verify the crash fix, this time comparing the *pose*, not just
+crash-freedom: before this fix, yavin1's second-map load (reached via
+academy1 first, in one session) rendered a visibly different camera
+framing/pose than a fresh single-map `devmap yavin1` load at the exact same
+simulated time (`waittime 4800`, deterministic via `fixedtime`) - direct
+evidence of a real divergence, not session noise. After this fix, both
+scenarios render pixel-for-pixel the same pose at that instant.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render

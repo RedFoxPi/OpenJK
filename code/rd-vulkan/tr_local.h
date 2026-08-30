@@ -668,20 +668,15 @@ static const int kG2BoltAnd = ( 1 << kG2BoltWidth ) - 1;
 // nullptr for an invalid modelCacheIndex, same convention as
 // VK_FindGhoul2Bone's -1.
 const char *VK_GetGhoul2GLAName( int modelCacheIndex );
-// Computes every bone's object-space pose matrix for one instance right
-// now (see VK_ComputeGhoul2Pose's own comment in tr_model.cpp for the real,
-// verified-against-rd-vanilla math, the per-bone hierarchy-inheritance
-// resolution, and its remaining deliberate scope cuts). skeletonIndex is
-// VK_LoadGhoul2Skeleton's return value, not a model cache index. Clears
-// and leaves outBones empty on any invalid input. attachBase, if non-null,
-// replaces the fixed root-rotation constant every root bone would
-// otherwise seed its hierarchy walk with - see VK_DrawGhoul2Entities's own
-// comment ("Ghoul2 model-to-model attachment") for the one real case that
-// needs this: a sub-model attached to a bolt on a sibling sub-model within
-// the same entity (G2API_AttachG2Model) is seeded with that bolt's current
-// matrix instead of the ordinary fixed root rotation, so its own hierarchy
-// composes relative to the bolt rather than the entity's raw origin/axis.
-void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int currentTime, std::vector<mdxaBone_t> &outBones, const mdxaBone_t *attachBase = nullptr );
+// VK_ComputeGhoul2Pose (computes every bone's object-space pose matrix for
+// one instance right now - see its own comment in tr_model.cpp for the
+// real, verified-against-rd-vanilla math, the per-bone hierarchy-
+// inheritance resolution, and its remaining deliberate scope cuts) takes a
+// VulkanGhoul2Model& (a tr_model.cpp-private type) since a per-bone-track
+// animation-file override needs to resolve *per bone* now, not once for the
+// whole call - see VulkanGhoul2BonePose::header's own comment for the real
+// bug that fixed - so it's `static` and only declared in tr_model.cpp; it
+// has no caller outside that file.
 // Per-level animation-file-override handle space (G2API_SetAnimIndex/
 // GetAnimIndex/PrecacheGhoul2Model, tr_init.cpp) - see
 // VK_PrecacheGhoul2AnimHandle's own comment (tr_model.cpp) for the real
