@@ -345,7 +345,7 @@ defaultoffsetposition:
 			}
 			else
 			{
-				sprintf(errMsg, "Invalid additional argument <%s> for type 'loop rof'", addlArg);
+				Com_sprintf(errMsg, sizeof(errMsg), "Invalid additional argument <%s> for type 'loop rof'", addlArg);
 				goto functionend;
 			}
 
@@ -409,7 +409,7 @@ defaultoffsetposition:
 					else
 					{
 						ent->s.loopSound = 0;
-						sprintf(errMsg, "cgi_S_RegisterSound(%s) failed to return a valid sfxHandle_t for additional argument. Setting 'loopSound' to 0.", addlArg);
+						Com_sprintf(errMsg, sizeof(errMsg), "cgi_S_RegisterSound(%s) failed to return a valid sfxHandle_t for additional argument. Setting 'loopSound' to 0.", addlArg);
 						goto functionend;
 					}
 				}
@@ -424,13 +424,13 @@ defaultoffsetposition:
 			}
 			else
 			{
-				sprintf(errMsg, "Invalid additional argument <%s> for type 'loop sfx'", addlArg);
+				Com_sprintf(errMsg, sizeof(errMsg), "Invalid additional argument <%s> for type 'loop sfx'", addlArg);
 				goto functionend;
 			}
 		}
 		else
 		{
-			sprintf(errMsg, "Invalid argument <%s> for type 'loop' notetrack.", argument);
+			Com_sprintf(errMsg, sizeof(errMsg), "Invalid argument <%s> for type 'loop' notetrack.", argument);
 			goto functionend;
 		}
 	}

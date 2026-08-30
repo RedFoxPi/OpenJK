@@ -1857,7 +1857,7 @@ void G2_LoadGhoul2Model(CGhoul2Info_v &ghoul2, char *buffer)
 		// now load all the bolts
 		for (size_t x=0; x<ghoul2[i].mBltlist.size(); x++)
 		{
-			memcpy(&ghoul2[i].mBltlist[x], buffer, BOLT_SAVE_BLOCK_SIZE);
+			memcpy((void *)&ghoul2[i].mBltlist[x], buffer, BOLT_SAVE_BLOCK_SIZE);
 			buffer += BOLT_SAVE_BLOCK_SIZE;
 		}
 	}

@@ -2985,7 +2985,7 @@ Item_Init
 */
 void Item_Init(itemDef_t *item)
 {
-	memset(item, 0, sizeof(itemDef_t));
+	memset((void *)item, 0, sizeof(itemDef_t));
 	item->textscale = 0.55f;
 	Window_Init(&item->window);
 }

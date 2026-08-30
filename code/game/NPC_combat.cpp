@@ -2290,7 +2290,7 @@ qboolean NPC_EvaluateShot( int hit, qboolean glassOK )
 		return qfalse;
 	}
 
-	if ( hit == NPC->enemy->s.number || (&g_entities[hit] != NULL && (g_entities[hit].svFlags&SVF_GLASS_BRUSH)) )
+	if ( hit == NPC->enemy->s.number || (g_entities[hit].svFlags&SVF_GLASS_BRUSH) )
 	{//can hit enemy or will hit glass, so shoot anyway
 		return qtrue;
 	}

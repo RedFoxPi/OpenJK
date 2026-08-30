@@ -985,7 +985,7 @@ void G_FreeEntity( gentity_t *ed ) {
 	// Free any associated timers
 	TIMER_Clear(ed->s.number);
 
-	memset (ed, 0, sizeof(*ed));
+	memset ((void *)ed, 0, sizeof(*ed));
 	ed->s.number = ENTITYNUM_NONE;
 	ed->classname = "freed";
 	ed->freetime = level.time;

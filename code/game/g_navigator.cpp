@@ -1177,7 +1177,7 @@ bool			NAV::LoadFromFile(const char *filename, int checksum)
 	mIslandRegion = 0;
 	mAirRegion = 0;
 
-	memset(&mEntityAlertList, 0, sizeof(mEntityAlertList));
+	memset((void *)&mEntityAlertList, 0, sizeof(mEntityAlertList));
 
 #if !defined(FINAL_BUILD)
 	ratl::ratl_base::OutputPrint = stupid_print;
@@ -1271,8 +1271,7 @@ bool			NAV::TestEdge( TNodeHandle NodeA, TNodeHandle NodeB, qboolean IsDebugEdge
 	if (!CanGo &&
 		!mMoveTrace.startsolid &&
 		EntHit!=ENTITYNUM_WORLD &&
-		EntHit!=ENTITYNUM_NONE &&
-		(&g_entities[EntHit])!=0)
+		EntHit!=ENTITYNUM_NONE)
 	{
 		gentity_t*	ent		= &g_entities[EntHit];
 
@@ -5490,7 +5489,7 @@ bool	STEER::Reached(gentity_t* actor, NAV::TNodeHandle target, float targetRadiu
 ////////////////////////////////////////////////////////////////////////////////////
 bool	STEER::Reached(gentity_t* actor, const vec3_t& target, float targetRadius, bool flying)
 {
-	if (!actor || !target)
+	if (!actor)
 	{
 		return false;
 	}

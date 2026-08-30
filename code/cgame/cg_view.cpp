@@ -1179,8 +1179,7 @@ static void CG_OffsetFirstPersonView( qboolean firstPersonSaber ) {
 		// add view height
 		if ( cg.snap->ps.viewEntity > 0 && cg.snap->ps.viewEntity < ENTITYNUM_WORLD )
 		{
-			if ( &g_entities[cg.snap->ps.viewEntity] &&
-				g_entities[cg.snap->ps.viewEntity].client &&
+			if ( g_entities[cg.snap->ps.viewEntity].client &&
 				g_entities[cg.snap->ps.viewEntity].client->ps.viewheight )
 			{
 				origin[2] += g_entities[cg.snap->ps.viewEntity].client->ps.viewheight;
@@ -1359,8 +1358,7 @@ static qboolean	CG_CalcFov( void ) {
 		&& (!cg.renderingThirdPerson || g_entities[cg.snap->ps.viewEntity].e_DieFunc == dieF_camera_die) )
 	{
 		// if in entity camera view, use a special FOV
-		if ( &g_entities[cg.snap->ps.viewEntity] &&
-			g_entities[cg.snap->ps.viewEntity].NPC )
+		if ( g_entities[cg.snap->ps.viewEntity].NPC )
 		{//FIXME: looks bad when take over a jedi... but never really do that, do we?
 			fov_x = g_entities[cg.snap->ps.viewEntity].NPC->stats.hfov;
 			//sanity-cap?

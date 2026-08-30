@@ -107,7 +107,6 @@ void INV_SecurityKeyTake( gentity_t *target, char *keyname )
 
 	for ( int i = 0; i <= 4; i++ )
 	{
-		if ( target->client->ps.security_key_message[i] )
 		{
 			if ( !Q_stricmp( keyname, target->client->ps.security_key_message[i] ) )
 			{
@@ -135,7 +134,7 @@ qboolean INV_SecurityKeyCheck( gentity_t *target, char *keyname )
 
 	for ( int i = 0; i <= 4; i++ )
 	{
-		if ( target->client->ps.inventory[INV_SECURITY_KEY] && target->client->ps.security_key_message[i] )
+		if ( target->client->ps.inventory[INV_SECURITY_KEY] )
 		{
 			if ( !Q_stricmp( keyname, target->client->ps.security_key_message[i] ) )
 			{

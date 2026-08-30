@@ -464,7 +464,7 @@ qboolean Grenadier_EvaluateShot( int hit )
 		return qfalse;
 	}
 
-	if ( hit == NPCS.NPC->enemy->s.number || (&g_entities[hit] != NULL && (g_entities[hit].r.svFlags&SVF_GLASS_BRUSH)) )
+	if ( hit == NPCS.NPC->enemy->s.number || (g_entities[hit].r.svFlags&SVF_GLASS_BRUSH) )
 	{//can hit enemy or will hit glass, so shoot anyway
 		return qtrue;
 	}

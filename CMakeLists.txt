@@ -16,8 +16,13 @@
 # along with this program; if not, see <http://www.gnu.org/licenses/>.
 #============================================================================
 
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.5)
 set(CMAKE_OSX_DEPLOYMENT_TARGET "10.9" CACHE STRING "Minimum OS X deployment version")
+
+if(POLICY CMP0072)
+	# Prefer GLVND OpenGL libraries over legacy ones when both are present
+	cmake_policy(SET CMP0072 NEW)
+endif()
 
 set(InOpenJK ON)
 

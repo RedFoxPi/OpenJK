@@ -8203,7 +8203,7 @@ static void PM_Footsteps( void )
 				}
 				if ( pm->ps->saberEntityNum < ENTITYNUM_NONE && pm->ps->saberEntityNum > 0 )//player is 0
 				{//
-					if ( &g_entities[pm->ps->saberEntityNum] != NULL && g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
+					if ( g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
 					{//fell to the ground and we're not trying to pull it back
 						saberInAir = qfalse;
 					}
@@ -12149,7 +12149,7 @@ void PM_WeaponLightsaber(void)
 		{//guiding saber
 			if ( pm->ps->saberEntityNum < ENTITYNUM_NONE && pm->ps->saberEntityNum > 0 )//player is 0
 			{//
-				if ( &g_entities[pm->ps->saberEntityNum] != NULL && g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
+				if ( g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
 				{//fell to the ground and we're not trying to pull it back
 					saberInAir = qfalse;
 				}
@@ -12333,7 +12333,7 @@ void PM_WeaponLightsaber(void)
 				}
 				if ( pm->ps->saberEntityNum < ENTITYNUM_NONE && pm->ps->saberEntityNum > 0 )//player is 0
 				{//
-					if ( &g_entities[pm->ps->saberEntityNum] != NULL && g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
+					if ( g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
 					{//fell to the ground and we're not trying to pull it back
 						saberInAir = qfalse;
 					}
@@ -12560,7 +12560,7 @@ void PM_WeaponLightsaber(void)
 			}
 			if ( pm->ps->saberEntityNum < ENTITYNUM_NONE && pm->ps->saberEntityNum > 0 )//player is 0
 			{//
-				if ( &g_entities[pm->ps->saberEntityNum] != NULL && g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
+				if ( g_entities[pm->ps->saberEntityNum].s.pos.trType == TR_STATIONARY )
 				{//fell to the ground and we're not trying to pull it back
 					saberInAir = qfalse;
 				}
@@ -14750,7 +14750,7 @@ void Pmove( pmove_t *pmove )
 	}
 
 	// clear all pmove local vars
-	memset (&pml, 0, sizeof(pml));
+	memset ((void *)&pml, 0, sizeof(pml));
 
 	// determine the time
 	pml.msec = pmove->cmd.serverTime - pm->ps->commandTime;
