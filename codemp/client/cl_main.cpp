@@ -2449,6 +2449,7 @@ void CL_InitRef( void ) {
 	ri.CIN_RunCinematic = CIN_RunCinematic;
 	ri.CIN_PlayCinematic = CIN_PlayCinematic;
 	ri.CIN_UploadCinematic = CIN_UploadCinematic;
+	ri.CIN_StopCinematic = CIN_StopCinematic;
 	ri.CL_WriteAVIVideoFrame = CL_WriteAVIVideoFrame;
 
 	// g2 data access

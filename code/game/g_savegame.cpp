@@ -40,6 +40,26 @@ extern void G_ReloadSaberData( gentity_t *ent );
 extern void FX_Read( void );
 extern void FX_Write( void );
 
+// EnumerateField()/EvaluateField() below reinterpret a field within a live
+// struct (e.g. gentity_t) as a different, often pointer-sized, type at an
+// offset that isn't guaranteed to satisfy that type's alignment - so those
+// fields must be read/written via memcpy() rather than a cast-and-dereference.
+// This only changes how the in-memory value is accessed, not what value ends
+// up stored there, so it has no effect on the on-disk savegame format.
+template<typename T>
+static inline T ReadUnaligned( const void *p )
+{
+	T v;
+	memcpy( &v, p, sizeof( v ) );
+	return v;
+}
+
+template<typename T>
+static inline void WriteUnaligned( void *p, const T &v )
+{
+	memcpy( p, &v, sizeof( v ) );
+}
+
 
 static const save_field_t savefields_gEntity[] =
 {
@@ -402,36 +422,35 @@ static void EnumerateField(const save_field_t *pField, const byte *pbBase)
 	switch (pField->eFieldType)
 	{
 	case F_STRING:
-		*(int *)pv = GetStringNum(*(char **)pv);
+		WriteUnaligned<int>(pv, GetStringNum(ReadUnaligned<char *>(pv)));
 		break;
 
 	case F_GENTITY:
-		*(intptr_t *)pv = GetGEntityNum(*(gentity_t **)pv);
+		WriteUnaligned<intptr_t>(pv, GetGEntityNum(ReadUnaligned<gentity_t *>(pv)));
 		break;
 
 	case F_GROUP:
-		*(int *)pv = GetGroupNumber(*(AIGroupInfo_t **)pv);
+		WriteUnaligned<int>(pv, GetGroupNumber(ReadUnaligned<AIGroupInfo_t *>(pv)));
 		break;
 
 	case F_GCLIENT:
-		*(intptr_t *)pv = GetGClientNum(*(gclient_t **)pv, (gentity_t *) pbBase);
+		WriteUnaligned<intptr_t>(pv, GetGClientNum(ReadUnaligned<gclient_t *>(pv), (gentity_t *) pbBase));
 		break;
 
 	case F_ITEM:
-		*(int *)pv = GetGItemNum(*(gitem_t **)pv);
+		WriteUnaligned<int>(pv, GetGItemNum(ReadUnaligned<gitem_t *>(pv)));
 		break;
 
 	case F_VEHINFO:
-		*(int *)pv = GetVehicleInfoNum(*(vehicleInfo_t **)pv);
+		WriteUnaligned<int>(pv, GetVehicleInfoNum(ReadUnaligned<vehicleInfo_t *>(pv)));
 		break;
 
 	case F_BEHAVIORSET:
 		{
-			const char **p = (const char **) pv;
-			for (int i=0; i<NUM_BSETS; i++)
+			byte *p = (byte *) pv;
+			for (int i=0; i<NUM_BSETS; i++, p += sizeof(char *))
 			{
-				pv = &p[i];	// since you can't ++ a void ptr
-				*(int *)pv = GetStringNum(*(char **)pv);
+				WriteUnaligned<int>(p, GetStringNum(ReadUnaligned<char *>(p)));
 			}
 		}
 		break;
@@ -478,24 +497,24 @@ static void EnumerateField(const save_field_t *pField, const byte *pbBase)
 
 			for ( int i = 0; i < MAX_ANIM_FILES; i++ ) {
 				for ( int j = 0; j < MAX_ANIM_EVENTS; j++ ) {
-					byteAlias_t *baTorso = (byteAlias_t *)&p[i].torsoAnimEvents[j].stringData,
-						*baLegs = (byteAlias_t *)&p[i].legsAnimEvents[j].stringData;
+					void *pTorso = &p[i].torsoAnimEvents[j].stringData,
+						*pLegs = &p[i].legsAnimEvents[j].stringData;
 					const char *ptAnimEventStringData = p[i].torsoAnimEvents[j].stringData;
-					baTorso->i = GetStringNum( ptAnimEventStringData );
+					WriteUnaligned<int>( pTorso, GetStringNum( ptAnimEventStringData ) );
 					const char *plAnimEventStringData = p[i].legsAnimEvents[j].stringData;
-					baLegs->i = GetStringNum( plAnimEventStringData );
+					WriteUnaligned<int>( pLegs, GetStringNum( plAnimEventStringData ) );
 				}
 			}
 		}
 		break;
 
 	case F_BOOLPTR:
-		*(qboolean *)pv = (qboolean)(*(int *)pv != 0);
+		WriteUnaligned<qboolean>(pv, (qboolean)(ReadUnaligned<int>(pv) != 0));
 		break;
 
 	// These are pointers that are always recreated
 	case F_NULL:
-		*(void **)pv = NULL;
+		WriteUnaligned<void *>(pv, nullptr);
 		break;
 
 	case F_IGNORE:
@@ -562,36 +581,36 @@ static void EvaluateField(const save_field_t *pField, byte *pbBase, byte *pbOrig
 	switch (pField->eFieldType)
 	{
 	case F_STRING:
-		*(char **)pv = GetStringPtr(*(int *)pv, pbOriginalRefData?*(char**)pvOriginal:NULL);
+		WriteUnaligned<char *>(pv, GetStringPtr(ReadUnaligned<int>(pv), pbOriginalRefData ? ReadUnaligned<char *>(pvOriginal) : NULL));
 		break;
 
 	case F_GENTITY:
-		*(gentity_t **)pv = GetGEntityPtr(*(intptr_t *)pv);
+		WriteUnaligned<gentity_t *>(pv, GetGEntityPtr(ReadUnaligned<intptr_t>(pv)));
 		break;
 
 	case F_GROUP:
-		*(AIGroupInfo_t **)pv = GetGroupPtr(*(int *)pv);
+		WriteUnaligned<AIGroupInfo_t *>(pv, GetGroupPtr(ReadUnaligned<int>(pv)));
 		break;
 
 	case F_GCLIENT:
-		*(gclient_t **)pv = GetGClientPtr(*(intptr_t *)pv);
+		WriteUnaligned<gclient_t *>(pv, GetGClientPtr(ReadUnaligned<intptr_t>(pv)));
 		break;
 
 	case F_ITEM:
-		*(gitem_t **)pv = GetGItemPtr(*(int *)pv);
+		WriteUnaligned<gitem_t *>(pv, GetGItemPtr(ReadUnaligned<int>(pv)));
 		break;
 
 	case F_VEHINFO:
-		*(vehicleInfo_t **)pv = GetVehicleInfoPtr(*(int *)pv);
+		WriteUnaligned<vehicleInfo_t *>(pv, GetVehicleInfoPtr(ReadUnaligned<int>(pv)));
 		break;
 
 	case F_BEHAVIORSET:
 		{
-			char **p = (char **) pv;
-			char **pO= (char **) pvOriginal;
-			for (int i=0; i<NUM_BSETS; i++, p++, pO++)
+			byte *p = (byte *) pv;
+			byte *pO = (byte *) pvOriginal;
+			for (int i=0; i<NUM_BSETS; i++, p += sizeof(char *), pO += sizeof(char *))
 			{
-				*p = GetStringPtr(*(int *)p, pbOriginalRefData?*(char **)pO:NULL);
+				WriteUnaligned<char *>(p, GetStringPtr(ReadUnaligned<int>(p), pbOriginalRefData ? ReadUnaligned<char *>(pO) : NULL));
 			}
 		}
 		break;

@@ -70,11 +70,20 @@ public:
 	// give me some space from the heap please
 	char *MiniHeapAlloc(int size)
 	{
-		if ((size_t)size < (mSize - ((size_t)mCurrentHeap - (size_t)mHeap)))
+		// keep every allocation address aligned to at least pointer size - this
+		// is a plain bump allocator with no alignment tracking, so a sequence
+		// of odd-sized allocations (e.g. surface->numVerts * 5 * 4 in
+		// G2_misc.cpp) could otherwise hand out a misaligned address, and
+		// callers do store pointer-sized (intptr_t) values into what they get
+		// back.
+		const size_t alignment = sizeof(void *);
+		char *aligned = (char *)(((size_t)mCurrentHeap + alignment - 1) & ~(alignment - 1));
+		const size_t padding = (size_t)(aligned - mCurrentHeap);
+
+		if ((size_t)size + padding < (mSize - ((size_t)mCurrentHeap - (size_t)mHeap)))
 		{
-			char *tempAddress =  mCurrentHeap;
-			mCurrentHeap += size;
-			return tempAddress;
+			mCurrentHeap = aligned + size;
+			return aligned;
 		}
 		return NULL;
 	}

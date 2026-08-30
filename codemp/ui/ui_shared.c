@@ -7086,7 +7086,10 @@ qboolean ItemParse_asset_model_go( itemDef_t *item, const char *name,int *runTim
 	modelPtr = item->typeData.model;
 	*runTimeLength =0.0f;
 
-	if (!Q_stricmp(&name[strlen(name) - 4], ".glm"))
+	// name may be shorter than the ".glm" suffix being tested for, so
+	// strlen(name)-4 must not be used as an index without checking first.
+	size_t nameLen = strlen(name);
+	if (nameLen >= 4 && !Q_stricmp(&name[nameLen - 4], ".glm"))
 	{ //it's a ghoul2 model then
 		if ( item->ghoul2 )
 		{

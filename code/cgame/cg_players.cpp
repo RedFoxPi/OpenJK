@@ -1215,7 +1215,7 @@ static void CG_PlayerAnimEvents( int animFileIndex, qboolean torso, int oldFrame
 			inSameAnim = qfalse;
 			//FIXME: we *could* see if the oldFrame was *just about* to play the keyframed sound...
 		}
-		else
+		else if ( anim >= 0 )
 		{//still in same anim, check for looping anim
 			inSameAnim = qtrue;
 			animation_t *animation = &level.knownAnimFileSets[animFileIndex].animations[anim];

@@ -146,8 +146,12 @@ void Z_Validate(void)
 
 // static mem blocks to reduce a lot of small zone overhead
 //
-#pragma pack(push)
-#pragma pack(1)
+// NOTE: these must NOT be byte-packed - Z_Free() et al. treat the Header and
+// Tail members as ordinary (naturally-aligned) zoneHeader_t/zoneTail_t
+// structs, so a #pragma pack(1) here (as this used to have) makes every
+// access to Header's pointer members - and to gNumberString's second and
+// later elements, since their offsets no longer land on natural boundaries -
+// a misaligned access.
 typedef struct StaticZeroMem_s {
 	zoneHeader_t	Header;
 //	byte mem[0];
@@ -159,7 +163,6 @@ typedef struct StaticMem_s {
 	byte mem[2];
 	zoneTail_t		Tail;
 } StaticMem_t;
-#pragma pack(pop)
 
 StaticZeroMem_t gZeroMalloc  =
 	{ {ZONE_MAGIC, TAG_STATIC,0,NULL,NULL},{ZONE_MAGIC}};
@@ -674,7 +677,7 @@ Touch all known used data to make sure it is paged in
 void Com_TouchMemory( void ) {
 //	int		start, end;
 	int		i, j;
-	int		sum;
+	unsigned int	sum;	// unsigned: this just forces pages in, the value itself is discarded
 
 //	start = Sys_Milliseconds();
 	Z_Validate();

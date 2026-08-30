@@ -768,7 +768,11 @@ qhandle_t RE_RegisterModel( const char *name )
 
 		qhandle_t q = RE_RegisterModel_Actual( name );
 
-	if (Q_stricmp(&name[strlen(name)-4],".gla")){
+	// name may be shorter than the ".gla" suffix being tested for (e.g. the
+	// "*1", "*2", ... names used for inline brush models), so strlen(name)-4
+	// must not be used as an index without first checking it doesn't underflow.
+	size_t nameLen = strlen(name);
+	if (nameLen < 4 || Q_stricmp(&name[nameLen-4],".gla")){
 		gbInsideRegisterModel = qfalse;		// GLA files recursively call this, so don't turn off half way. A reference count would be nice, but if any ERR_DROP ever occurs within the load then the refcount will be knackered from then on
 	}
 

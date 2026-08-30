@@ -4180,6 +4180,33 @@ static void CreateExternalShaders( void ) {
 
 /*
 ==================
+R_ShutdownVideoMapCinematics
+
+A "videoMap" shader stage plays a cinematic - and keeps its underlying pk3
+file handle open - for as long as the shader is registered. R_InitShaders()
+below discards the entire existing shader table on every renderer init and
+vid_restart, so any such cinematics must be explicitly stopped first, or
+their handles (and the zlib/file state behind them) leak.
+==================
+*/
+void R_ShutdownVideoMapCinematics( void ) {
+	for ( int i = 0; i < tr.numShaders; i++ ) {
+		shader_t *sh = tr.shaders[i];
+		for ( int j = 0; j < sh->numUnfoggedPasses; j++ ) {
+			shaderStage_t *stage = &sh->stages[j];
+			for ( int b = 0; b < NUM_TEXTURE_BUNDLES; b++ ) {
+				if ( stage->bundle[b].isVideoMap ) {
+					ri.CIN_StopCinematic( stage->bundle[b].videoMapHandle );
+					stage->bundle[b].isVideoMap = false;
+					stage->bundle[b].videoMapHandle = -1;
+				}
+			}
+		}
+	}
+}
+
+/*
+==================
 R_InitShaders
 ==================
 */
@@ -4191,6 +4218,8 @@ void R_InitShaders(qboolean server)
 
 	if ( !server )
 	{
+		R_ShutdownVideoMapCinematics();
+
 		CreateInternalShaders();
 
 		ScanAndLoadShaderFiles();

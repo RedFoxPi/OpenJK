@@ -1785,7 +1785,13 @@ RE_Shutdown
 ===============
 */
 extern void R_ShutdownWorldEffects(void);
+extern void R_ShutdownVideoMapCinematics(void);
 void RE_Shutdown( qboolean destroyWindow, qboolean restarting ) {
+	// R_InitShaders() only runs again on a later vid_restart, which may never
+	// happen before the engine exits, so any still-open videoMap cinematics
+	// must also be closed here, not just there.
+	R_ShutdownVideoMapCinematics();
+
 	for ( size_t i = 0; i < numCommands; i++ )
 		ri.Cmd_RemoveCommand( commands[i].cmd );
 
