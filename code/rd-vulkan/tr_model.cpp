@@ -350,6 +350,42 @@ int VK_PrecacheGhoul2AnimHandle( const char *animNameNoExt )
 	return handle;
 }
 
+// Called from VK_ShutdownWorld (tr_world.cpp), which already runs at the
+// start of every RE_LoadWorldMap - i.e. once per real level load, matching
+// the real game code's own per-level lifecycle for the exact data this
+// handle space exists to support. A second, real crash from the same
+// underlying fragility this handle space's own comment already documents
+// (see VK_PrecacheGhoul2AnimHandle's comment above, "a real crash on
+// academy1"): that fix isolated this handle space from ordinary model
+// loading *within* one level, but never reset it *across* levels, so it
+// kept growing for the lifetime of the process. On a real multi-map
+// campaign playthrough (not something the render-regression harness, which
+// only ever loads one fresh map per process, can exercise), the SECOND
+// humanoid-family map a player reaches hits exactly the same class of bug:
+// "models/players/_humanoid/_humanoid.gla" is already cached from the
+// first map (a cache hit, returning that old handle), while this new
+// map's own "_humanoid_<mapname>.gla" cinematic override is a genuine
+// first-time miss - allocated wherever the counter has grown to since,
+// not necessarily immediately after the old cached handle - breaking
+// G_ParseAnimFileSet's real `cineGLAIndex == normalGLAIndex+1` assertion
+// exactly as before. Confirmed by a real user-reported crash: `Assertion
+// 'cineGLAIndex == normalGLAIndex+1' failed` loading
+// models/players/_humanoid_yavin1b/_humanoid_yavin1b.gla, consistent with
+// yavin1 being reached as a later map in the same running session (the
+// game's own level.knownAnimFileSets - the thing this handle numbering
+// must stay adjacent-compatible with - already resets to empty every
+// level; this renderer's own numbering needs to do the same). Does NOT
+// clear VK_LoadGhoul2Skeleton's own by-filename cache (a deliberately
+// separate space, see this handle space's own comment) - a .gla already
+// parsed on an earlier level (e.g. the near-universal "_humanoid.gla"
+// itself) is still found there and reused instantly, not re-parsed; only
+// the numbering built on top of it restarts.
+void VK_ResetGhoul2AnimHandles( void )
+{
+	s_animHandlesByName.clear();
+	s_animHandleSkeletonIndex.clear();
+}
+
 // Lookup-only counterpart, for VK_ResolveGhoul2SkeletonIndex below: does a
 // Ghoul2 model's own default .gla (by name, not by any handle baked in at
 // .glm-load time - see that function's own comment for why a lookup, not a

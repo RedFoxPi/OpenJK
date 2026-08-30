@@ -4550,6 +4550,68 @@ hoth2-specific): academy1 and yavin1 unchanged from their own
 already-documented state, vjun1 improved (see #4 above), no new artifacts
 on any of them.
 
+## A real crash on the second map of a session (`G_ParseAnimFileSet` assertion)
+
+A user compiled this branch, ran it interactively (not the render-regression
+harness), and hit a real crash partway through a normal campaign
+playthrough: `Assertion 'cineGLAIndex == normalGLAIndex+1' failed` in
+`game/NPC_stats.cpp`'s `G_ParseAnimFileSet`, while loading
+`models/players/_humanoid_yavin1b/_humanoid_yavin1b.gla`.
+
+**Why the render-regression harness never caught this**: every scene it
+captures launches a brand-new process that loads exactly one map
+(`devmap <map>`) and exits - there is no way for a map-load-order bug like
+this one to surface there, since it can only exist across *two or more*
+map loads in the *same* running session (exactly what a real campaign
+playthrough does constantly: academy1 → hoth2 → ... → yavin1, all in one
+process).
+
+**Root cause**: `VK_PrecacheGhoul2AnimHandle`'s own handle-numbering cache
+(`s_animHandlesByName`/`s_animHandleSkeletonIndex`, tr_model.cpp) is a
+process-lifetime static, never reset anywhere - unlike the real game
+code's own `level.knownAnimFileSets`, which resets to empty on every single
+level load. This handle space exists specifically to satisfy a real,
+already-documented fragile invariant in `G_ParseAnimFileSet`: it precaches
+`models/players/_humanoid/_humanoid.gla` and then immediately asserts the
+very next precache call (a level's own `_humanoid_<mapname>.gla` cinematic
+animation override) gets exactly that handle plus one - i.e. the two calls
+must allocate strictly adjacent handles, with nothing else touching this
+handle space in between. An earlier pass through this renderer already hit
+and fixed one real way this invariant could break (see
+`VK_PrecacheGhoul2AnimHandle`'s own comment: ordinary model loading was
+briefly sharing this same handle space and an unrelated model claimed a
+handle in between) - but that fix only isolated the space *within* one
+level's own precache sequence, not *across* levels. On the second (or
+later) map in a session that also uses the "_humanoid" skeleton family
+(nearly every SP campaign map does), `_humanoid.gla` is already cached
+from the earlier map - a cache *hit*, returning that old, low handle -
+while the new map's own `_humanoid_<mapname>.gla` is a genuine first-time
+*miss*, allocated at whatever the counter has grown to since (not
+necessarily adjacent at all) - breaking the exact same assertion a second,
+different way.
+
+**Fix**: `VK_ResetGhoul2AnimHandles()` (tr_model.cpp) clears just this
+numbering overlay, called from `VK_ShutdownWorld` (tr_world.cpp) - which
+already runs at the start of every single `RE_LoadWorldMap`, i.e. exactly
+once per real level load, matching `level.knownAnimFileSets`'s own
+per-level lifecycle precisely. Deliberately does *not* touch
+`VK_LoadGhoul2Skeleton`'s own separate by-filename cache: a `.gla` already
+parsed on an earlier level (`_humanoid.gla` itself, almost certainly,
+since nearly every level needs it) is still found there and reused
+instantly on the next level, not re-parsed from disk - only the handle
+*numbering* built on top of it restarts clean each level.
+
+**Verified**: warning-free rebuild, full SP scene suite clean on all 5
+scenes (unaffected, since each of those launches a single-map process and
+never exercised this bug either way). Directly reproduced the real
+reported failure mode and confirmed the fix: a manual interactive run
+(`+devmap academy1 +wait 400 +devmap yavin1 +wait 400`, forcing exactly
+the two-map-in-one-session sequence a real campaign playthrough hits)
+completed cleanly end to end with no assertion and a clean shutdown -
+`_humanoid.gla`, `_humanoid_academy1.gla` (academy1) and then
+`_humanoid_yavin1.gla` (yavin1) all loaded successfully in that one run,
+the exact precache sequence that used to fail.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render

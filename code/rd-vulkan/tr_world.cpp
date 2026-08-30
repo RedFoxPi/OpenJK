@@ -320,6 +320,12 @@ void VK_ShutdownWorld( void )
 	s_worldFlares.clear();
 	s_worldFogs.clear();
 	s_globalFogIndex = -1;
+	// Real per-level crash fix - see VK_ResetGhoul2AnimHandles' own comment
+	// (tr_model.cpp) for the exact user-reported assertion failure this
+	// closes (G_ParseAnimFileSet's cineGLAIndex/normalGLAIndex adjacency
+	// invariant breaking on the second or later humanoid-family map in one
+	// running session).
+	VK_ResetGhoul2AnimHandles();
 	s_rangedFog = 0.0f;
 	s_oldRangedFog = 0.0f;
 	s_distanceCull = 12000.0f;

@@ -690,6 +690,10 @@ void VK_ComputeGhoul2Pose( int skeletonIndex, const CGhoul2Info *ghlInfo, int cu
 // Returns 0 (falsy) if the file doesn't exist, same as a failed
 // RE_RegisterModel in real vanilla.
 int VK_PrecacheGhoul2AnimHandle( const char *animNameNoExt );
+// Resets the above handle numbering - see this function's own comment
+// (tr_model.cpp) for the real per-level crash this fixes. Called from
+// VK_ShutdownWorld (tr_world.cpp), once per real level load.
+void VK_ResetGhoul2AnimHandles( void );
 // Live per-instance, per-bone animation state (see VulkanGhoul2AnimState's
 // comment in tr_model.cpp for the real scope/simplifications) - backs
 // G2API_SetBoneAnim/GetBoneAnim/PauseBoneAnim/IsPaused/StopBoneAnim below.
