@@ -4922,7 +4922,7 @@ extern cvar_t	*g_skippingcin;
 		{
 			G_UpdateEmplacedWeaponData( ent );
 		}
-		if ( player && player->client && player->client->ps.viewEntity == ent->s.number )
+		if ( player && player->client && ent->client && player->client->ps.viewEntity == ent->s.number )
 		{
 			controlledByPlayer = qtrue;
 			int sav_weapon = ucmd->weapon;

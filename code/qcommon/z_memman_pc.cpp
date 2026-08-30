@@ -75,9 +75,17 @@ typedef struct
 
 } zoneTail_t;
 
+// iSize (the caller's requested allocation size) is not necessarily a multiple of
+// alignof(zoneTail_t), so round the tail's offset up to keep its access aligned.
+static inline size_t ZoneTailOffset(size_t uiHeaderSize, int iSize)
+{
+	size_t uiOffset = uiHeaderSize + (size_t)iSize;
+	return (uiOffset + alignof(zoneTail_t) - 1) & ~(alignof(zoneTail_t) - 1);
+}
+
 static inline zoneTail_t *ZoneTailFromHeader(zoneHeader_t *pHeader)
 {
-	return (zoneTail_t*) ( (char*)pHeader + sizeof(*pHeader) + pHeader->iSize );
+	return (zoneTail_t*) ( (char*)pHeader + ZoneTailOffset(sizeof(*pHeader), pHeader->iSize) );
 }
 
 #ifdef DETAILED_ZONE_DEBUG_CODE
@@ -262,8 +270,7 @@ void *Z_Malloc(int iSize, memtag_t eTag, qboolean bZeroit, int /*unusedAlign*/)
 
 	// Add in tracking info and round to a longword...  (ignore longword aligning now we're not using contiguous blocks)
 	//
-//	int iRealSize = (iSize + sizeof(zoneHeader_t) + sizeof(zoneTail_t) + 3) & 0xfffffffc;
-	int iRealSize = (iSize + sizeof(zoneHeader_t) + sizeof(zoneTail_t));
+	int iRealSize = (int)(ZoneTailOffset(sizeof(zoneHeader_t), iSize) + sizeof(zoneTail_t));
 
 	// Allocate a chunk...
 	//

@@ -467,7 +467,7 @@ void G_SetEnemy( gentity_t *self, gentity_t *enemy )
 	if ( self->enemy == NULL )
 	{
 		//TEMP HACK: turn on our saber
-		if ( self->health > 0 )
+		if ( self->health > 0 && self->client )
 		{
 			self->client->ps.SaberActivate();
 		}

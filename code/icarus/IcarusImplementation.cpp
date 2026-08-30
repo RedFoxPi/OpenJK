@@ -585,7 +585,7 @@ int CIcarus::Save()
 
 int CIcarus::LoadSignals()
 {
-	int numSignals;
+	int numSignals = 0;
 
 	BufferRead( &numSignals, sizeof( numSignals ) );
 
@@ -624,7 +624,7 @@ int CIcarus::LoadSequence()
 int CIcarus::LoadSequences()
 {
 	CSequence	*sequence;
-	int			numSequences;
+	int			numSequences = 0;
 
 	//Get the number of sequences to read in
 	BufferRead( &numSequences, sizeof( numSequences ) );
@@ -639,18 +639,27 @@ int CIcarus::LoadSequences()
 
 	//First pass, allocate all container sequences and give them their proper IDs
 	if ( AllocateSequences( numSequences, idTable ) == false )
+	{
+		delete[] idTable;
 		return false;
+	}
 
 	//Second pass, load all sequences
 	for ( int i = 0; i < numSequences; i++ )
 	{
 		//Get the proper sequence for this load
 		if ( ( sequence = GetSequence( idTable[i] ) ) == NULL )
+		{
+			delete[] idTable;
 			return false;
+		}
 
 		//Load the sequence
 		if ( ( sequence->Load(this) ) == false )
+		{
+			delete[] idTable;
 			return false;
+		}
 	}
 
 	//Free the idTable
@@ -662,7 +671,7 @@ int CIcarus::LoadSequences()
 int CIcarus::LoadSequencers()
 {
 	CSequencer	*sequencer;
-	int			numSequencers;
+	int			numSequencers = 0;
 	IGameInterface* game = IGameInterface::GetGame(m_flavor);
 
 	//Get the number of sequencers to load
