@@ -1711,6 +1711,38 @@ void VK_DrawWorldFlares( const float *mvp, const refdef_t *fd )
 
 void RE_RenderScene( const refdef_t *fd )
 {
+	// RDF_SKYBOXPORTAL: real Quake3/JKA calls RE_RenderScene a *second* time
+	// per frame with this flag set, from an entirely different camera placed
+	// elsewhere in the map (a mapper-configured "portal sky" - a miniature
+	// separate scene, e.g. distant mountains or a cityscape, meant to be
+	// composited into just the sky/background of the real scene that's
+	// rendered right after it - see RDF_SKYBOXPORTAL's own comment,
+	// tr_types.h: "the [DRAWSKYBOX flag] says to draw it or not"). This
+	// renderer doesn't implement that compositing (see README.md's "Proper
+	// sky rendering" - no RDF_SKYBOXPORTAL support), but until this check
+	// existed it didn't IGNORE the call either: it drew this second scene as
+	// an entirely ordinary full opaque scene, straight into the same
+	// framebuffer, with its own real world geometry from that unrelated
+	// camera position. Confirmed the real, concrete cause of yavin1's
+	// opening cockpit scene showing a hole full of unrelated outdoor jungle
+	// terrain where a solid interior wall belongs: this portal call (from a
+	// camera positioned out in that exact jungle) draws first every frame,
+	// then gets mostly but not entirely painted over when the real cockpit
+	// scene renders second immediately after - confirmed by a temporary
+	// debug print (removed before committing) of both calls' real
+	// `refdef_t` contents each frame, matching the real
+	// RDF_SKYBOXPORTAL/RDF_DRAWSKYBOX bit values exactly. Skipping the call
+	// outright - not attempting a translation this renderer couldn't
+	// correctly composite into just a sky background anyway - leaves the
+	// framebuffer exactly as it was before this call, which the
+	// immediately-following real scene render (same frame, same target, its
+	// own full opaque geometry and skybox) always completely overwrites
+	// regardless - so there is no missing content, only a correctly-scoped
+	// no-op instead of an actively wrong second scene. See README.md.
+	if ( fd->rdflags & RDF_SKYBOXPORTAL )
+	{
+		return;
+	}
 	if ( !vk.frameActive || !s_worldLoaded || ( fd->rdflags & RDF_NOWORLDMODEL ) )
 	{
 		return;

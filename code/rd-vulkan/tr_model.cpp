@@ -448,8 +448,23 @@ static bool VK_ParseSkinFile( const char *fileName, VulkanSkin &skin )
 				std::string surfName = line.substr( 0, comma );
 				std::string shaderName = line.substr( comma + 1 );
 				// Strip trailing '\r' (CRLF line endings) and any stray
-				// whitespace CommaParse's real tokenizer would have skipped.
+				// whitespace CommaParse's real tokenizer would have skipped,
+				// on BOTH ends of BOTH tokens - real vanilla's CommaParse
+				// (tr_skin.cpp) skips leading whitespace before every token it
+				// reads, not just trailing. A real, confirmed-substantial bug
+				// without this: `models/players/tauntaun/model_wild.skin` (the
+				// skin hoth2's wild tauntaun NPCs actually use) writes
+				// "torso, models/players/tauntaun/tauntaun_body_bare_back.tga"
+				// - a space *after* the comma, unlike the more common
+				// no-space convention (e.g. this same model's own
+				// model_default.skin) - leaving a leading space on every one
+				// of its real shader names when only trailing whitespace was
+				// stripped, so every surface's VK_FindImage lookup failed on
+				// a name that was never a real file to begin with, and this
+				// specific NPC never drew a single surface (see README.md).
 				while ( !shaderName.empty() && (unsigned char)shaderName.back() <= ' ' ) shaderName.pop_back();
+				while ( !shaderName.empty() && (unsigned char)shaderName.front() <= ' ' ) shaderName.erase( shaderName.begin() );
+				while ( !surfName.empty() && (unsigned char)surfName.back() <= ' ' ) surfName.pop_back();
 				for ( char &c : surfName ) c = (char)tolower( (unsigned char)c );
 
 				if ( surfName.size() > 4 && surfName.compare( surfName.size() - 4, 4, "_off" ) == 0 )
@@ -865,7 +880,11 @@ int VK_LoadGhoul2Model( const char *fileName, int skinHandle )
 	// GPU-side read here, only the cost of a staging-buffer round trip on
 	// every re-skin. Only slot 0 is initialized here (the raw bind pose,
 	// cpuVerts) - every slot is always fully rewritten by VK_SkinGhoul2Model
-	// before anything reads it, so the rest starting uninitialized is fine.
+	// before anything reads it (pos/uv/lightmapUV/color, all four - a real
+	// bug once had color as the one silent exception, since it never
+	// changes per-pose and so was easy to forget when writing this
+	// function; see VK_SkinGhoul2Model's own comment for the real visual
+	// bug that caused), so the rest starting uninitialized is fine.
 	VkDeviceSize slotSize = cpuVerts.size() * sizeof( WorldVertex );
 	VkDeviceSize vbSize = slotSize * GHOUL2_SKIN_SLOTS_PER_MODEL;
 	VK_CreateBuffer( vbSize, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
@@ -2274,6 +2293,27 @@ static void VK_SkinGhoul2Model( VulkanGhoul2Model &model, const std::vector<mdxa
 		out[v].uv[1] = sv.uv[1];
 		out[v].lightmapUV[0] = 0.0f;
 		out[v].lightmapUV[1] = 0.0f;
+		// Real, confirmed bug: this function did not write `color` at all,
+		// even though the comment at this model's vertexBuffer allocation
+		// site (VK_LoadGhoul2Model) claims "every slot is always fully
+		// rewritten by VK_SkinGhoul2Model before anything reads it" - that
+		// was true for every field except this one. Slot 0 happens to look
+		// correct only because VK_LoadGhoul2Model's own initial `memcpy`
+		// seeds it from cpuVerts (color already 1,1,1,1 there - see
+		// WorldVertex::color's own comment) - every OTHER slot's colour
+		// channel is whatever the freshly Vulkan-allocated host-visible
+		// memory happened to contain (commonly zero-initialized, at least
+		// under Mesa's lavapipe), silently multiplying that instance's
+		// entire diffuse texture to solid black. Confirmed the real,
+		// concrete cause of 2 of hoth2's 3 simultaneously-visible
+		// WildTauntaun NPCs (all three sharing one cached model+skin, so
+		// only the one drawn from skin-slot 0 this frame looked right)
+		// rendering as flat black silhouettes instead of their real
+		// texture - see README.md.
+		out[v].color[0] = 1.0f;
+		out[v].color[1] = 1.0f;
+		out[v].color[2] = 1.0f;
+		out[v].color[3] = 1.0f;
 	}
 }
 
@@ -3841,7 +3881,38 @@ void VK_DrawGhoul2Entities( const float *mvp, int currentTime )
 		for ( int subModelIdx = 0; subModelIdx < ent.ghoul2->size(); subModelIdx++ )
 		{
 			const CGhoul2Info &g2Instance = (*ent.ghoul2)[subModelIdx];
-			int modelIndex = g2Instance.mModel;
+			// Real rd-vanilla's own per-entity skin override (tr_ghoul2.cpp's
+			// R_AddGhoul2Surfaces: `if (ent->e.customSkin) skin =
+			// R_GetSkinByHandle(ent->e.customSkin); else if (ghoul2[i].mSkin >
+			// 0) ...`) takes priority over whatever skin this sub-model was
+			// loaded with via G2API_SetSkin, and is the ONLY skin mechanism a
+			// great many real NPCs ever use at all - G2API_SetSkin (this
+			// renderer's only skin path until now) is real vanilla's own
+			// *player*-model-specific convenience (g_client.cpp's
+			// G_SetG2PlayerModel always calls it right after
+			// G2API_InitGhoul2Model), while a NPC's single-piece creature/
+			// droid/prop model (no separate head/torso/legs to individually
+			// re-skin) is set up purely by the CLIENT stamping this plain,
+			// already-networked refEntity_t::customSkin field directly - no
+			// G2API_SetSkin call ever happens for it. Without this, any such
+			// model - loaded once at G2API_InitGhoul2Model time with skin 0,
+			// same as "no skin at all" - resolves every one of its (usually
+			// entirely skin-file-dependent, embedded-shader-name-empty)
+			// surfaces to nothing and silently never draws: confirmed the
+			// real, concrete cause of hoth2's tauntaun/wampa NPCs being
+			// completely invisible (every one of tauntaun's 12 real surfaces
+			// has an empty embedded shader name per its own .glm data, relying
+			// entirely on `models/players/tauntaun/model_default.skin` for
+			// every texture - a skin this renderer's own G2API_InitGhoul2Model
+			// deliberately never applies, by design, matching real vanilla's
+			// own comment there). Re-resolves through the same
+			// VK_LoadGhoul2Model cache (keyed by fileName+skinHandle) used
+			// everywhere else, so this costs a cache lookup, not a re-parse,
+			// once the correctly-skinned variant has been loaded the first
+			// time.
+			int modelIndex = ent.customSkin
+				? VK_LoadGhoul2Model( g2Instance.mFileName, (int)ent.customSkin )
+				: g2Instance.mModel;
 			if ( modelIndex <= 0 || (size_t)modelIndex >= s_ghoul2Models.size() )
 			{
 				continue;

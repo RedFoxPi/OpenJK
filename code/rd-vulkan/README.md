@@ -4322,6 +4322,138 @@ other translucent geometry rather than producing a large, easily-diffable
 whole-frame pixel change, the same evidence-tier reasoning already applied
 to several features above (e.g. `tcMod turb`'s vjun1 hit).
 
+## Four real rendering bugs found from a direct side-by-side screenshot review
+
+Prompted by a direct request to review fresh rd-vanilla-vs-rd-vulkan comparison
+screenshots "like a 3D engine expert" - not a shader-keyword gap this time,
+but four genuine implementation bugs, each root-caused with real debug
+instrumentation (added, used, and removed before committing, per this
+project's own standing methodology) rather than guessed at from the pixels
+alone.
+
+### 1. Hoth2's wampa/tauntaun NPCs entirely invisible
+
+**Symptom**: three real `WildTauntaun` NPCs, clearly visible in the
+rd-vanilla reference screenshot, completely absent from rd-vulkan's - not
+faint or miscoloured, just gone.
+
+**Root cause**: `models/players/tauntaun/model.glm`'s own embedded surface
+shader names are ALL empty (confirmed by parsing the real `.glm`'s
+`mdxmSurfHierarchy_t` records directly) - correct and expected for this
+family of model, since real vanilla resolves every surface's texture
+entirely through a separately-registered `.skin` file, not the mesh's own
+data. `G2API_InitGhoul2Model` (real vanilla's own documented convention,
+matched here) always loads a model with skin 0 ("no skin") - the real skin
+only gets applied afterward, via `G2API_SetSkin`. For ordinary player
+models that's fine, since `g_client.cpp`'s `G_SetG2PlayerModel` always calls
+`G2API_SetSkin` immediately after. Tracing NPC spawn code
+(`NPC_stats.cpp:4064`) showed NPCs go through that exact same function - so
+`G2API_SetSkin` *was* being called correctly, with a real, valid skin
+handle. The actual failure was one level deeper, inside the skin file
+parser itself.
+
+### 2. `VK_ParseSkinFile` didn't strip leading whitespace
+
+Confirmed directly: `models/players/tauntaun/model_wild.skin` (the skin
+hoth2's `WildTauntaun` NPCs actually use, not the more common
+`model_default.skin`) writes `torso, models/players/tauntaun/tauntaun_body_
+bare_back.tga` - a space *after* the comma. `VK_ParseSkinFile`
+(`tr_model.cpp`) only stripped trailing whitespace/`\r` from the shader-name
+token, so every one of this file's real shader names kept a leading space,
+making every surface's `VK_FindImage` lookup fail on a name that was never a
+real file to begin with - `VK_LoadGhoul2Model` legitimately found zero
+drawable surfaces and the NPC simply never drew anything. Real rd-vanilla's
+own `RE_RegisterIndividualSkin` (`tr_skin.cpp`) uses `CommaParse`, a real
+tokenizer that skips leading whitespace before every token - this renderer's
+substring-based parser didn't replicate that. **Fix**: strip whitespace from
+both ends of both the surface-name and shader-name tokens, not just the
+trailing end of the shader name.
+
+Confirmed live via a temporary debug print (removed before committing) of
+exactly which real skin index and `surfaceShaders` map size
+`VK_LoadGhoul2Model` resolved for `model_wild.skin`: 0 real entries before
+the fix (matching "no drawable surfaces"), 7 after (matching its 7 real
+non-`*off` surface lines).
+
+### 3. `refEntity_t::customSkin` never read for Ghoul2 draws
+
+A related, second real gap found investigating the above (not the actual
+cause here, since NPCs do go through `G2API_SetSkin`, but a genuine, real
+mechanism this renderer was still missing): real rd-vanilla's own
+`R_AddGhoul2Surfaces` (`tr_ghoul2.cpp`) checks `ent->e.customSkin` - a
+plain, already-networked `refEntity_t` field, set directly by the client
+with no `G2API_SetSkin` call involved at all - and lets it override
+whatever skin a sub-model was loaded with, taking priority over
+`CGhoul2Info::mSkin`. `VK_DrawGhoul2Entities` never read this field.
+**Fix**: when `ent.customSkin` is set, re-resolve that sub-model's
+`modelIndex` through `VK_LoadGhoul2Model` with that skin instead of the
+model's own baked-in one (same cache, so this only costs a lookup once
+that skin's variant has loaded once).
+
+### 4. Two of three simultaneous tauntaun NPCs render solid black
+
+**Symptom**: after fixing #1/#2 above, all three `WildTauntaun` NPCs finally
+drew - but two of the three were flat black silhouettes instead of their
+real texture, while the third looked correct.
+
+**Root cause**: all three NPCs share one cached `VulkanGhoul2Model` (same
+file, same resolved skin), which needs `GHOUL2_SKIN_SLOTS_PER_MODEL`
+independent vertex-buffer "slots" so simultaneous instances at different
+animation poses don't clobber each other (see that constant's own comment).
+Only slot 0 is seeded at load time from `cpuVerts` (position, UV, AND
+colour, all already correct there); the comment at that call site claimed
+"every slot is always fully rewritten by `VK_SkinGhoul2Model` before
+anything reads it" - true for position/UV/lightmap-UV, but `VK_SkinGhoul2Model`
+never actually wrote `color` at all. Slot 0's instance inherited a correct
+white vertex colour by accident (from the initial load-time copy); every
+other slot's colour channel was whatever the freshly Vulkan-allocated
+host-visible memory happened to contain (zero, under Mesa's lavapipe),
+silently multiplying that instance's entire diffuse texture to solid black.
+Confirmed with a temporary per-instance debug print showing all three NPCs
+resolving the identical `modelIndex`/skin, ruling out a per-entity
+skin/model mismatch before looking at the skinning function itself. **Fix**:
+`VK_SkinGhoul2Model` now writes `color = (1,1,1,1)` for every vertex, every
+slot, every call, matching what the comment already (incorrectly) claimed
+it did.
+
+### 5. `RDF_SKYBOXPORTAL` drawn as an ordinary second scene
+
+**Symptom**: yavin1's and vjun1's opening cockpit scenes both showed a large
+"hole" - unrelated outdoor jungle terrain (yavin1) or a flat sky-blue patch
+(vjun1) where solid interior wall/window geometry belongs, in a way that
+persisted even with view-frustum culling forcibly disabled (ruling that out
+directly rather than assuming).
+
+**Root cause**: real Quake3/JKA calls `RE_RenderScene` a *second* time per
+frame with `RDF_SKYBOXPORTAL` set, from an entirely different camera placed
+elsewhere in the map (a mapper-configured "portal sky" - a miniature
+separate scene meant to be composited into just the background of the real
+scene rendered immediately after it - see `RDF_DRAWSKYBOX`'s own comment,
+`tr_types.h`). Confirmed directly with a temporary debug print of every real
+`refdef_t` passed to `RE_RenderScene`: yavin1's opening scene calls it with
+`(vieworg=(6176,-2536,608), rdflags=24)` immediately followed by
+`(vieworg=(4043,-191,-16), rdflags=16)` every single frame - `24 = 8
+(RDF_SKYBOXPORTAL) | 16 (RDF_DRAWSKYBOX)`, `16` alone for the real scene -
+exactly the real engine's own documented pair of flags. This renderer only
+ever checked for `RDF_NOWORLDMODEL`; the portal-sky call fell through and
+got drawn as an entirely ordinary full opaque scene - real world geometry,
+from a real but unrelated camera position out in the jungle - directly into
+the same framebuffer the correct scene draws into immediately after.
+**Fix**: skip the call outright when `RDF_SKYBOXPORTAL` is set, matching
+this project's already-documented "no portal-sky compositing" scope (see
+"Proper sky rendering" below) - since the very next `RE_RenderScene` call
+this same frame always draws a complete opaque scene (its own geometry and
+skybox) over the whole framebuffer regardless, skipping the portal call
+loses nothing and removes the wrong scene's leftover pixels entirely.
+
+**Verified** (all four fixes together): warning-free rebuild, full SP scene
+suite clean on all 5 scenes. Fresh side-by-side screenshots against
+rd-vanilla confirm: hoth2's three tauntaun NPCs now render identically and
+correctly; yavin1's and vjun1's opening cockpit scenes now show their full
+real interior with no hole. All four fixes are narrow and root-caused, not
+speculative - each was confirmed with a targeted temporary debug print
+before being fixed, and every print was removed before committing.
+
 ## What's actually implemented
 
 - Real Vulkan bring-up: instance, physical/logical device, swapchain, render
