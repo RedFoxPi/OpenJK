@@ -2129,7 +2129,7 @@ void RB_StageIteratorGeneric( void )
 	//
 	// now do any dynamic lighting needed
 	//
-	if ( tess.dlightBits && tess.shader->sort <= SS_OPAQUE
+	if ( tess.dlightBits && tess.shader->sort <= (float)SS_OPAQUE
 		&& !(tess.shader->surfaceFlags & (SURF_NODLIGHT | SURF_SKY) ) ) {
 		if (r_dlightStyle->integer>0)
 		{

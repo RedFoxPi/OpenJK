@@ -532,15 +532,15 @@ static qboolean Music_ParseLeveldata( gsl::czstring psLevelName )
 
 					// done this way in case I want to conditionally pass any bools depending on music type...
 					//
-					if( bReturn && psName_Explore )
+					if( bReturn && !psName_Explore.empty() )
 					{
 						bReturn = Music_ParseMusic( filename, Parser, MusicData, *pgMusicFiles, psName_Explore, sKEY_EXPLORE, eBGRNDTRACK_EXPLORE );
 					}
-					if( bReturn && psName_Action )
+					if( bReturn && !psName_Action.empty() )
 					{
 						bReturn = Music_ParseMusic( filename, Parser, MusicData, *pgMusicFiles, psName_Action, sKEY_ACTION, eBGRNDTRACK_ACTION );
 					}
-					if( bReturn && psName_Boss )
+					if( bReturn && !psName_Boss.empty() )
 					{
 						bReturn = Music_ParseMusic( filename, Parser, MusicData, *pgMusicFiles, psName_Boss, sKEY_BOSS, eBGRNDTRACK_BOSS );
 					}

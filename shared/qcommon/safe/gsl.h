@@ -1,25 +1,28 @@
 #pragma once
 
-// central point of include to simplify possible future swap for Microsoft's implementation
-#include <gsl/gsl-lite.h>
+// central point of include for the small subset of Microsoft GSL-like
+// types this codebase relies on; all of them now have direct standard
+// library equivalents, so this header defines them instead of pulling
+// in the (unmaintained, pre-C++14) bundled gsl-lite.
 
-// the default cstring_view constructor from string literals includes the terminating null; this one does not.
-#if defined( _MSC_VER ) && _MSC_VER < 1900
-// VS2013 needs a workaround for its lack of user-defined literals. Fuck VS2013.
-// TODO: eradicate VS2013
-// The workaround is using CSTRING_VIEW("literal") instead of "literal"_v (for the time being).
-# define CSTRING_VIEW(x) vs2013hack_cstring_view_literal(x)
-template< int length >
-inline gsl::cstring_view vs2013hack_cstring_view_literal( const char (&str)[length] )
+#include <cstddef>
+#include <span>
+#include <string_view>
+
+namespace gsl
 {
-	static_assert( length > 0, "CSTRING_VIEW expects a string literal argument." );
-	return{ str, str + length - 1 };
+	/// non-owning view over a contiguous range of const char, not necessarily null-terminated
+	using cstring_view = std::string_view;
+	/// non-owning pointer to a null-terminated string
+	using czstring = const char*;
+	/// non-owning view over a contiguous range of T
+	template< typename T >
+	using array_view = std::span< T >;
 }
-#else
-# define CSTRING_VIEW(x) x ## _v
+
+#define CSTRING_VIEW(x) x ## _v
 /** gsl::cstring_view from string literal (without null-termination) */
 inline gsl::cstring_view operator"" _v( const char* str, std::size_t length )
 {
-	return{ str, str + length };
+	return gsl::cstring_view( str, length );
 }
-#endif

@@ -673,7 +673,7 @@ public:
 			{
 				if (al[alIndex].mHandle==eHandle && al[alIndex].mDanger>0.0f)
 				{
-					DangerBias += (al[alIndex].mDanger*NAV::BIAS_DANGER);
+					DangerBias += (al[alIndex].mDanger*(float)NAV::BIAS_DANGER);
 				}
 			}
 
@@ -687,7 +687,7 @@ public:
 
 		if (mDangerSpotRadiusSq > mDangerSpot.DistToLine2(Edge.PointA(), Edge.PointB()))
 		{
-			DangerBias += NAV::BIAS_DANGER;
+			DangerBias += (float)NAV::BIAS_DANGER;
 		}
 
 
@@ -695,7 +695,7 @@ public:
 		{
             return (Edge.mDistance + DangerBias);
 		}
-		return ((Edge.mDistance + DangerBias) + NAV::BIAS_NONWAYPOINT);
+		return ((Edge.mDistance + DangerBias) + (float)NAV::BIAS_NONWAYPOINT);
 	}
 
 	////////////////////////////////////////////////////////////////////////////////////
@@ -1487,7 +1487,7 @@ bool			NAV::TestEdge( TNodeHandle NodeA, TNodeHandle NodeB, qboolean IsDebugEdge
 
 		CVec3	AtoB(b.mPoint - a.mPoint);
 		float	AtoBDist = AtoB.SafeNorm();
-		int		AtoBSegs = (AtoBDist / MAX_EDGE_SEG_LEN);
+		int		AtoBSegs = (AtoBDist / (float)MAX_EDGE_SEG_LEN);
 
 		AtoB *= MAX_EDGE_SEG_LEN;
 		CVec3	Start(a.mPoint);
@@ -1497,7 +1497,7 @@ bool			NAV::TestEdge( TNodeHandle NodeA, TNodeHandle NodeB, qboolean IsDebugEdge
 		{
 			Start	+= AtoB;
 			Stop	= Start;
-			Stop[2] -= MAX_EDGE_FLOOR_DIST;
+			Stop[2] -= (float)MAX_EDGE_FLOOR_DIST;
 
 			CanGo = !MoveTrace(Start, Stop, Mins, Maxs, EntHit, true, false);
 		}
@@ -1631,9 +1631,9 @@ bool			NAV::LoadFromEntitiesAndSaveToFile(const char *filename, int checksum)
 		atFloor			= at->mPoint;
 		if (at->mFlags.get_bit(CWayNode::WN_DROPTOFLOOR))
 		{
-			atFloor[2]	-= MAX_EDGE_FLOOR_DIST;
+			atFloor[2]	-= (float)MAX_EDGE_FLOOR_DIST;
 		}
-		atFloor[2]		-= (MAX_EDGE_FLOOR_DIST * 1.5f);
+		atFloor[2]		-= ((float)MAX_EDGE_FLOOR_DIST * 1.5f);
 		atOnFloor		= !ViewTrace(atRoof, atFloor);
 		if (at->mFlags.get_bit(CWayNode::WN_DROPTOFLOOR))
 		{
@@ -1774,7 +1774,7 @@ bool			NAV::LoadFromEntitiesAndSaveToFile(const char *filename, int checksum)
 
 				// Ignore Ones That Are A Floor Above Or Below
 				//---------------------------------------------
-				if (fabsf(node.mPoint[2] - at->mPoint[2])>NAV::MAX_EDGE_FLOOR_DIST)
+				if (fabsf(node.mPoint[2] - at->mPoint[2])>(float)NAV::MAX_EDGE_FLOOR_DIST)
 				{
 					continue;
 				}
@@ -1782,7 +1782,7 @@ bool			NAV::LoadFromEntitiesAndSaveToFile(const char *filename, int checksum)
 				// Ignore Ones That Are Too Far
 				//------------------------------
 				float cost = node.mPoint.Dist(at->mPoint);
-				if (cost>NAV::MAX_EDGE_AUTO_LEN)
+				if (cost>(float)NAV::MAX_EDGE_AUTO_LEN)
 				{
 					continue;
 				}
@@ -1797,7 +1797,7 @@ bool			NAV::LoadFromEntitiesAndSaveToFile(const char *filename, int checksum)
 						continue;
 					}
 
-					if (cost>(NAV::MAX_EDGE_AUTO_LEN/2.0f))
+					if (cost>((float)NAV::MAX_EDGE_AUTO_LEN/2.0f))
 					{
 						continue;
 					}
@@ -2309,7 +2309,7 @@ void			NAV::SpawnedPoint(gentity_t* ent, NAV::EPointType type)
 	CVec3 Maxs;
 
 
-	Mins[0] = Mins[1] = (SC_MEDIUM_RADIUS) * -1.0f;
+	Mins[0] = Mins[1] = (float)(SC_MEDIUM_RADIUS) * -1.0f;
 	Maxs[0] = Maxs[1] = (SC_MEDIUM_RADIUS);
 	Mins[2] = 0.0f;
 	Maxs[2] = SC_MEDIUM_HEIGHT;
@@ -3011,7 +3011,7 @@ bool	NAV::FindPath(gentity_t* actor, NAV::TNodeHandle target, float MaxDangerLev
 		SPathPoint&		PPoint	= puser.mPath[i];					// For Debugging And A Tad Speed Improvement, Get A Ref Directly
 
 		AtToNext		= (PPoint.mPoint - At);
-		if (fabsf(AtToNext[2])>Z_CULL_OFFSET)
+		if (fabsf(AtToNext[2])>(float)Z_CULL_OFFSET)
 		{
 			AtToNext[2] = 0.0f;
 		}
@@ -3028,7 +3028,7 @@ bool	NAV::FindPath(gentity_t* actor, NAV::TNodeHandle target, float MaxDangerLev
 			)
 		{
 			NextToBeyond = (puser.mPath[i-1].mPoint - PPoint.mPoint);
-			if (fabsf(NextToBeyond[2])>Z_CULL_OFFSET)
+			if (fabsf(NextToBeyond[2])>(float)Z_CULL_OFFSET)
 			{
 				NextToBeyond[2] = 0.0f;
 			}
@@ -3427,9 +3427,9 @@ bool			NAV::InSafeRadius(CVec3 at, TNodeHandle atNode, TNodeHandle targetNode)
 				//-------------------------------------
 				if (atToTargetEdge.mFlags.get_bit(CWayEdge::WE_SIZE_LARGE))
 				{
-					return (atDistToEdge<SC_LARGE_RADIUS);
+					return (atDistToEdge<(float)SC_LARGE_RADIUS);
 				}
-				return (atDistToEdge<SC_MEDIUM_RADIUS);
+				return (atDistToEdge<(float)SC_MEDIUM_RADIUS);
 			}// not valid edge
 		}// no edge
 	}// no valid target
@@ -3567,7 +3567,7 @@ bool			NAV::UpdatePath(gentity_t* actor, TNodeHandle target, float MaxDangerLeve
 	{
 		SPathPoint&	PPoint	= path[path.size()-1];
 		CVec3	Dir(PPoint.mPoint - At);
-		if (fabsf(At[2] - PPoint.mPoint[2])<Z_CULL_OFFSET)
+		if (fabsf(At[2] - PPoint.mPoint[2])<(float)Z_CULL_OFFSET)
 		{
 			Dir[2] = 0.0f;
 		}
@@ -3806,7 +3806,7 @@ unsigned int		NAV::ClassifyEntSize(gentity_t* ent)
 		float radius = Max(fabsf(minRadius), maxRadius);
 		float height = ent->maxs[2];
 
-		if ((radius > SC_MEDIUM_RADIUS) || height > (SC_MEDIUM_HEIGHT))
+		if ((radius > (float)SC_MEDIUM_RADIUS) || height > ((float)SC_MEDIUM_HEIGHT))
 		{
 			return CWayEdge::WE_SIZE_LARGE;
 		}
@@ -4140,7 +4140,7 @@ void			STEER::Activate(gentity_t* actor)
 	// Find Our Neighbors
 	//--------------------
 	suser.mNeighbors.clear();
-	float	RangeSize = suser.mRadius + STEER::NEIGHBOR_RANGE;
+	float	RangeSize = suser.mRadius + (float)STEER::NEIGHBOR_RANGE;
 
 	CVec3	Range(RangeSize, RangeSize, (actor->client->moveType==MT_FLYSWIM)?(RangeSize):(suser.mRadius*2.0f));
 	CVec3	Mins(suser.mPosition - Range);

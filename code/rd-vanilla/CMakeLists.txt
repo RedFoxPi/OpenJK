@@ -28,7 +28,6 @@ if(BuildSPRdVanilla OR BuildJK2SPRdVanilla)
 		${SharedDir}
 		${SPRDVanillaRendererIncludeDirectories}
 		"${SPDir}/rd-vanilla"
-		"${GSLIncludeDirectory}"
 		)
 
 	# Modular Renderer crap (let's hope this works..)

@@ -177,7 +177,6 @@ set(MPDir "${CMAKE_SOURCE_DIR}/codemp")
 set(JK2SPDir "${CMAKE_SOURCE_DIR}/codeJK2")
 set(SharedDir ${CMAKE_SOURCE_DIR}/shared)
 set(OpenJKLibDir "${CMAKE_SOURCE_DIR}/lib")
-set(GSLIncludeDirectory "${OpenJKLibDir}/gsl-lite/include")
 
 include(InstallConfig)
 
@@ -217,6 +216,9 @@ if(MSVC)
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /arch:SSE2")
 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /MP")
 
+	# enable somewhat modern C++
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /std:c++20")
+
 	# We don't try to control symbol visibility under MSVC.
 	set(OPENJK_VISIBILITY_FLAGS "")
 elseif (("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU") OR ("${CMAKE_C_COMPILER_ID}" MATCHES "Clang"))
@@ -247,7 +249,7 @@ elseif (("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU") OR ("${CMAKE_C_COMPILER_ID}" M
 	set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 
 	# enable somewhat modern C++
-	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++20")
 	
 	if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU")
 		set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wall")

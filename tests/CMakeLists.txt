@@ -47,7 +47,6 @@ set(TestLibraries "${Boost_UNIT_TEST_FRAMEWORK_LIBRARY}")
 set(TestIncludeDirectories
 	"${Boost_INCLUDE_DIRS}"
 	"${SharedDir}"
-	"${GSLIncludeDirectory}"
 	)
 set(TestDefines "${SharedDefines}")
 

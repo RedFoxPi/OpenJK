@@ -1231,12 +1231,12 @@ void R_SortDrawSurfs( drawSurf_t *drawSurfs, int numDrawSurfs ) {
 	for ( int i = 0 ; i < numDrawSurfs ; i++ ) {
 		R_DecomposeSort( (drawSurfs+i)->sort, &entityNum, &shader, &fogNum, &dlighted );
 
-		if ( shader->sort > SS_PORTAL ) {
+		if ( shader->sort > (float)SS_PORTAL ) {
 			break;
 		}
 
 		// no shader should ever have this sort type
-		if ( shader->sort == SS_BAD ) {
+		if ( shader->sort == (float)SS_BAD ) {
 			Com_Error (ERR_DROP, "Shader '%s'with sort == SS_BAD", shader->name );
 		}
 

@@ -42,8 +42,7 @@ if(BuildSPEngine OR BuildJK2SPEngine)
 		${SPEngineIncludeDirectories}
 		${SharedDir}
 		${CMAKE_BINARY_DIR}/shared
-		${SPDir}
-		"${GSLIncludeDirectory}")
+		${SPDir})
 
 	#    Dependencies
 	# OpenAL (is optionally included for Windows)
