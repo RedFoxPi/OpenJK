@@ -285,9 +285,14 @@ def draw_countdown_number(ax, text, progress, color, spin):
 # --------------------------------------------------------------------------
 
 class Firework:
-    """One firework burst: a cloud of particles exploding from a center."""
+    """One firework burst: a cloud of particles exploding from a center.
 
-    def __init__(self, center, n_particles=90, speed=6.0, color=None):
+    Bigger bursts have a chance to "crackle" partway through -- spawning a
+    handful of smaller secondary bursts from their own particles, like a
+    willow/crackle firework -- for a more opulent, layered finale.
+    """
+
+    def __init__(self, center, n_particles=130, speed=6.0, color=None, can_crackle=True):
         self.center = np.array(center, dtype=float)
         rng = np.random.default_rng()
         dirs = rng.normal(size=(n_particles, 3))
@@ -298,6 +303,8 @@ class Firework:
         self.age = 0.0
         self.lifetime = rng.uniform(1.6, 2.4)
         self.color = color or random.choice(FIREWORK_COLORS)
+        self.can_crackle = can_crackle and n_particles >= 60
+        self.crackled = False
 
     def alive(self):
         return self.age < self.lifetime
@@ -309,6 +316,16 @@ class Firework:
         self.vel *= 0.98  # air drag
         self.pos += self.vel * dt
 
+        children = []
+        if self.can_crackle and not self.crackled and self.age > self.lifetime * 0.35:
+            self.crackled = True
+            if random.random() < 0.7:
+                n = len(self.pos)
+                for i in random.sample(range(n), min(3, n)):
+                    children.append(Firework(self.pos[i], n_particles=26, speed=2.6,
+                                              can_crackle=False))
+        return children
+
     def draw(self, ax):
         life_frac = max(0.0, 1.0 - self.age / self.lifetime)
         alpha = life_frac ** 0.7
@@ -316,6 +333,44 @@ class Firework:
         ax.scatter(self.pos[:, 0], self.pos[:, 1], self.pos[:, 2],
                    s=size, c=self.color, alpha=alpha, linewidths=0,
                    depthshade=False)
+
+
+class Confetti:
+    """A continuous flutter of colorful confetti squares, for party flair."""
+
+    def __init__(self, n=170):
+        self.rng = np.random.default_rng()
+        self.n = n
+        self.pos = np.column_stack([
+            self.rng.uniform(-CUBE, CUBE, n),
+            self.rng.uniform(-CUBE, CUBE, n),
+            self.rng.uniform(-CUBE * 0.5, CUBE * 1.8, n),
+        ])
+        self.vel = np.column_stack([
+            self.rng.uniform(-1.2, 1.2, n),
+            self.rng.uniform(-1.2, 1.2, n),
+            self.rng.uniform(-2.6, -1.0, n),
+        ])
+        self.flutter_phase = self.rng.uniform(0, 2 * np.pi, n)
+        self.colors = np.array([hex_to_rgb(c) for c in self.rng.choice(FIREWORK_COLORS, n)])
+        self.size_base = self.rng.uniform(8, 20, n)
+
+    def update(self, dt):
+        self.pos += self.vel * dt
+        self.flutter_phase += dt * 3.0
+        below = self.pos[:, 2] < -CUBE * 1.3
+        n_reset = int(below.sum())
+        if n_reset:
+            self.pos[below, 2] = CUBE * 1.8
+            self.pos[below, 0] = self.rng.uniform(-CUBE, CUBE, n_reset)
+            self.pos[below, 1] = self.rng.uniform(-CUBE, CUBE, n_reset)
+
+    def draw(self, ax):
+        flutter = 0.5 + 0.5 * np.sin(self.flutter_phase)
+        sizes = self.size_base * (0.5 + 0.7 * flutter)
+        ax.scatter(self.pos[:, 0], self.pos[:, 1], self.pos[:, 2],
+                   s=sizes, c=self.colors, alpha=0.85, linewidths=0,
+                   depthshade=False, marker="s")
 
 
 def draw_happy_birthday(fig, progress):
@@ -337,9 +392,9 @@ def draw_happy_birthday(fig, progress):
 def generate(output="countdown_birthday.gif", fps=20, quick=False):
     frames_per_number = int(fps * (0.6 if quick else 1.4))
     numbers = list(range(10, -1, -1))
-    firework_seconds = 1.5 if quick else 4.0
+    firework_seconds = 2.0 if quick else 6.0
     firework_frames = int(fps * firework_seconds)
-    end_hold_frames = int(fps * (0.5 if quick else 1.5))
+    end_hold_frames = int(fps * (0.8 if quick else 3.0))
 
     fig = plt.figure(figsize=(6, 4.5), dpi=70 if quick else 90)
     fig.patch.set_facecolor("black")
@@ -393,10 +448,26 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
 
     # --- Firework + "Happy Birthday" phase ---
     fireworks = []
-    spawn_every = max(1, int(fps * 0.35))
+    confetti = Confetti()
+    spawn_every = max(1, int(fps * 0.18))
     text_fly_start = int(fps * 0.4)
     text_fly_duration = int(fps * 1.2)
+    grand_finale_fired = False
     dt = 0.06
+
+    def random_burst_center(spread=0.5):
+        return (
+            random.uniform(-CUBE * spread, CUBE * spread),
+            random.uniform(-CUBE * spread, CUBE * spread),
+            random.uniform(-1.0, CUBE * 0.6),
+        )
+
+    def update_fireworks(dt):
+        children = []
+        for fw in fireworks:
+            children.extend(fw.update(dt))
+        fireworks.extend(children)
+        fireworks[:] = [fw for fw in fireworks if fw.alive()]
 
     for f in range(firework_frames):
         ax.cla()
@@ -407,26 +478,29 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         draw_stars(ax, stars)
 
         if f % spawn_every == 0:
-            center = (
-                random.uniform(-CUBE * 0.5, CUBE * 0.5),
-                random.uniform(-CUBE * 0.5, CUBE * 0.5),
-                random.uniform(-1.0, CUBE * 0.6),
-            )
-            fireworks.append(Firework(center))
-
-        for fw in fireworks:
-            fw.update(dt)
-        fireworks = [fw for fw in fireworks if fw.alive()]
-        for fw in fireworks:
-            fw.draw(ax)
+            fireworks.append(Firework(random_burst_center()))
+        if f % (spawn_every * 3) == 0:
+            # a second, simultaneous burst for a fuller sky
+            fireworks.append(Firework(random_burst_center()))
 
         if f >= text_fly_start:
             text_progress = min(1.0, (f - text_fly_start) / text_fly_duration)
             birthday_artists.append(draw_happy_birthday(fig, text_progress))
+            if text_progress >= 1.0 and not grand_finale_fired:
+                grand_finale_fired = True
+                for _ in range(7):
+                    fireworks.append(Firework(random_burst_center(spread=0.75), n_particles=160, speed=7.5))
+
+        update_fireworks(dt)
+        for fw in fireworks:
+            fw.draw(ax)
+
+        confetti.update(dt)
+        confetti.draw(ax)
 
         capture()
 
-    # --- Final hold: keep the finale look, fireworks keep sparkling gently ---
+    # --- Final hold: full-on party finale, confetti and fireworks keep going ---
     for f in range(end_hold_frames):
         ax.cla()
         setup_axes(ax)
@@ -435,19 +509,15 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         ax.view_init(elev=16, azim=azim)
         draw_stars(ax, stars)
 
-        if f % (spawn_every * 2) == 0:
-            center = (
-                random.uniform(-CUBE * 0.4, CUBE * 0.4),
-                random.uniform(-CUBE * 0.4, CUBE * 0.4),
-                random.uniform(0.0, CUBE * 0.5),
-            )
-            fireworks.append(Firework(center, n_particles=60))
+        if f % spawn_every == 0:
+            fireworks.append(Firework(random_burst_center(spread=0.45), n_particles=100))
 
-        for fw in fireworks:
-            fw.update(dt)
-        fireworks = [fw for fw in fireworks if fw.alive()]
+        update_fireworks(dt)
         for fw in fireworks:
             fw.draw(ax)
+
+        confetti.update(dt)
+        confetti.draw(ax)
 
         birthday_artists.append(draw_happy_birthday(fig, 1.0))
         capture()
