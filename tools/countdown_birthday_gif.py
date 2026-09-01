@@ -261,7 +261,7 @@ def draw_happy_birthday(fig, progress):
 # --------------------------------------------------------------------------
 
 def generate(output="countdown_birthday.gif", fps=20, quick=False):
-    frames_per_number = int(fps * (0.35 if quick else 0.6))
+    frames_per_number = int(fps * (0.45 if quick else 0.85))
     numbers = list(range(10, -1, -1))
     firework_seconds = 1.5 if quick else 4.0
     firework_frames = int(fps * firework_seconds)
@@ -299,9 +299,9 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         # on the same camera-facing orientation as "Happy Birthday!" both
         # when it pops in (progress=0) and right before it pops out (progress=1).
         spin = (
-            spin_rng.choice([1, 2]) * spin_rng.choice([-1, 1]),
             spin_rng.choice([0, 1]) * spin_rng.choice([-1, 1]),
-            spin_rng.choice([2, 3]) * spin_rng.choice([-1, 1]),
+            spin_rng.choice([0, 1]) * spin_rng.choice([-1, 1]),
+            spin_rng.choice([1, 1, 2]) * spin_rng.choice([-1, 1]),
         )
         for f in range(frames_per_number):
             progress = f / frames_per_number
