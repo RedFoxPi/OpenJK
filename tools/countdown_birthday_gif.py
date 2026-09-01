@@ -58,6 +58,11 @@ def ease_out_cubic(t):
     return 1 - (1 - t) ** 3
 
 
+def ease_in_cubic(t):
+    t = min(max(t, 0.0), 1.0)
+    return t ** 3
+
+
 def hex_to_rgb(color):
     color = color.lstrip("#")
     return tuple(int(color[i:i + 2], 16) / 255 for i in (0, 2, 4))
@@ -108,16 +113,30 @@ def build_digit_mesh(text, target_height=DIGIT_HEIGHT, depth=DIGIT_DEPTH):
     Returns a dict with 'faces' (N, 3-or-4, 3) local vertex arrays and a
     matching 'colors01' shade array (0..1) used to tint the base color.
     """
-    raw_path = TextPath((0, 0), text, size=200, prop=_DIGIT_FONT)
+    raw_path = TextPath((0, 0), text, size=400, prop=_DIGIT_FONT)
     ext = raw_path.get_extents()
     cx = ext.x0 + ext.width / 2.0
     cy = ext.y0 + ext.height / 2.0
     scale = target_height / ext.height if ext.height > 0 else 1.0
     path = raw_path.transformed(Affine2D().translate(-cx, -cy).scale(scale))
 
-    polygons = [p for p in path.to_polygons() if len(p) >= 3]
-    pts = np.vstack([p[:-1] if np.allclose(p[0], p[-1]) else p for p in polygons])
-    x, y = pts[:, 0], pts[:, 1]
+    def resample(poly, max_edge_len):
+        """Insert extra points along long edges for a denser boundary/wall mesh."""
+        out = []
+        n = len(poly)
+        for i in range(n):
+            p0 = poly[i]
+            p1 = poly[(i + 1) % n]
+            seg_len = float(np.hypot(*(p1 - p0)))
+            steps = max(1, int(np.ceil(seg_len / max_edge_len)))
+            for s in range(steps):
+                out.append(p0 + (p1 - p0) * (s / steps))
+        return np.array(out)
+
+    max_edge = target_height * 0.06
+    polygons = [p[:-1] if np.allclose(p[0], p[-1]) else p
+                for p in path.to_polygons() if len(p) >= 3]
+    polygons = [resample(p, max_edge) for p in polygons]
 
     # matplotlib's compound-path nonzero-winding contains_points() does not
     # reliably detect counters/holes for every glyph (e.g. "0"), so decide
@@ -126,12 +145,34 @@ def build_digit_mesh(text, target_height=DIGIT_HEIGHT, depth=DIGIT_DEPTH):
     from matplotlib.path import Path as MplPath
     subpaths = [MplPath(poly) for poly in polygons]
 
+    def inside_shape(points):
+        hit_counts = np.zeros(len(points), dtype=int)
+        for sp in subpaths:
+            hit_counts += sp.contains_points(points).astype(int)
+        return (hit_counts % 2) == 1
+
+    boundary_pts = np.vstack(polygons)
+
+    # Add an interior grid of Steiner points so the cap faces are made of
+    # many small triangles instead of a few large ones spanning the outline.
+    xmin, ymin = boundary_pts.min(axis=0)
+    xmax, ymax = boundary_pts.max(axis=0)
+    grid_step = target_height * 0.06
+    gx = np.arange(xmin + grid_step / 2, xmax, grid_step)
+    gy = np.arange(ymin + grid_step / 2, ymax, grid_step)
+    if len(gx) and len(gy):
+        gxx, gyy = np.meshgrid(gx, gy)
+        grid_pts = np.column_stack([gxx.ravel(), gyy.ravel()])
+        grid_pts = grid_pts[inside_shape(grid_pts)]
+    else:
+        grid_pts = np.empty((0, 2))
+
+    pts = np.vstack([boundary_pts, grid_pts]) if len(grid_pts) else boundary_pts
+    x, y = pts[:, 0], pts[:, 1]
+
     tri = Triangulation(x, y)
     centroids = np.column_stack([x[tri.triangles].mean(axis=1), y[tri.triangles].mean(axis=1)])
-    hit_counts = np.zeros(len(centroids), dtype=int)
-    for sp in subpaths:
-        hit_counts += sp.contains_points(centroids).astype(int)
-    inside = (hit_counts % 2) == 1
+    inside = inside_shape(centroids)
     tri.set_mask(~inside)
     cap_tri_idx = tri.get_masked_triangles()
 
@@ -187,14 +228,32 @@ def smoothstep(t):
     return t * t * (3 - 2 * t)
 
 
+FLY_IN_FRAC = 0.4    # fraction of a digit's hold time spent flying in
+FLY_OUT_FRAC = 0.4    # fraction spent flying back out
+FLY_DISTANCE = 9.0     # how far back/forward the digit travels while flying
+
+
 def draw_countdown_number(ax, text, progress, color, spin):
-    """Draw a real, extruded 3D digit that tumbles in and settles back to
-    the same camera-facing orientation as "Happy Birthday!" at rest."""
-    scale = ease_out_back(min(progress / 0.45, 1.0))
-    alpha = ease_out_cubic(min(progress / 0.25, 1.0))
-    if progress > 0.8:
-        # fade out slightly right before the next number pops in
-        alpha *= ease_out_cubic(1 - (progress - 0.8) / 0.2)
+    """Draw a real, extruded 3D digit that flies in from behind the camera,
+    tumbles, then flies onward and settles back to the same camera-facing
+    orientation as "Happy Birthday!" both on arrival and departure."""
+    if progress < FLY_IN_FRAC:
+        t = progress / FLY_IN_FRAC
+        ease = ease_out_cubic(t)
+        scale = ease_out_back(t)
+        alpha = ease
+        fly_y = (1 - ease) * -FLY_DISTANCE
+    elif progress > 1 - FLY_OUT_FRAC:
+        t = (progress - (1 - FLY_OUT_FRAC)) / FLY_OUT_FRAC
+        ease = ease_in_cubic(t)
+        scale = 1.0
+        alpha = 1.0 - ease
+        fly_y = ease * FLY_DISTANCE
+    else:
+        scale = 1.0
+        alpha = 1.0
+        fly_y = 0.0
+
     if scale <= 0.02 or alpha <= 0.01:
         return
 
@@ -202,12 +261,13 @@ def draw_countdown_number(ax, text, progress, color, spin):
     spin_t = smoothstep(progress)
     turns_x, turns_y, turns_z = spin
     rot = rotation_matrix(turns_x * 360 * spin_t, turns_y * 360 * spin_t, turns_z * 360 * spin_t)
+    offset = np.array([0.0, fly_y, 0.0])
 
     base_rgb = np.array(hex_to_rgb(color))
     poly_verts = []
     poly_colors = []
     for local_verts, shade in zip(mesh["faces"], mesh["shades"]):
-        world = (rot @ (local_verts * scale).T).T
+        world = (rot @ (local_verts * scale).T).T + offset
         poly_verts.append(world)
         poly_colors.append(tuple(base_rgb * shade))
 
@@ -271,7 +331,7 @@ def draw_happy_birthday(fig, progress):
 # --------------------------------------------------------------------------
 
 def generate(output="countdown_birthday.gif", fps=20, quick=False):
-    frames_per_number = int(fps * (0.55 if quick else 1.2))
+    frames_per_number = int(fps * (0.6 if quick else 1.4))
     numbers = list(range(10, -1, -1))
     firework_seconds = 1.5 if quick else 4.0
     firework_frames = int(fps * firework_seconds)
