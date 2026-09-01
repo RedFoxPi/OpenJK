@@ -119,9 +119,19 @@ def build_digit_mesh(text, target_height=DIGIT_HEIGHT, depth=DIGIT_DEPTH):
     pts = np.vstack([p[:-1] if np.allclose(p[0], p[-1]) else p for p in polygons])
     x, y = pts[:, 0], pts[:, 1]
 
+    # matplotlib's compound-path nonzero-winding contains_points() does not
+    # reliably detect counters/holes for every glyph (e.g. "0"), so decide
+    # inside/outside ourselves with an even-odd count across each subpath
+    # treated as its own simple polygon.
+    from matplotlib.path import Path as MplPath
+    subpaths = [MplPath(poly) for poly in polygons]
+
     tri = Triangulation(x, y)
     centroids = np.column_stack([x[tri.triangles].mean(axis=1), y[tri.triangles].mean(axis=1)])
-    inside = path.contains_points(centroids)
+    hit_counts = np.zeros(len(centroids), dtype=int)
+    for sp in subpaths:
+        hit_counts += sp.contains_points(centroids).astype(int)
+    inside = (hit_counts % 2) == 1
     tri.set_mask(~inside)
     cap_tri_idx = tri.get_masked_triangles()
 
@@ -261,7 +271,7 @@ def draw_happy_birthday(fig, progress):
 # --------------------------------------------------------------------------
 
 def generate(output="countdown_birthday.gif", fps=20, quick=False):
-    frames_per_number = int(fps * (0.45 if quick else 0.85))
+    frames_per_number = int(fps * (0.55 if quick else 1.2))
     numbers = list(range(10, -1, -1))
     firework_seconds = 1.5 if quick else 4.0
     firework_frames = int(fps * firework_seconds)
@@ -299,9 +309,9 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         # on the same camera-facing orientation as "Happy Birthday!" both
         # when it pops in (progress=0) and right before it pops out (progress=1).
         spin = (
-            spin_rng.choice([0, 1]) * spin_rng.choice([-1, 1]),
-            spin_rng.choice([0, 1]) * spin_rng.choice([-1, 1]),
-            spin_rng.choice([1, 1, 2]) * spin_rng.choice([-1, 1]),
+            spin_rng.choice([0, 0, 1]) * spin_rng.choice([-1, 1]),
+            spin_rng.choice([0, 0, 1]) * spin_rng.choice([-1, 1]),
+            1 * spin_rng.choice([-1, 1]),
         )
         for f in range(frames_per_number):
             progress = f / frames_per_number
