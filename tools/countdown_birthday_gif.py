@@ -228,30 +228,34 @@ def smoothstep(t):
     return t * t * (3 - 2 * t)
 
 
-FLY_IN_FRAC = 0.4    # fraction of a digit's hold time spent flying in
-FLY_OUT_FRAC = 0.4    # fraction spent flying back out
-FLY_DISTANCE = 9.0     # how far back/forward the digit travels while flying
+FLY_IN_FRAC = 0.4     # fraction of a digit's hold time spent flying in
+FLY_OUT_FRAC = 0.4     # fraction spent flying back out
+FLY_DISTANCE_X = 17.0   # sideways travel while flying -- well past the frame edge
+FLY_DISTANCE_Y = 7.0    # extra back/forward travel while flying, for depth
 
 
 def draw_countdown_number(ax, text, progress, color, spin):
-    """Draw a real, extruded 3D digit that flies in from behind the camera,
-    tumbles, then flies onward and settles back to the same camera-facing
-    orientation as "Happy Birthday!" both on arrival and departure."""
+    """Draw a real, extruded 3D digit that flies in from off-screen (left),
+    tumbles at rest in the same camera-facing orientation as "Happy
+    Birthday!", then flies onward off-screen (right) until it is gone."""
     if progress < FLY_IN_FRAC:
         t = progress / FLY_IN_FRAC
         ease = ease_out_cubic(t)
-        scale = ease_out_back(t)
+        scale = 0.15 + 0.85 * ease_out_back(t)
         alpha = ease
-        fly_y = (1 - ease) * -FLY_DISTANCE
+        fly_x = (1 - ease) * -FLY_DISTANCE_X
+        fly_y = (1 - ease) * -FLY_DISTANCE_Y
     elif progress > 1 - FLY_OUT_FRAC:
         t = (progress - (1 - FLY_OUT_FRAC)) / FLY_OUT_FRAC
         ease = ease_in_cubic(t)
-        scale = 1.0
+        scale = 1.0 - 0.85 * ease
         alpha = 1.0 - ease
-        fly_y = ease * FLY_DISTANCE
+        fly_x = ease * FLY_DISTANCE_X
+        fly_y = ease * FLY_DISTANCE_Y
     else:
         scale = 1.0
         alpha = 1.0
+        fly_x = 0.0
         fly_y = 0.0
 
     if scale <= 0.02 or alpha <= 0.01:
@@ -261,7 +265,7 @@ def draw_countdown_number(ax, text, progress, color, spin):
     spin_t = smoothstep(progress)
     turns_x, turns_y, turns_z = spin
     rot = rotation_matrix(turns_x * 360 * spin_t, turns_y * 360 * spin_t, turns_z * 360 * spin_t)
-    offset = np.array([0.0, fly_y, 0.0])
+    offset = np.array([fly_x, fly_y, 0.0])
 
     base_rgb = np.array(hex_to_rgb(color))
     poly_verts = []
@@ -357,10 +361,11 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         frames.append(Image.fromarray(buf).convert("RGB"))
 
     # --- Countdown phase ---
-    # Camera stays close to azim=90 (where a digit at rest/identity rotation
-    # faces the viewer head-on, just like the flat "Happy Birthday!" overlay
-    # always does) and only bobs gently -- the wildness comes from the
-    # digit's own multi-axis spin, not from the camera drifting away.
+    # Camera stays close to azim=-90 (where a digit at rest/identity rotation
+    # faces the viewer head-on and reads correctly, just like the flat
+    # "Happy Birthday!" overlay always does) and only bobs gently -- the
+    # wildness comes from the digit's own multi-axis spin, not from the
+    # camera drifting away.
     spin_rng = random.Random(7)
     countdown_frame = 0
     for idx, num in enumerate(numbers):
@@ -378,13 +383,13 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
             ax.cla()
             setup_axes(ax)
             countdown_frame += 1
-            azim = 90 + 14 * np.sin(countdown_frame * 0.05)
+            azim = -90 + 14 * np.sin(countdown_frame * 0.05)
             elev = 15 + 6 * np.sin(countdown_frame * 0.035)
             ax.view_init(elev=elev, azim=azim)
             draw_stars(ax, stars)
             draw_countdown_number(ax, str(num), progress, color, spin)
             capture()
-    azim = 90.0
+    azim = -90.0
 
     # --- Firework + "Happy Birthday" phase ---
     fireworks = []
