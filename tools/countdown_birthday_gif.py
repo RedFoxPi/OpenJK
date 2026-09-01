@@ -22,7 +22,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as pe
+from matplotlib.textpath import TextPath
+from matplotlib.font_manager import FontProperties
+from matplotlib.transforms import Affine2D
+from matplotlib.tri import Triangulation
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from PIL import Image
 
 
@@ -31,7 +36,8 @@ from PIL import Image
 # --------------------------------------------------------------------------
 
 CUBE = 10.0            # half-extent of the 3D scene
-NUM_LAYERS = 10         # depth layers used to "extrude" the countdown digits
+DIGIT_HEIGHT = 7.0      # target height (in scene units) of an extruded digit
+DIGIT_DEPTH = 2.2       # extrusion thickness of an extruded digit
 STAR_COUNT = 140
 
 GOLD = "#FFD54A"
@@ -87,28 +93,117 @@ def setup_axes(ax):
         pass
 
 
-def draw_countdown_number(ax, text, progress, color):
-    """Draw a popping-in, layered (pseudo-extruded) 3D number."""
+_DIGIT_FONT = FontProperties(family="DejaVu Sans", weight="bold")
+
+
+def build_digit_mesh(text, target_height=DIGIT_HEIGHT, depth=DIGIT_DEPTH):
+    """Build a real extruded 3D mesh for a digit from its font outline.
+
+    Local axes (before any object rotation is applied), chosen so the
+    digit's rest pose faces the camera upright -- the same way the flat
+    "Happy Birthday!" overlay always faces the viewer:
+        x = left/right, y = extrusion depth (towards/away from camera),
+        z = up.
+
+    Returns a dict with 'faces' (N, 3-or-4, 3) local vertex arrays and a
+    matching 'colors01' shade array (0..1) used to tint the base color.
+    """
+    raw_path = TextPath((0, 0), text, size=200, prop=_DIGIT_FONT)
+    ext = raw_path.get_extents()
+    cx = ext.x0 + ext.width / 2.0
+    cy = ext.y0 + ext.height / 2.0
+    scale = target_height / ext.height if ext.height > 0 else 1.0
+    path = raw_path.transformed(Affine2D().translate(-cx, -cy).scale(scale))
+
+    polygons = [p for p in path.to_polygons() if len(p) >= 3]
+    pts = np.vstack([p[:-1] if np.allclose(p[0], p[-1]) else p for p in polygons])
+    x, y = pts[:, 0], pts[:, 1]
+
+    tri = Triangulation(x, y)
+    centroids = np.column_stack([x[tri.triangles].mean(axis=1), y[tri.triangles].mean(axis=1)])
+    inside = path.contains_points(centroids)
+    tri.set_mask(~inside)
+    cap_tri_idx = tri.get_masked_triangles()
+
+    faces = []       # each entry: list of (x, y_depth, z) local vertices
+    shades = []       # matching flat-shade brightness in [0, 1]
+    half = depth / 2.0
+
+    for a, b, c in cap_tri_idx:
+        faces.append([(x[a], half, y[a]), (x[b], half, y[b]), (x[c], half, y[c])])
+        shades.append(1.0)  # front cap: brightest
+        faces.append([(x[a], -half, y[a]), (x[c], -half, y[c]), (x[b], -half, y[b])])
+        shades.append(0.4)  # back cap: darkest
+
+    light_dir = np.array([0.6, 0.5])
+    light_dir /= np.linalg.norm(light_dir)
+    for poly in polygons:
+        p = poly[:-1] if np.allclose(poly[0], poly[-1]) else poly
+        n = len(p)
+        for i in range(n):
+            x0, y0 = p[i]
+            x1, y1 = p[(i + 1) % n]
+            edge = np.array([x1 - x0, y1 - y0])
+            edge_len = np.linalg.norm(edge)
+            if edge_len < 1e-6:
+                continue
+            normal = np.array([edge[1], -edge[0]]) / edge_len
+            shade = 0.45 + 0.5 * max(0.0, float(np.dot(normal, light_dir)))
+            faces.append([
+                (x0, half, y0), (x1, half, y1),
+                (x1, -half, y1), (x0, -half, y0),
+            ])
+            shades.append(shade)
+
+    return {
+        "faces": [np.array(f) for f in faces],
+        "shades": np.array(shades),
+    }
+
+
+DIGIT_MESHES = {str(n): build_digit_mesh(str(n)) for n in range(11)}
+
+
+def rotation_matrix(angle_x_deg, angle_y_deg, angle_z_deg):
+    ax_, ay_, az_ = np.radians([angle_x_deg, angle_y_deg, angle_z_deg])
+    rx = np.array([[1, 0, 0], [0, np.cos(ax_), -np.sin(ax_)], [0, np.sin(ax_), np.cos(ax_)]])
+    ry = np.array([[np.cos(ay_), 0, np.sin(ay_)], [0, 1, 0], [-np.sin(ay_), 0, np.cos(ay_)]])
+    rz = np.array([[np.cos(az_), -np.sin(az_), 0], [np.sin(az_), np.cos(az_), 0], [0, 0, 1]])
+    return rz @ ry @ rx
+
+
+def smoothstep(t):
+    t = min(max(t, 0.0), 1.0)
+    return t * t * (3 - 2 * t)
+
+
+def draw_countdown_number(ax, text, progress, color, spin):
+    """Draw a real, extruded 3D digit that tumbles in and settles back to
+    the same camera-facing orientation as "Happy Birthday!" at rest."""
     scale = ease_out_back(min(progress / 0.45, 1.0))
     alpha = ease_out_cubic(min(progress / 0.25, 1.0))
     if progress > 0.8:
         # fade out slightly right before the next number pops in
         alpha *= ease_out_cubic(1 - (progress - 0.8) / 0.2)
-
-    fontsize = 150 * scale
-    if fontsize <= 1 or alpha <= 0.01:
+    if scale <= 0.02 or alpha <= 0.01:
         return
 
-    base_rgb = hex_to_rgb(color)
-    for i in range(NUM_LAYERS):
-        depth_t = i / (NUM_LAYERS - 1)
-        z = -3.0 + depth_t * 3.0
-        shade = 0.35 + 0.65 * depth_t  # back layers darker -> gives the extruded look
-        rgb = tuple(c * shade for c in base_rgb)
-        layer_alpha = alpha * (0.5 if depth_t < 1.0 else 1.0)
-        ax.text(0, 0, z, text, color=rgb, alpha=layer_alpha, fontsize=fontsize,
-                 ha="center", va="center", zdir="z", fontweight="bold",
-                 path_effects=[pe.withStroke(linewidth=max(fontsize * 0.05, 1), foreground="black")])
+    mesh = DIGIT_MESHES[text]
+    spin_t = smoothstep(progress)
+    turns_x, turns_y, turns_z = spin
+    rot = rotation_matrix(turns_x * 360 * spin_t, turns_y * 360 * spin_t, turns_z * 360 * spin_t)
+
+    base_rgb = np.array(hex_to_rgb(color))
+    poly_verts = []
+    poly_colors = []
+    for local_verts, shade in zip(mesh["faces"], mesh["shades"]):
+        world = (rot @ (local_verts * scale).T).T
+        poly_verts.append(world)
+        poly_colors.append(tuple(base_rgb * shade))
+
+    coll = Poly3DCollection(poly_verts, facecolors=poly_colors, edgecolors="none",
+                             alpha=alpha, antialiased=False)
+    ax.add_collection3d(coll)
 
 
 # --------------------------------------------------------------------------
@@ -152,7 +247,7 @@ class Firework:
 def draw_happy_birthday(fig, progress):
     """Overlay 'Happy Birthday!' flying from the background into the foreground."""
     t = ease_out_back(progress, overshoot=1.2)
-    fontsize = 14 + 46 * t
+    fontsize = 12 + 26 * t
     alpha = ease_out_cubic(min(progress / 0.5, 1.0))
     y = 0.12 + 0.38 * t
     return fig.text(0.5, y, "Happy Birthday!", ha="center", va="center",
@@ -192,17 +287,34 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         frames.append(Image.fromarray(buf).convert("RGB"))
 
     # --- Countdown phase ---
+    # Camera stays close to azim=90 (where a digit at rest/identity rotation
+    # faces the viewer head-on, just like the flat "Happy Birthday!" overlay
+    # always does) and only bobs gently -- the wildness comes from the
+    # digit's own multi-axis spin, not from the camera drifting away.
+    spin_rng = random.Random(7)
+    countdown_frame = 0
     for idx, num in enumerate(numbers):
         color = COUNTDOWN_COLORS[idx % len(COUNTDOWN_COLORS)]
+        # Wild multi-axis tumble: whole-turn counts so the digit lands back
+        # on the same camera-facing orientation as "Happy Birthday!" both
+        # when it pops in (progress=0) and right before it pops out (progress=1).
+        spin = (
+            spin_rng.choice([1, 2]) * spin_rng.choice([-1, 1]),
+            spin_rng.choice([0, 1]) * spin_rng.choice([-1, 1]),
+            spin_rng.choice([2, 3]) * spin_rng.choice([-1, 1]),
+        )
         for f in range(frames_per_number):
             progress = f / frames_per_number
             ax.cla()
             setup_axes(ax)
-            azim += 1.1
-            ax.view_init(elev=18, azim=azim)
+            countdown_frame += 1
+            azim = 90 + 14 * np.sin(countdown_frame * 0.05)
+            elev = 15 + 6 * np.sin(countdown_frame * 0.035)
+            ax.view_init(elev=elev, azim=azim)
             draw_stars(ax, stars)
-            draw_countdown_number(ax, str(num), progress, color)
+            draw_countdown_number(ax, str(num), progress, color, spin)
             capture()
+    azim = 90.0
 
     # --- Firework + "Happy Birthday" phase ---
     fireworks = []
