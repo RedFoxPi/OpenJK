@@ -372,7 +372,7 @@ _HORSE_WHITE = "#ffffff"
 _HORSE_BLUSH = "#ffb3c6"
 
 
-def _ellipse_poly(cx, cy, rx, ry, rot_deg=0.0, n=22):
+def _ellipse_poly(cx, cy, rx, ry, rot_deg=0.0, n=14):
     t = np.linspace(0, 2 * np.pi, n, endpoint=False)
     pts = np.column_stack([rx * np.cos(t), ry * np.sin(t)])
     if rot_deg:
@@ -386,42 +386,76 @@ def _tri_poly(p1, p2, p3):
     return np.array([p1, p2, p3])
 
 
+def _extrude_part(poly2d, thickness, w_layer=0.0):
+    """Extrude a 2D (u, v) side-view polygon into a real 3D volume: a front
+    cap, a back cap and a ring of side-wall quads, in local (u, w, v)
+    coordinates -- u=forward/back, w=sideways thickness, v=height. This is
+    what turns the horse from a flat cutout into an actual 3D shape that
+    can be viewed, and rotated to face any direction, without ever going
+    edge-on/invisible or needing a mirror-flip."""
+    n = len(poly2d)
+    half = thickness / 2.0
+    u, v = poly2d[:, 0], poly2d[:, 1]
+    front = np.column_stack([u, np.full(n, w_layer + half), v])
+    back = np.column_stack([u, np.full(n, w_layer - half), v])
+    faces = [(front, 1.0), (back, 0.45)]
+    for i in range(n):
+        j = (i + 1) % n
+        quad = np.array([
+            [u[i], w_layer + half, v[i]],
+            [u[j], w_layer + half, v[j]],
+            [u[j], w_layer - half, v[j]],
+            [u[i], w_layer - half, v[i]],
+        ])
+        faces.append((quad, 0.72))
+    return faces
+
+
+_HORSE_CENTER_U = 5.0
+
+
 def build_horse_template():
-    """A cute, chibi-proportioned side-view pony built from simple rounded
-    shapes (a big soft body, a friendly head with a blush and a bow, poofy
-    mane/tail tufts) -- standing with feet at local y=0, roughly 10x10 units.
-    Colors are given as palette keys, resolved per horse instance so each
-    pony can wear its own coat/mane/bow colors.
+    """A cute, chibi-proportioned pony built from simple rounded shapes (a
+    big soft body, a friendly head with a blush and a bow, poofy mane/tail
+    tufts), each one a real extruded 3D volume rather than a flat cutout.
+    Standing with feet at local v=0, roughly 10 units tall, centered on its
+    own forward axis. Colors are given as palette keys, resolved per horse
+    instance so each pony can wear its own coat/mane/bow colors.
     """
-    rigid = [
-        (_ellipse_poly(4.6, 4.2, 2.5, 1.55), "body", 0.0),
-        (_ellipse_poly(6.6, 5.6, 1.05, 1.7, rot_deg=32), "body", 0.0),
-        (_ellipse_poly(7.75, 7.0, 1.0, 0.85), "body", 0.01),
-        (_ellipse_poly(8.65, 6.75, 0.55, 0.4), "snout", 0.02),
-        (_tri_poly((7.2, 7.7), (7.0, 8.75), (7.55, 7.85)), "body", 0.02),
-        (_tri_poly((7.75, 7.75), (7.95, 8.85), (8.15, 7.85)), "body", 0.02),
-        (_tri_poly((7.28, 7.75), (7.12, 8.5), (7.46, 7.9)), "blush", 0.03),
-        (_tri_poly((7.82, 7.8), (7.98, 8.55), (8.1, 7.9)), "blush", 0.03),
-        (_ellipse_poly(7.95, 7.15, 0.13, 0.13), "dark", 0.03),
-        (_ellipse_poly(8.0, 7.2, 0.045, 0.045), "white", 0.04),
-        (_ellipse_poly(8.95, 6.65, 0.08, 0.06), "dark", 0.03),
-        (_ellipse_poly(8.35, 6.55, 0.22, 0.16), "blush", 0.02),
-        (_tri_poly((7.35, 8.15), (6.98, 8.42), (7.35, 8.28)), "bow", 0.05),
-        (_tri_poly((7.55, 8.15), (7.92, 8.42), (7.55, 8.28)), "bow", 0.05),
-        (_ellipse_poly(7.45, 8.22, 0.1, 0.1), "bow", 0.06),
+    part_defs = [
+        (_ellipse_poly(4.6, 4.2, 2.5, 1.55), "body", 2.6, 0.0),
+        (_ellipse_poly(6.6, 5.6, 1.05, 1.7, rot_deg=32), "body", 1.7, 0.0),
+        (_ellipse_poly(7.75, 7.0, 1.0, 0.85), "body", 1.5, 0.0),
+        (_ellipse_poly(8.65, 6.75, 0.55, 0.4), "snout", 1.0, 0.0),
+        (_tri_poly((7.2, 7.7), (7.0, 8.75), (7.55, 7.85)), "body", 0.35, 0.0),
+        (_tri_poly((7.75, 7.75), (7.95, 8.85), (8.15, 7.85)), "body", 0.35, 0.0),
+        (_tri_poly((7.28, 7.75), (7.12, 8.5), (7.46, 7.9)), "blush", 0.2, 0.7),
+        (_tri_poly((7.82, 7.8), (7.98, 8.55), (8.1, 7.9)), "blush", 0.2, 0.7),
+        (_ellipse_poly(7.95, 7.15, 0.13, 0.13), "dark", 0.25, 0.75),
+        (_ellipse_poly(8.0, 7.2, 0.045, 0.045), "white", 0.28, 0.85),
+        (_ellipse_poly(8.95, 6.65, 0.08, 0.06), "dark", 0.25, 0.5),
+        (_ellipse_poly(8.35, 6.55, 0.22, 0.16), "blush", 0.2, 0.7),
+        (_tri_poly((7.35, 8.15), (6.98, 8.42), (7.35, 8.28)), "bow", 0.4, 0.0),
+        (_tri_poly((7.55, 8.15), (7.92, 8.42), (7.55, 8.28)), "bow", 0.4, 0.0),
+        (_ellipse_poly(7.45, 8.22, 0.1, 0.1), "bow", 0.42, 0.0),
     ]
     for mx, my, mr in [(6.05, 6.9, 0.42), (6.45, 7.25, 0.4), (6.9, 7.55, 0.36), (7.25, 7.75, 0.3)]:
-        rigid.append((_ellipse_poly(mx, my, mr, mr), "mane", 0.015))
+        part_defs.append((_ellipse_poly(mx, my, mr, mr), "mane", 1.0, 0.0))
+
+    rigid = []
+    for poly, color_key, thickness, w_layer in part_defs:
+        centered = poly - np.array([_HORSE_CENTER_U, 0.0])
+        for face, shade in _extrude_part(centered, thickness, w_layer):
+            rigid.append((face, color_key, shade))
+
+    leg_faces = _extrude_part(_ellipse_poly(0, -1.3, 0.34, 1.3), 0.85)
+    hoof_faces = _extrude_part(_ellipse_poly(0, -2.45, 0.4, 0.22), 0.9)
 
     def leg(pivot, side):
-        return {
-            "pivot": pivot,
-            "side": side,
-            "parts": [
-                (_ellipse_poly(0, -1.3, 0.34, 1.3), "body", 0.0),
-                (_ellipse_poly(0, -2.45, 0.4, 0.22), "dark", 0.01),
-            ],
-        }
+        pu, pv = pivot[0] - _HORSE_CENTER_U, pivot[1]
+        parts = [(face, "body", shade) for face, shade in leg_faces]
+        parts += [(face, "dark", shade) for face, shade in hoof_faces]
+        return {"pivot": (pu, pv), "side": side, "parts": parts}
 
     legs = [
         leg((3.3, 2.75), "back"),
@@ -430,14 +464,12 @@ def build_horse_template():
         leg((6.3, 2.8), "front"),
     ]
 
-    tail = {
-        "pivot": (2.2, 4.6),
-        "parts": [
-            (_ellipse_poly(0, 0, 0.5, 0.5), "mane", 0.0),
-            (_ellipse_poly(-0.5, -0.7, 0.42, 0.42), "mane", 0.0),
-            (_ellipse_poly(-0.85, -1.5, 0.34, 0.34), "mane", 0.0),
-        ],
-    }
+    tail_pivot = (2.2 - _HORSE_CENTER_U, 4.6)
+    tail_parts = []
+    for cx, cy, r, thick in [(0, 0, 0.5, 0.9), (-0.5, -0.7, 0.42, 0.85), (-0.85, -1.5, 0.34, 0.8)]:
+        for face, shade in _extrude_part(_ellipse_poly(cx, cy, r, r), thick):
+            tail_parts.append((face, "mane", shade))
+    tail = {"pivot": tail_pivot, "parts": tail_parts}
 
     return {"rigid": rigid, "legs": legs, "tail": tail}
 
@@ -445,12 +477,29 @@ def build_horse_template():
 HORSE_TEMPLATE = build_horse_template()
 
 
+def _rotate_uv(pts_xyz, angle_deg, pivot_uv):
+    """Rotate the (u, v) = (x, z) components of local (u, w, v) points
+    around pivot_uv, leaving the sideways w (y) component untouched --
+    used for the local leg-swing/tail-swish animation."""
+    r = np.radians(angle_deg)
+    c, s = np.cos(r), np.sin(r)
+    pu, pv = pivot_uv
+    u = pts_xyz[:, 0] - pu
+    v = pts_xyz[:, 2] - pv
+    out = pts_xyz.copy()
+    out[:, 0] = u * c - v * s + pu
+    out[:, 2] = u * s + v * c + pv
+    return out
+
+
 class DancingHorse:
-    """A cute background pony that rides around a circular track which
-    recedes into depth (a circle in the ground/depth plane, not one lying
-    flat against the screen) -- bouncing, swinging its legs in a little
-    trot and swishing its tail as it goes. Purely decorative background
-    flair, drawn behind the confetti and "Happy Birthday!" text."""
+    """A cute background pony, built as a real extruded 3D model, that
+    rides around a circular track which recedes into depth (a circle in
+    the ground/depth plane, not one lying flat against the screen). It
+    turns to face its actual direction of travel with a real yaw rotation
+    -- never mirror-flipping -- while bouncing, swinging its legs in a
+    little trot and swishing its tail. Purely decorative background flair,
+    drawn behind the confetti and "Happy Birthday!" text."""
 
     def __init__(self, theta0, orbit_center, orbit_radius, orbit_speed,
                  z_base, scale, phase, palette, dance_speed=2.2):
@@ -478,43 +527,41 @@ class DancingHorse:
         depth_t = np.clip((y_center - far_y) / (near_y - far_y), 0.0, 1.0)
         eff_scale = self.scale * (0.5 + 0.75 * depth_t)
 
-        # Face the direction of travel around the circle -- mirror the
-        # (right-facing) template when moving toward -x.
+        # A real yaw rotation to face the current direction of travel
+        # around the circle -- the horse is an actual 3D volume now, so it
+        # turns smoothly through every heading instead of mirror-flipping.
         vx = -np.sin(theta) * self.orbit_speed
-        facing = 1.0 if vx >= 0 else -1.0
+        vy = np.cos(theta) * self.orbit_speed
+        heading_deg = np.degrees(np.arctan2(vy, vx))
+        rot = rotation_matrix(0.0, 0.0, heading_deg)
 
         bounce = abs(np.sin(t * self.dance_speed + self.phase)) * 0.9
         swing_deg = np.sin(t * self.dance_speed * 2.0 + self.phase) * 26.0
         tail_deg = np.sin(t * self.dance_speed * 1.6 + self.phase + 1.0) * 20.0
+        center = np.array([x_center, y_center, self.z_base])
 
-        def place(local_xy, y_layer):
-            wx = (local_xy[:, 0] - 5.0) * facing * eff_scale + x_center
-            wz = local_xy[:, 1] * eff_scale + self.z_base + bounce * eff_scale
-            wy = np.full(len(local_xy), y_center + y_layer)
-            return np.column_stack([wx, wy, wz])
-
-        def rot2d(local_xy, angle_deg):
-            r = np.radians(angle_deg)
-            c, s = np.cos(r), np.sin(r)
-            return local_xy @ np.array([[c, -s], [s, c]]).T
+        def place(local_xyz):
+            world = (rot @ (local_xyz * eff_scale).T).T + center
+            world[:, 2] += bounce * eff_scale
+            return world
 
         verts, colors = [], []
-        for local_poly, color_key, y_layer in HORSE_TEMPLATE["rigid"]:
-            verts.append(place(local_poly, y_layer))
-            colors.append(self.colors[color_key])
+        for local_face, color_key, shade in HORSE_TEMPLATE["rigid"]:
+            verts.append(place(local_face))
+            colors.append(tuple(np.array(hex_to_rgb(self.colors[color_key])) * shade))
 
         for leg in HORSE_TEMPLATE["legs"]:
             angle = swing_deg if leg["side"] == "front" else -swing_deg
-            for local_poly, color_key, y_layer in leg["parts"]:
-                world_local = rot2d(local_poly, angle) + np.array(leg["pivot"])
-                verts.append(place(world_local, y_layer))
-                colors.append(self.colors[color_key])
+            for local_face, color_key, shade in leg["parts"]:
+                swung = _rotate_uv(local_face, angle, leg["pivot"])
+                verts.append(place(swung))
+                colors.append(tuple(np.array(hex_to_rgb(self.colors[color_key])) * shade))
 
         tail = HORSE_TEMPLATE["tail"]
-        for local_poly, color_key, y_layer in tail["parts"]:
-            world_local = rot2d(local_poly, tail_deg) + np.array(tail["pivot"])
-            verts.append(place(world_local, y_layer))
-            colors.append(self.colors[color_key])
+        for local_face, color_key, shade in tail["parts"]:
+            swung = _rotate_uv(local_face, tail_deg, tail["pivot"])
+            verts.append(place(swung))
+            colors.append(tuple(np.array(hex_to_rgb(self.colors[color_key])) * shade))
 
         return verts, colors
 
