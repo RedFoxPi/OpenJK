@@ -245,32 +245,36 @@ def smoothstep(t):
 
 GATHER_IN_FRAC = 0.4    # fraction of a digit's hold time spent assembling from particles
 SHATTER_OUT_FRAC = 0.4   # fraction spent shattering back into particles
-SHATTER_DISTANCE = 8.0    # how far each shard/particle travels while scattered
+SHATTER_DISTANCE = 8.0    # how far each shard/particle scatters radially
 PARTICLE_SCALE = 0.12     # how small a face shrinks to when it's "just a particle"
+DRIFT_DISTANCE_X = 17.0   # sideways drift while gathering/shattering -- past the frame edge
 
 
 def draw_countdown_number(ax, text, progress, color, spin):
     """Draw a real, extruded 3D digit that assembles out of a swarm of tiny
-    particles which snap into full polygon shards and merge into the digit,
-    tumbles at rest in the same camera-facing orientation as "Happy
-    Birthday!", then shatters back into shards, shrinks into particles and
-    scatters away -- ready to reform as the next digit."""
+    particles drifting in from off-screen left, which snap into full polygon
+    shards and merge into the digit; it tumbles at rest in the same
+    camera-facing orientation as "Happy Birthday!"; then shatters back into
+    shards, shrinks into particles and scatters away to off-screen right."""
     if progress < GATHER_IN_FRAC:
         t = progress / GATHER_IN_FRAC
         ease = ease_out_cubic(t)   # 0 -> 1 as the digit finishes assembling
         travel = 1.0 - ease
         shard_scale = PARTICLE_SCALE + (1.0 - PARTICLE_SCALE) * ease
         alpha = 0.35 + 0.65 * ease
+        drift_x = travel * -DRIFT_DISTANCE_X
     elif progress > 1 - SHATTER_OUT_FRAC:
         t = (progress - (1 - SHATTER_OUT_FRAC)) / SHATTER_OUT_FRAC
         ease = ease_in_cubic(t)     # 0 -> 1 as the digit finishes shattering away
         travel = ease
         shard_scale = 1.0 - (1.0 - PARTICLE_SCALE) * ease
         alpha = 1.0 - 0.65 * ease
+        drift_x = travel * DRIFT_DISTANCE_X
     else:
         travel = 0.0
         shard_scale = 1.0
         alpha = 1.0
+        drift_x = 0.0
 
     if alpha <= 0.01:
         return
@@ -279,6 +283,7 @@ def draw_countdown_number(ax, text, progress, color, spin):
     spin_t = smoothstep(progress)
     turns_x, turns_y, turns_z = spin
     rot = rotation_matrix(turns_x * 360 * spin_t, turns_y * 360 * spin_t, turns_z * 360 * spin_t)
+    drift = np.array([drift_x, 0.0, 0.0])
 
     base_rgb = np.array(hex_to_rgb(color))
     poly_verts = []
@@ -292,7 +297,7 @@ def draw_countdown_number(ax, text, progress, color, spin):
         # it reads as a solid little chip flying around, not a sliver being
         # stretched from the center.
         local_shard = centroid + (local_verts - centroid) * shard_scale + shard_offset
-        world = (rot @ local_shard.T).T
+        world = (rot @ local_shard.T).T + drift
         poly_verts.append(world)
         poly_colors.append(tuple(base_rgb * shade))
 
