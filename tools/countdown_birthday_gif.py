@@ -446,31 +446,51 @@ HORSE_TEMPLATE = build_horse_template()
 
 
 class DancingHorse:
-    """A cute background pony that bounces, swings its legs in a little
-    trot and swishes its tail -- purely decorative background flair, drawn
-    behind the confetti and "Happy Birthday!" text."""
+    """A cute background pony that rides around a circular track which
+    recedes into depth (a circle in the ground/depth plane, not one lying
+    flat against the screen) -- bouncing, swinging its legs in a little
+    trot and swishing its tail as it goes. Purely decorative background
+    flair, drawn behind the confetti and "Happy Birthday!" text."""
 
-    def __init__(self, x, z_base, scale, phase, palette, speed=2.2):
-        self.x = x
+    def __init__(self, theta0, orbit_center, orbit_radius, orbit_speed,
+                 z_base, scale, phase, palette, dance_speed=2.2):
+        self.theta0 = theta0
+        self.orbit_cx, self.orbit_cy = orbit_center
+        self.orbit_radius = orbit_radius
+        self.orbit_speed = orbit_speed
         self.z_base = z_base
         self.scale = scale
         self.phase = phase
-        self.speed = speed
+        self.dance_speed = dance_speed
         body, mane, snout, bow = palette
         self.colors = {
             "body": body, "mane": mane, "snout": snout, "bow": bow,
             "dark": _HORSE_DARK, "white": _HORSE_WHITE, "blush": _HORSE_BLUSH,
         }
 
-    def collect(self, t, y_bg):
-        bounce = abs(np.sin(t * self.speed + self.phase)) * 0.9
-        swing_deg = np.sin(t * self.speed * 2.0 + self.phase) * 26.0
-        tail_deg = np.sin(t * self.speed * 1.6 + self.phase + 1.0) * 20.0
+    def collect(self, t, near_y, far_y):
+        theta = self.theta0 + t * self.orbit_speed
+        x_center = self.orbit_cx + self.orbit_radius * np.cos(theta)
+        y_center = self.orbit_cy + self.orbit_radius * np.sin(theta)
+
+        # Nearer horses (closer to the camera) are drawn bigger, farther
+        # ones smaller, so the circular track visibly recedes into depth.
+        depth_t = np.clip((y_center - far_y) / (near_y - far_y), 0.0, 1.0)
+        eff_scale = self.scale * (0.5 + 0.75 * depth_t)
+
+        # Face the direction of travel around the circle -- mirror the
+        # (right-facing) template when moving toward -x.
+        vx = -np.sin(theta) * self.orbit_speed
+        facing = 1.0 if vx >= 0 else -1.0
+
+        bounce = abs(np.sin(t * self.dance_speed + self.phase)) * 0.9
+        swing_deg = np.sin(t * self.dance_speed * 2.0 + self.phase) * 26.0
+        tail_deg = np.sin(t * self.dance_speed * 1.6 + self.phase + 1.0) * 20.0
 
         def place(local_xy, y_layer):
-            wx = (local_xy[:, 0] - 5.0) * self.scale + self.x
-            wz = local_xy[:, 1] * self.scale + self.z_base + bounce * self.scale
-            wy = np.full(len(local_xy), y_bg + y_layer)
+            wx = (local_xy[:, 0] - 5.0) * facing * eff_scale + x_center
+            wz = local_xy[:, 1] * eff_scale + self.z_base + bounce * eff_scale
+            wy = np.full(len(local_xy), y_center + y_layer)
             return np.column_stack([wx, wy, wz])
 
         def rot2d(local_xy, angle_deg):
@@ -499,10 +519,17 @@ class DancingHorse:
         return verts, colors
 
 
-def draw_horses(ax, horses, t, y_bg):
+def draw_horses(ax, horses, t, near_y, far_y):
+    # Draw farthest-first so nearer horses correctly overlap farther ones.
+    def depth_of(h):
+        theta = h.theta0 + t * h.orbit_speed
+        y_center = h.orbit_cy + h.orbit_radius * np.sin(theta)
+        return (y_center - far_y) / (near_y - far_y)
+
+    ordered = sorted(horses, key=depth_of)
     verts, colors = [], []
-    for horse in horses:
-        hv, hc = horse.collect(t, y_bg)
+    for horse in ordered:
+        hv, hc = horse.collect(t, near_y, far_y)
         verts.extend(hv)
         colors.extend(hc)
     coll = Poly3DCollection(verts, facecolors=colors, edgecolors="none", antialiased=False)
@@ -656,20 +683,35 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
     text_fly_start = int(fps * 0.4)
     text_fly_duration = int(fps * 1.2)
     dt = 0.06
-    HORSE_BG_Y = -CUBE * 1.25   # a background plane, behind the confetti/text action
+
+    # The horses ride a circular track laid out in the ground/depth plane
+    # (not flat against the screen), so the circle visibly recedes into
+    # depth: half the ride is out front near the camera, half recedes into
+    # the background, looping continuously.
+    ORBIT_CENTER = (0.0, -CUBE * 0.9)
+    ORBIT_RADIUS = CUBE * 0.55
+    # Higher world-Y is closer to the camera at azim=-90 (the same
+    # convention the digits use), so the near point of the orbit is the
+    # +radius side and the far point is the -radius side.
+    ORBIT_NEAR_Y = ORBIT_CENTER[1] + ORBIT_RADIUS
+    ORBIT_FAR_Y = ORBIT_CENTER[1] - ORBIT_RADIUS
+    ORBIT_SPEED = 0.7
 
     horse_rng = random.Random(11)
-    horse_xs = np.linspace(-CUBE * 0.95, CUBE * 0.95, 5)
+    n_horses = 6
     horses = [
         DancingHorse(
-            x=hx + horse_rng.uniform(-0.6, 0.6),
-            z_base=-CUBE * 0.55 + horse_rng.uniform(-0.5, 0.5),
-            scale=horse_rng.uniform(0.62, 0.85),
+            theta0=i * (2 * np.pi / n_horses) + horse_rng.uniform(-0.15, 0.15),
+            orbit_center=ORBIT_CENTER,
+            orbit_radius=ORBIT_RADIUS,
+            orbit_speed=ORBIT_SPEED,
+            z_base=-CUBE * 0.55 + horse_rng.uniform(-0.3, 0.3),
+            scale=horse_rng.uniform(0.68, 0.82),
             phase=horse_rng.uniform(0, 2 * np.pi),
             palette=HORSE_PALETTE[i % len(HORSE_PALETTE)],
-            speed=horse_rng.uniform(1.9, 2.6),
+            dance_speed=horse_rng.uniform(2.4, 3.0),
         )
-        for i, hx in enumerate(horse_xs)
+        for i in range(n_horses)
     ]
 
     finale_time = 0.0
@@ -684,7 +726,7 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         draw_stars(ax, stars)
 
         finale_time += dt
-        draw_horses(ax, horses, finale_time, HORSE_BG_Y)
+        draw_horses(ax, horses, finale_time, ORBIT_NEAR_Y, ORBIT_FAR_Y)
 
         if f >= text_fly_start:
             text_progress = min(1.0, (f - text_fly_start) / text_fly_duration)
@@ -706,7 +748,7 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         draw_stars(ax, stars)
 
         finale_time += dt
-        draw_horses(ax, horses, finale_time, HORSE_BG_Y)
+        draw_horses(ax, horses, finale_time, ORBIT_NEAR_Y, ORBIT_FAR_Y)
 
         confetti.update(dt)
         confetti.draw(ax)
