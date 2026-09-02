@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Render an animated GIF: a 3D countdown from 10 to 0 that ends in an
-opulent particle firework, with a "Happy Birthday!" banner flying into
-the foreground.
+"""Render an animated GIF: a 3D countdown from 10 to 0 that ends in a
+party finale with cute dancing ponies and falling confetti in the
+background, and a "Happy Birthday!" banner flying into the foreground.
 
 Dependencies:
     pip install matplotlib numpy pillow
@@ -42,7 +42,7 @@ STAR_COUNT = 140
 
 GOLD = "#FFD54A"
 COUNTDOWN_COLORS = ["#3fb6ff", "#ff5f6d", "#ffd93f", "#6dffb0", "#c86dff"]
-FIREWORK_COLORS = ["#ff5f6d", "#ffd93f", "#6dffb0", "#3fb6ff", "#ff9de2", "#c86dff", "#ffffff"]
+CONFETTI_COLORS = ["#ff5f6d", "#ffd93f", "#6dffb0", "#3fb6ff", "#ff9de2", "#c86dff", "#ffffff"]
 
 
 def ease_out_back(t, overshoot=1.7):
@@ -357,58 +357,156 @@ def draw_transition(ax, old_text, new_text, t, old_color, new_color):
 
 
 # --------------------------------------------------------------------------
-# Fireworks
+# Dancing horses
 # --------------------------------------------------------------------------
 
-class Firework:
-    """One firework burst: a cloud of particles exploding from a center.
+HORSE_PALETTE = [
+    ("#c9814f", "#6b4226", "#f4e6d7", "#ff5f9e"),   # chestnut, mane, snout, bow
+    ("#dba463", "#7a4a2b", "#fbeedd", "#3fb6ff"),    # caramel, mane, snout, bow
+    ("#8d7466", "#4a382f", "#efe2d3", "#ffd93f"),    # dove grey-brown, mane, snout, bow
+    ("#5c4a42", "#241a16", "#e9dccb", "#6dffb0"),    # deep bay, mane, snout, bow
+    ("#e8c39e", "#a9713f", "#fff6ea", "#c86dff"),    # palomino, mane, snout, bow
+]
+_HORSE_DARK = "#2e2018"
+_HORSE_WHITE = "#ffffff"
+_HORSE_BLUSH = "#ffb3c6"
 
-    Bigger bursts have a chance to "crackle" partway through -- spawning a
-    handful of smaller secondary bursts from their own particles, like a
-    willow/crackle firework -- for a more opulent, layered finale.
+
+def _ellipse_poly(cx, cy, rx, ry, rot_deg=0.0, n=22):
+    t = np.linspace(0, 2 * np.pi, n, endpoint=False)
+    pts = np.column_stack([rx * np.cos(t), ry * np.sin(t)])
+    if rot_deg:
+        r = np.radians(rot_deg)
+        c, s = np.cos(r), np.sin(r)
+        pts = pts @ np.array([[c, -s], [s, c]]).T
+    return pts + np.array([cx, cy])
+
+
+def _tri_poly(p1, p2, p3):
+    return np.array([p1, p2, p3])
+
+
+def build_horse_template():
+    """A cute, chibi-proportioned side-view pony built from simple rounded
+    shapes (a big soft body, a friendly head with a blush and a bow, poofy
+    mane/tail tufts) -- standing with feet at local y=0, roughly 10x10 units.
+    Colors are given as palette keys, resolved per horse instance so each
+    pony can wear its own coat/mane/bow colors.
     """
+    rigid = [
+        (_ellipse_poly(4.6, 4.2, 2.5, 1.55), "body", 0.0),
+        (_ellipse_poly(6.6, 5.6, 1.05, 1.7, rot_deg=32), "body", 0.0),
+        (_ellipse_poly(7.75, 7.0, 1.0, 0.85), "body", 0.01),
+        (_ellipse_poly(8.65, 6.75, 0.55, 0.4), "snout", 0.02),
+        (_tri_poly((7.2, 7.7), (7.0, 8.75), (7.55, 7.85)), "body", 0.02),
+        (_tri_poly((7.75, 7.75), (7.95, 8.85), (8.15, 7.85)), "body", 0.02),
+        (_tri_poly((7.28, 7.75), (7.12, 8.5), (7.46, 7.9)), "blush", 0.03),
+        (_tri_poly((7.82, 7.8), (7.98, 8.55), (8.1, 7.9)), "blush", 0.03),
+        (_ellipse_poly(7.95, 7.15, 0.13, 0.13), "dark", 0.03),
+        (_ellipse_poly(8.0, 7.2, 0.045, 0.045), "white", 0.04),
+        (_ellipse_poly(8.95, 6.65, 0.08, 0.06), "dark", 0.03),
+        (_ellipse_poly(8.35, 6.55, 0.22, 0.16), "blush", 0.02),
+        (_tri_poly((7.35, 8.15), (6.98, 8.42), (7.35, 8.28)), "bow", 0.05),
+        (_tri_poly((7.55, 8.15), (7.92, 8.42), (7.55, 8.28)), "bow", 0.05),
+        (_ellipse_poly(7.45, 8.22, 0.1, 0.1), "bow", 0.06),
+    ]
+    for mx, my, mr in [(6.05, 6.9, 0.42), (6.45, 7.25, 0.4), (6.9, 7.55, 0.36), (7.25, 7.75, 0.3)]:
+        rigid.append((_ellipse_poly(mx, my, mr, mr), "mane", 0.015))
 
-    def __init__(self, center, n_particles=130, speed=6.0, color=None, can_crackle=True):
-        self.center = np.array(center, dtype=float)
-        rng = np.random.default_rng()
-        dirs = rng.normal(size=(n_particles, 3))
-        dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
-        speeds = rng.uniform(0.4, 1.0, size=n_particles) * speed
-        self.pos = np.tile(self.center, (n_particles, 1))
-        self.vel = dirs * speeds[:, None]
-        self.age = 0.0
-        self.lifetime = rng.uniform(1.6, 2.4)
-        self.color = color or random.choice(FIREWORK_COLORS)
-        self.can_crackle = can_crackle and n_particles >= 60
-        self.crackled = False
+    def leg(pivot, side):
+        return {
+            "pivot": pivot,
+            "side": side,
+            "parts": [
+                (_ellipse_poly(0, -1.3, 0.34, 1.3), "body", 0.0),
+                (_ellipse_poly(0, -2.45, 0.4, 0.22), "dark", 0.01),
+            ],
+        }
 
-    def alive(self):
-        return self.age < self.lifetime
+    legs = [
+        leg((3.3, 2.75), "back"),
+        leg((3.9, 2.7), "back"),
+        leg((5.7, 2.85), "front"),
+        leg((6.3, 2.8), "front"),
+    ]
 
-    def update(self, dt):
-        self.age += dt
-        gravity = np.array([0.0, 0.0, -3.2])
-        self.vel += gravity * dt
-        self.vel *= 0.98  # air drag
-        self.pos += self.vel * dt
+    tail = {
+        "pivot": (2.2, 4.6),
+        "parts": [
+            (_ellipse_poly(0, 0, 0.5, 0.5), "mane", 0.0),
+            (_ellipse_poly(-0.5, -0.7, 0.42, 0.42), "mane", 0.0),
+            (_ellipse_poly(-0.85, -1.5, 0.34, 0.34), "mane", 0.0),
+        ],
+    }
 
-        children = []
-        if self.can_crackle and not self.crackled and self.age > self.lifetime * 0.35:
-            self.crackled = True
-            if random.random() < 0.7:
-                n = len(self.pos)
-                for i in random.sample(range(n), min(3, n)):
-                    children.append(Firework(self.pos[i], n_particles=26, speed=2.6,
-                                              can_crackle=False))
-        return children
+    return {"rigid": rigid, "legs": legs, "tail": tail}
 
-    def draw(self, ax):
-        life_frac = max(0.0, 1.0 - self.age / self.lifetime)
-        alpha = life_frac ** 0.7
-        size = 14 * life_frac + 2
-        ax.scatter(self.pos[:, 0], self.pos[:, 1], self.pos[:, 2],
-                   s=size, c=self.color, alpha=alpha, linewidths=0,
-                   depthshade=False)
+
+HORSE_TEMPLATE = build_horse_template()
+
+
+class DancingHorse:
+    """A cute background pony that bounces, swings its legs in a little
+    trot and swishes its tail -- purely decorative background flair, drawn
+    behind the confetti and "Happy Birthday!" text."""
+
+    def __init__(self, x, z_base, scale, phase, palette, speed=2.2):
+        self.x = x
+        self.z_base = z_base
+        self.scale = scale
+        self.phase = phase
+        self.speed = speed
+        body, mane, snout, bow = palette
+        self.colors = {
+            "body": body, "mane": mane, "snout": snout, "bow": bow,
+            "dark": _HORSE_DARK, "white": _HORSE_WHITE, "blush": _HORSE_BLUSH,
+        }
+
+    def collect(self, t, y_bg):
+        bounce = abs(np.sin(t * self.speed + self.phase)) * 0.9
+        swing_deg = np.sin(t * self.speed * 2.0 + self.phase) * 26.0
+        tail_deg = np.sin(t * self.speed * 1.6 + self.phase + 1.0) * 20.0
+
+        def place(local_xy, y_layer):
+            wx = (local_xy[:, 0] - 5.0) * self.scale + self.x
+            wz = local_xy[:, 1] * self.scale + self.z_base + bounce * self.scale
+            wy = np.full(len(local_xy), y_bg + y_layer)
+            return np.column_stack([wx, wy, wz])
+
+        def rot2d(local_xy, angle_deg):
+            r = np.radians(angle_deg)
+            c, s = np.cos(r), np.sin(r)
+            return local_xy @ np.array([[c, -s], [s, c]]).T
+
+        verts, colors = [], []
+        for local_poly, color_key, y_layer in HORSE_TEMPLATE["rigid"]:
+            verts.append(place(local_poly, y_layer))
+            colors.append(self.colors[color_key])
+
+        for leg in HORSE_TEMPLATE["legs"]:
+            angle = swing_deg if leg["side"] == "front" else -swing_deg
+            for local_poly, color_key, y_layer in leg["parts"]:
+                world_local = rot2d(local_poly, angle) + np.array(leg["pivot"])
+                verts.append(place(world_local, y_layer))
+                colors.append(self.colors[color_key])
+
+        tail = HORSE_TEMPLATE["tail"]
+        for local_poly, color_key, y_layer in tail["parts"]:
+            world_local = rot2d(local_poly, tail_deg) + np.array(tail["pivot"])
+            verts.append(place(world_local, y_layer))
+            colors.append(self.colors[color_key])
+
+        return verts, colors
+
+
+def draw_horses(ax, horses, t, y_bg):
+    verts, colors = [], []
+    for horse in horses:
+        hv, hc = horse.collect(t, y_bg)
+        verts.extend(hv)
+        colors.extend(hc)
+    coll = Poly3DCollection(verts, facecolors=colors, edgecolors="none", antialiased=False)
+    ax.add_collection3d(coll)
 
 
 class Confetti:
@@ -428,7 +526,7 @@ class Confetti:
             self.rng.uniform(-2.6, -1.0, n),
         ])
         self.flutter_phase = self.rng.uniform(0, 2 * np.pi, n)
-        self.colors = np.array([hex_to_rgb(c) for c in self.rng.choice(FIREWORK_COLORS, n)])
+        self.colors = np.array([hex_to_rgb(c) for c in self.rng.choice(CONFETTI_COLORS, n)])
         self.size_base = self.rng.uniform(8, 20, n)
 
     def update(self, dt):
@@ -470,8 +568,8 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
     transition_frames = int(fps * (0.45 if quick else 1.0))
     edge_frames = int(fps * (0.3 if quick else 0.6))
     numbers = list(range(10, -1, -1))
-    firework_seconds = 2.0 if quick else 6.0
-    firework_frames = int(fps * firework_seconds)
+    finale_seconds = 2.0 if quick else 6.0
+    finale_frames = int(fps * finale_seconds)
     end_hold_frames = int(fps * (0.8 if quick else 3.0))
 
     fig = plt.figure(figsize=(6, 4.5), dpi=70 if quick else 90)
@@ -553,75 +651,62 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
                 capture()
     azim = -90.0
 
-    # --- Firework + "Happy Birthday" phase ---
-    fireworks = []
+    # --- Dancing horses + "Happy Birthday" finale ---
     confetti = Confetti()
-    spawn_every = max(1, int(fps * 0.18))
     text_fly_start = int(fps * 0.4)
     text_fly_duration = int(fps * 1.2)
-    grand_finale_fired = False
     dt = 0.06
+    HORSE_BG_Y = -CUBE * 1.25   # a background plane, behind the confetti/text action
 
-    def random_burst_center(spread=0.5):
-        return (
-            random.uniform(-CUBE * spread, CUBE * spread),
-            random.uniform(-CUBE * spread, CUBE * spread),
-            random.uniform(-1.0, CUBE * 0.6),
+    horse_rng = random.Random(11)
+    horse_xs = np.linspace(-CUBE * 0.95, CUBE * 0.95, 5)
+    horses = [
+        DancingHorse(
+            x=hx + horse_rng.uniform(-0.6, 0.6),
+            z_base=-CUBE * 0.55 + horse_rng.uniform(-0.5, 0.5),
+            scale=horse_rng.uniform(0.62, 0.85),
+            phase=horse_rng.uniform(0, 2 * np.pi),
+            palette=HORSE_PALETTE[i % len(HORSE_PALETTE)],
+            speed=horse_rng.uniform(1.9, 2.6),
         )
+        for i, hx in enumerate(horse_xs)
+    ]
 
-    def update_fireworks(dt):
-        children = []
-        for fw in fireworks:
-            children.extend(fw.update(dt))
-        fireworks.extend(children)
-        fireworks[:] = [fw for fw in fireworks if fw.alive()]
+    finale_time = 0.0
 
-    for f in range(firework_frames):
+    for f in range(finale_frames):
         ax.cla()
         setup_axes(ax)
         clear_birthday()
-        azim += 0.8
-        ax.view_init(elev=16, azim=azim)
+        azim = -90 + 10 * np.sin(f * 0.03)
+        elev = 15 + 5 * np.sin(f * 0.02)
+        ax.view_init(elev=elev, azim=azim)
         draw_stars(ax, stars)
 
-        if f % spawn_every == 0:
-            fireworks.append(Firework(random_burst_center()))
-        if f % (spawn_every * 3) == 0:
-            # a second, simultaneous burst for a fuller sky
-            fireworks.append(Firework(random_burst_center()))
+        finale_time += dt
+        draw_horses(ax, horses, finale_time, HORSE_BG_Y)
 
         if f >= text_fly_start:
             text_progress = min(1.0, (f - text_fly_start) / text_fly_duration)
             birthday_artists.append(draw_happy_birthday(fig, text_progress))
-            if text_progress >= 1.0 and not grand_finale_fired:
-                grand_finale_fired = True
-                for _ in range(7):
-                    fireworks.append(Firework(random_burst_center(spread=0.75), n_particles=160, speed=7.5))
-
-        update_fireworks(dt)
-        for fw in fireworks:
-            fw.draw(ax)
 
         confetti.update(dt)
         confetti.draw(ax)
 
         capture()
 
-    # --- Final hold: full-on party finale, confetti and fireworks keep going ---
+    # --- Final hold: the ponies keep dancing, confetti keeps falling ---
     for f in range(end_hold_frames):
         ax.cla()
         setup_axes(ax)
         clear_birthday()
-        azim += 0.5
-        ax.view_init(elev=16, azim=azim)
+        azim = -90 + 10 * np.sin((finale_frames + f) * 0.03)
+        elev = 15 + 5 * np.sin((finale_frames + f) * 0.02)
+        ax.view_init(elev=elev, azim=azim)
         draw_stars(ax, stars)
 
-        if f % spawn_every == 0:
-            fireworks.append(Firework(random_burst_center(spread=0.45), n_particles=100))
-
-        update_fireworks(dt)
-        for fw in fireworks:
-            fw.draw(ax)
+        finale_time += dt
+        draw_horses(ax, horses, finale_time, HORSE_BG_Y)
 
         confetti.update(dt)
         confetti.draw(ax)
