@@ -552,14 +552,19 @@ class DancingHorse:
 
         for leg in HORSE_TEMPLATE["legs"]:
             angle = swing_deg if leg["side"] == "front" else -swing_deg
+            pivot_offset = np.array([leg["pivot"][0], 0.0, leg["pivot"][1]])
             for local_face, color_key, shade in leg["parts"]:
-                swung = _rotate_uv(local_face, angle, leg["pivot"])
+                # Parts are stored pivot-relative (hip/shoulder at local
+                # origin), so swing around (0, 0) first, then move the
+                # whole swung leg to its attachment point on the body.
+                swung = _rotate_uv(local_face, angle, (0.0, 0.0)) + pivot_offset
                 verts.append(place(swung))
                 colors.append(tuple(np.array(hex_to_rgb(self.colors[color_key])) * shade))
 
         tail = HORSE_TEMPLATE["tail"]
+        tail_offset = np.array([tail["pivot"][0], 0.0, tail["pivot"][1]])
         for local_face, color_key, shade in tail["parts"]:
-            swung = _rotate_uv(local_face, tail_deg, tail["pivot"])
+            swung = _rotate_uv(local_face, tail_deg, (0.0, 0.0)) + tail_offset
             verts.append(place(swung))
             colors.append(tuple(np.array(hex_to_rgb(self.colors[color_key])) * shade))
 
