@@ -757,7 +757,7 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
             orbit_center=ORBIT_CENTER,
             orbit_radius=ORBIT_RADIUS,
             orbit_speed=ORBIT_SPEED,
-            z_base=-CUBE * 0.55 + horse_rng.uniform(-0.3, 0.3),
+            z_base=-CUBE * 1.35 + horse_rng.uniform(-0.3, 0.3),
             scale=horse_rng.uniform(0.68, 0.82),
             phase=horse_rng.uniform(0, 2 * np.pi),
             palette=HORSE_PALETTE[i % len(HORSE_PALETTE)],
