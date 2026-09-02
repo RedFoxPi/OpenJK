@@ -206,9 +206,24 @@ def build_digit_mesh(text, target_height=DIGIT_HEIGHT, depth=DIGIT_DEPTH):
             ])
             shades.append(shade)
 
+    face_arrays = [np.array(f) for f in faces]
+    centroids = np.array([f.mean(axis=0) for f in face_arrays])
+
+    # A fixed per-face random outward "shatter direction" (mostly along the
+    # face's own direction from the digit's center, with some jitter so the
+    # shards don't fly out in a perfectly uniform starburst).
+    rng = np.random.default_rng(abs(hash(text)) % (2 ** 32))
+    jitter = rng.normal(scale=0.4, size=centroids.shape)
+    shatter_dir = centroids + jitter
+    norms = np.linalg.norm(shatter_dir, axis=1, keepdims=True)
+    norms[norms < 1e-6] = 1.0
+    shatter_dir /= norms
+
     return {
-        "faces": [np.array(f) for f in faces],
+        "faces": face_arrays,
         "shades": np.array(shades),
+        "centroids": centroids,
+        "shatter_dir": shatter_dir,
     }
 
 
@@ -228,50 +243,56 @@ def smoothstep(t):
     return t * t * (3 - 2 * t)
 
 
-FLY_IN_FRAC = 0.4     # fraction of a digit's hold time spent flying in
-FLY_OUT_FRAC = 0.4     # fraction spent flying back out
-FLY_DISTANCE_X = 17.0   # sideways travel while flying -- well past the frame edge
-FLY_DISTANCE_Y = 7.0    # extra back/forward travel while flying, for depth
+GATHER_IN_FRAC = 0.4    # fraction of a digit's hold time spent assembling from particles
+SHATTER_OUT_FRAC = 0.4   # fraction spent shattering back into particles
+SHATTER_DISTANCE = 8.0    # how far each shard/particle travels while scattered
+PARTICLE_SCALE = 0.12     # how small a face shrinks to when it's "just a particle"
 
 
 def draw_countdown_number(ax, text, progress, color, spin):
-    """Draw a real, extruded 3D digit that flies in from off-screen (left),
+    """Draw a real, extruded 3D digit that assembles out of a swarm of tiny
+    particles which snap into full polygon shards and merge into the digit,
     tumbles at rest in the same camera-facing orientation as "Happy
-    Birthday!", then flies onward off-screen (right) until it is gone."""
-    if progress < FLY_IN_FRAC:
-        t = progress / FLY_IN_FRAC
-        ease = ease_out_cubic(t)
-        scale = 0.15 + 0.85 * ease_out_back(t)
-        alpha = ease
-        fly_x = (1 - ease) * -FLY_DISTANCE_X
-        fly_y = (1 - ease) * -FLY_DISTANCE_Y
-    elif progress > 1 - FLY_OUT_FRAC:
-        t = (progress - (1 - FLY_OUT_FRAC)) / FLY_OUT_FRAC
-        ease = ease_in_cubic(t)
-        scale = 1.0 - 0.85 * ease
-        alpha = 1.0 - ease
-        fly_x = ease * FLY_DISTANCE_X
-        fly_y = ease * FLY_DISTANCE_Y
+    Birthday!", then shatters back into shards, shrinks into particles and
+    scatters away -- ready to reform as the next digit."""
+    if progress < GATHER_IN_FRAC:
+        t = progress / GATHER_IN_FRAC
+        ease = ease_out_cubic(t)   # 0 -> 1 as the digit finishes assembling
+        travel = 1.0 - ease
+        shard_scale = PARTICLE_SCALE + (1.0 - PARTICLE_SCALE) * ease
+        alpha = 0.35 + 0.65 * ease
+    elif progress > 1 - SHATTER_OUT_FRAC:
+        t = (progress - (1 - SHATTER_OUT_FRAC)) / SHATTER_OUT_FRAC
+        ease = ease_in_cubic(t)     # 0 -> 1 as the digit finishes shattering away
+        travel = ease
+        shard_scale = 1.0 - (1.0 - PARTICLE_SCALE) * ease
+        alpha = 1.0 - 0.65 * ease
     else:
-        scale = 1.0
+        travel = 0.0
+        shard_scale = 1.0
         alpha = 1.0
-        fly_x = 0.0
-        fly_y = 0.0
 
-    if scale <= 0.02 or alpha <= 0.01:
+    if alpha <= 0.01:
         return
 
     mesh = DIGIT_MESHES[text]
     spin_t = smoothstep(progress)
     turns_x, turns_y, turns_z = spin
     rot = rotation_matrix(turns_x * 360 * spin_t, turns_y * 360 * spin_t, turns_z * 360 * spin_t)
-    offset = np.array([fly_x, fly_y, 0.0])
 
     base_rgb = np.array(hex_to_rgb(color))
     poly_verts = []
     poly_colors = []
-    for local_verts, shade in zip(mesh["faces"], mesh["shades"]):
-        world = (rot @ (local_verts * scale).T).T + offset
+    centroids = mesh["centroids"]
+    shatter_dir = mesh["shatter_dir"]
+    for local_verts, shade, centroid, direction in zip(
+            mesh["faces"], mesh["shades"], centroids, shatter_dir):
+        shard_offset = direction * (travel * SHATTER_DISTANCE)
+        # scale each shard about its own centroid (not the digit's origin) so
+        # it reads as a solid little chip flying around, not a sliver being
+        # stretched from the center.
+        local_shard = centroid + (local_verts - centroid) * shard_scale + shard_offset
+        world = (rot @ local_shard.T).T
         poly_verts.append(world)
         poly_colors.append(tuple(base_rgb * shade))
 
