@@ -243,64 +243,114 @@ def smoothstep(t):
     return t * t * (3 - 2 * t)
 
 
-GATHER_IN_FRAC = 0.4    # fraction of a digit's hold time spent assembling from particles
-SHATTER_OUT_FRAC = 0.4   # fraction spent shattering back into particles
 SHATTER_DISTANCE = 8.0    # how far each shard/particle scatters radially
 PARTICLE_SCALE = 0.12     # how small a face shrinks to when it's "just a particle"
-DRIFT_DISTANCE_X = 17.0   # sideways drift while gathering/shattering -- past the frame edge
+DRIFT_DISTANCE_X = 17.0   # sideways drift while materializing/dissolving -- past the frame edge
+TRANSIT_RIGHT_X = 13.0    # how far a decaying digit's particles sweep right
+TRANSIT_LEFT_X = 10.0     # how far they then swing past center to the left before settling
+BURST_RADIUS = 3.0        # extra outward kick applied at the mid-transition burst
+
+
+def _shard_polys(mesh, shard_scale, radial_travel, drift, rot):
+    """Build the rotated/offset/scaled world-space polygons for one mesh's
+    faces. `radial_travel` scatters each shard outward along its own
+    precomputed shatter direction; `drift` is a uniform world-space offset
+    (e.g. sideways travel) added after rotation."""
+    poly_verts = []
+    for local_verts, centroid, direction in zip(
+            mesh["faces"], mesh["centroids"], mesh["shatter_dir"]):
+        shard_offset = direction * radial_travel
+        local_shard = centroid + (local_verts - centroid) * shard_scale + shard_offset
+        poly_verts.append((rot @ local_shard.T).T + drift)
+    return poly_verts
 
 
 def draw_countdown_number(ax, text, progress, color, spin):
-    """Draw a real, extruded 3D digit that assembles out of a swarm of tiny
-    particles drifting in from off-screen left, which snap into full polygon
-    shards and merge into the digit; it tumbles at rest in the same
-    camera-facing orientation as "Happy Birthday!"; then shatters back into
-    shards, shrinks into particles and scatters away to off-screen right."""
-    if progress < GATHER_IN_FRAC:
-        t = progress / GATHER_IN_FRAC
-        ease = ease_out_cubic(t)   # 0 -> 1 as the digit finishes assembling
-        travel = 1.0 - ease
-        shard_scale = PARTICLE_SCALE + (1.0 - PARTICLE_SCALE) * ease
-        alpha = 0.35 + 0.65 * ease
-        drift_x = travel * -DRIFT_DISTANCE_X
-    elif progress > 1 - SHATTER_OUT_FRAC:
-        t = (progress - (1 - SHATTER_OUT_FRAC)) / SHATTER_OUT_FRAC
-        ease = ease_in_cubic(t)     # 0 -> 1 as the digit finishes shattering away
-        travel = ease
-        shard_scale = 1.0 - (1.0 - PARTICLE_SCALE) * ease
-        alpha = 1.0 - 0.65 * ease
-        drift_x = travel * DRIFT_DISTANCE_X
-    else:
-        travel = 0.0
-        shard_scale = 1.0
-        alpha = 1.0
-        drift_x = 0.0
-
-    if alpha <= 0.01:
-        return
-
+    """Draw a real, extruded 3D digit fully assembled, tumbling in the same
+    camera-facing orientation as "Happy Birthday!" at rest (progress=0/1)."""
     mesh = DIGIT_MESHES[text]
     spin_t = smoothstep(progress)
     turns_x, turns_y, turns_z = spin
     rot = rotation_matrix(turns_x * 360 * spin_t, turns_y * 360 * spin_t, turns_z * 360 * spin_t)
-    drift = np.array([drift_x, 0.0, 0.0])
 
     base_rgb = np.array(hex_to_rgb(color))
-    poly_verts = []
-    poly_colors = []
-    centroids = mesh["centroids"]
-    shatter_dir = mesh["shatter_dir"]
-    for local_verts, shade, centroid, direction in zip(
-            mesh["faces"], mesh["shades"], centroids, shatter_dir):
-        shard_offset = direction * (travel * SHATTER_DISTANCE)
-        # scale each shard about its own centroid (not the digit's origin) so
-        # it reads as a solid little chip flying around, not a sliver being
-        # stretched from the center.
-        local_shard = centroid + (local_verts - centroid) * shard_scale + shard_offset
-        world = (rot @ local_shard.T).T + drift
-        poly_verts.append(world)
-        poly_colors.append(tuple(base_rgb * shade))
+    poly_verts = _shard_polys(mesh, 1.0, 0.0, np.zeros(3), rot)
+    poly_colors = [tuple(base_rgb * shade) for shade in mesh["shades"]]
 
+    coll = Poly3DCollection(poly_verts, facecolors=poly_colors, edgecolors="none",
+                             alpha=1.0, antialiased=False)
+    ax.add_collection3d(coll)
+
+
+def draw_materialize(ax, text, t, color):
+    """The very first digit has no predecessor to emerge from, so it just
+    condenses out of a swarm of tiny particles drifting in from the left."""
+    ease = ease_out_cubic(t)
+    shard_scale = PARTICLE_SCALE + (1.0 - PARTICLE_SCALE) * ease
+    radial_travel = (1.0 - ease) * SHATTER_DISTANCE
+    alpha = 0.35 + 0.65 * ease
+    drift = np.array([(1.0 - ease) * -DRIFT_DISTANCE_X, 0.0, 0.0])
+
+    mesh = DIGIT_MESHES[text]
+    base_rgb = np.array(hex_to_rgb(color))
+    poly_verts = _shard_polys(mesh, shard_scale, radial_travel, drift, np.eye(3))
+    poly_colors = [tuple(base_rgb * shade) for shade in mesh["shades"]]
+    coll = Poly3DCollection(poly_verts, facecolors=poly_colors, edgecolors="none",
+                             alpha=alpha, antialiased=False)
+    ax.add_collection3d(coll)
+
+
+def draw_dissolve(ax, text, t, color):
+    """The final digit ("0") has no successor -- it just shatters into
+    particles and scatters away to the right, handing off to the fireworks."""
+    ease = ease_in_cubic(t)
+    shard_scale = 1.0 - (1.0 - PARTICLE_SCALE) * ease
+    radial_travel = ease * SHATTER_DISTANCE
+    alpha = 1.0 - 0.65 * ease
+    drift = np.array([ease * DRIFT_DISTANCE_X, 0.0, 0.0])
+
+    mesh = DIGIT_MESHES[text]
+    base_rgb = np.array(hex_to_rgb(color))
+    poly_verts = _shard_polys(mesh, shard_scale, radial_travel, drift, np.eye(3))
+    poly_colors = [tuple(base_rgb * shade) for shade in mesh["shades"]]
+    coll = Poly3DCollection(poly_verts, facecolors=poly_colors, edgecolors="none",
+                             alpha=alpha, antialiased=False)
+    ax.add_collection3d(coll)
+
+
+def draw_transition(ax, old_text, new_text, t, old_color, new_color):
+    """The particles of the decaying digit sweep right, burst apart in a
+    flurry of tiny drifting motes while their colour bleeds continuously
+    from the old digit's colour to the new one's, then sweep back past
+    center to the left and re-condense into the next digit's polygon shards."""
+    # One continuous sideways sweep: right, then past center to the left,
+    # settling back at x=0 exactly as the next digit's hold phase begins.
+    if t <= 0.6:
+        local_t = t / 0.6
+        drift_x = TRANSIT_RIGHT_X * np.sin(np.pi * local_t)
+    else:
+        local_t = (t - 0.6) / 0.4
+        drift_x = -TRANSIT_LEFT_X * np.sin(np.pi * local_t)
+    drift = np.array([drift_x, 0.0, 0.0])
+
+    # Shards are largest/most solid at the endpoints (still-forming old
+    # digit, freshly-formed new digit) and shrink to tiny bursting particles
+    # around the midpoint.
+    shard_scale = 1.0 - (1.0 - PARTICLE_SCALE) * np.sin(np.pi * t)
+    burst = BURST_RADIUS * np.sin(np.pi * t)
+    alpha = 0.5 + 0.5 * (1.0 - abs(2.0 * t - 1.0))
+
+    # A colour that bleeds continuously from the old digit's to the new
+    # digit's across the whole sweep, independent of which mesh is active.
+    blended_rgb = np.array(hex_to_rgb(old_color)) * (1.0 - t) + np.array(hex_to_rgb(new_color)) * t
+
+    # Which digit's shape the shards borrow is switched at the midpoint,
+    # where they are smallest/most particle-like, so the swap is disguised.
+    mesh = DIGIT_MESHES[old_text] if t < 0.5 else DIGIT_MESHES[new_text]
+    rot = rotation_matrix(0.0, 0.0, 90.0 * smoothstep(t))
+
+    poly_verts = _shard_polys(mesh, shard_scale, burst, drift, rot)
+    poly_colors = [tuple(blended_rgb * shade) for shade in mesh["shades"]]
     coll = Poly3DCollection(poly_verts, facecolors=poly_colors, edgecolors="none",
                              alpha=alpha, antialiased=False)
     ax.add_collection3d(coll)
@@ -416,7 +466,9 @@ def draw_happy_birthday(fig, progress):
 # --------------------------------------------------------------------------
 
 def generate(output="countdown_birthday.gif", fps=20, quick=False):
-    frames_per_number = int(fps * (0.6 if quick else 1.4))
+    hold_frames = int(fps * (0.5 if quick else 1.0))
+    transition_frames = int(fps * (0.45 if quick else 1.0))
+    edge_frames = int(fps * (0.3 if quick else 0.6))
     numbers = list(range(10, -1, -1))
     firework_seconds = 2.0 if quick else 6.0
     firework_frames = int(fps * firework_seconds)
@@ -449,7 +501,19 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
     # camera drifting away.
     spin_rng = random.Random(7)
     countdown_frame = 0
+
+    def next_camera():
+        nonlocal countdown_frame
+        countdown_frame += 1
+        azim = -90 + 14 * np.sin(countdown_frame * 0.05)
+        elev = 15 + 6 * np.sin(countdown_frame * 0.035)
+        ax.cla()
+        setup_axes(ax)
+        ax.view_init(elev=elev, azim=azim)
+        draw_stars(ax, stars)
+
     for idx, num in enumerate(numbers):
+        text = str(num)
         color = COUNTDOWN_COLORS[idx % len(COUNTDOWN_COLORS)]
         # Wild multi-axis tumble: whole-turn counts so the digit lands back
         # on the same camera-facing orientation as "Happy Birthday!" both
@@ -459,17 +523,34 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
             spin_rng.choice([0, 0, 1]) * spin_rng.choice([-1, 1]),
             1 * spin_rng.choice([-1, 1]),
         )
-        for f in range(frames_per_number):
-            progress = f / frames_per_number
-            ax.cla()
-            setup_axes(ax)
-            countdown_frame += 1
-            azim = -90 + 14 * np.sin(countdown_frame * 0.05)
-            elev = 15 + 6 * np.sin(countdown_frame * 0.035)
-            ax.view_init(elev=elev, azim=azim)
-            draw_stars(ax, stars)
-            draw_countdown_number(ax, str(num), progress, color, spin)
+
+        if idx == 0:
+            # The first digit has no predecessor -- it condenses out of
+            # drifting particles instead of taking part in a transition.
+            for f in range(edge_frames):
+                next_camera()
+                draw_materialize(ax, text, f / edge_frames, color)
+                capture()
+
+        for f in range(hold_frames):
+            next_camera()
+            draw_countdown_number(ax, text, f / hold_frames, color, spin)
             capture()
+
+        if idx == len(numbers) - 1:
+            # The last digit ("0") has no successor -- it shatters away on
+            # its own, handing off to the fireworks.
+            for f in range(edge_frames):
+                next_camera()
+                draw_dissolve(ax, text, f / edge_frames, color)
+                capture()
+        else:
+            next_color = COUNTDOWN_COLORS[(idx + 1) % len(COUNTDOWN_COLORS)]
+            next_text = str(numbers[idx + 1])
+            for f in range(transition_frames):
+                next_camera()
+                draw_transition(ax, text, next_text, f / transition_frames, color, next_color)
+                capture()
     azim = -90.0
 
     # --- Firework + "Happy Birthday" phase ---
