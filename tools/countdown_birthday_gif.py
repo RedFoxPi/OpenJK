@@ -26,6 +26,8 @@ from matplotlib.textpath import TextPath
 from matplotlib.font_manager import FontProperties
 from matplotlib.transforms import Affine2D
 from matplotlib.tri import Triangulation
+from matplotlib.lines import Line2D
+from matplotlib.patches import Polygon as MplPolygon
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the 3d projection)
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from PIL import Image
@@ -41,7 +43,7 @@ DIGIT_DEPTH = 2.2       # extrusion thickness of an extruded digit
 STAR_COUNT = 140
 
 GOLD = "#FFD54A"
-COUNTDOWN_COLORS = ["#3fb6ff", "#ff5f6d", "#ffd93f", "#6dffb0", "#c86dff"]
+COUNTDOWN_COLORS = ["#ff477e", "#00d9ff", "#ffb703", "#8ac926", "#b388ff"]
 CONFETTI_COLORS = ["#ff5f6d", "#ffd93f", "#6dffb0", "#3fb6ff", "#ff9de2", "#c86dff", "#ffffff"]
 
 
@@ -639,6 +641,95 @@ def draw_happy_birthday(fig, progress):
 
 
 # --------------------------------------------------------------------------
+# Ivy vines growing in above the banner
+# --------------------------------------------------------------------------
+
+IVY_STEM_COLOR = "#3f7d3f"
+IVY_LEAF_COLORS = ["#2e5e2e", "#4a8f4a", "#6fbf6f"]
+
+
+def _vine_path(start_x, start_y, direction, height, drift, seed, n=50, wobble=0.018):
+    """A wandering, slightly curling tendril path in figure coordinates,
+    parameterized by s in [0, 1] from root to tip."""
+    rng = np.random.default_rng(seed)
+    s = np.linspace(0.0, 1.0, n)
+    freq1, freq2 = rng.uniform(2.2, 3.4), rng.uniform(5.0, 7.5)
+    ph1, ph2 = rng.uniform(0, 2 * np.pi, 2)
+    curl = rng.uniform(0.7, 1.3)
+    x = (start_x + direction * s * drift
+         + wobble * np.sin(freq1 * np.pi * s + ph1)
+         + 0.4 * wobble * np.sin(freq2 * np.pi * s + ph2)
+         + direction * 0.05 * curl * s ** 2 * np.sin(3 * np.pi * s + ph1))
+    y = start_y + s * height + 0.03 * s * np.sin(freq1 * np.pi * s * 0.5 + ph2)
+    return x, y
+
+
+def build_ivy_vines():
+    """A handful of ivy tendrils creeping in from the left and right, up
+    and over the top of the "Happy Birthday!" banner."""
+    configs = [
+        dict(start=(0.055, 0.565), direction=1, height=0.27, drift=0.34, seed=1),
+        dict(start=(0.10, 0.545), direction=1, height=0.20, drift=0.22, seed=2),
+        dict(start=(0.945, 0.565), direction=-1, height=0.27, drift=0.34, seed=3),
+        dict(start=(0.90, 0.545), direction=-1, height=0.20, drift=0.22, seed=4),
+    ]
+    vines = []
+    for cfg in configs:
+        x, y = _vine_path(cfg["start"][0], cfg["start"][1], cfg["direction"],
+                           cfg["height"], cfg["drift"], cfg["seed"])
+        n = len(x)
+        rng = np.random.default_rng(cfg["seed"] + 100)
+        leaves = [(i, 1 if k % 2 == 0 else -1, rng.uniform(0.85, 1.15))
+                  for k, i in enumerate(range(4, n - 2, 5))]
+        vines.append({"x": x, "y": y, "leaves": leaves})
+    return vines
+
+
+IVY_VINES = build_ivy_vines()
+_IVY_LEAF_LOCAL = np.array([[0.0, 0.0], [0.32, 0.55], [0.0, 1.15], [-0.32, 0.55]])
+
+
+def draw_ivy(fig, vines, growth_by_vine):
+    """Draw each vine up to its current growth fraction (0..1), with small
+    leaves popping in as the tip grows past them -- an organic "growing in"
+    reveal rather than a static overlay."""
+    artists = []
+    for vine, g in zip(vines, growth_by_vine):
+        g = max(0.0, min(1.0, g))
+        n = len(vine["x"])
+        visible = int(g * (n - 1)) + 1
+        if visible >= 2:
+            line = Line2D(vine["x"][:visible], vine["y"][:visible], color=IVY_STEM_COLOR,
+                          linewidth=2.2, solid_capstyle="round", transform=fig.transFigure,
+                          zorder=5, alpha=0.95)
+            fig.add_artist(line)
+            artists.append(line)
+
+        for i, side, size_mult in vine["leaves"]:
+            s_leaf = i / (n - 1)
+            if s_leaf > g:
+                continue
+            pop = ease_out_back(min(1.0, (g - s_leaf) / 0.05), overshoot=1.6)
+            if pop <= 0.02:
+                continue
+            i0, i1 = max(0, i - 1), min(n - 1, i + 1)
+            dx, dy = vine["x"][i1] - vine["x"][i0], vine["y"][i1] - vine["y"][i0]
+            angle = np.degrees(np.arctan2(dy, dx)) + side * 62 - 90
+            r = np.radians(angle)
+            c, s_ = np.cos(r), np.sin(r)
+            rot = _IVY_LEAF_LOCAL @ np.array([[c, -s_], [s_, c]]).T
+            leaf_scale = 0.03 * size_mult * pop
+            pts = rot * leaf_scale + np.array([vine["x"][i], vine["y"][i]])
+            color = IVY_LEAF_COLORS[i % len(IVY_LEAF_COLORS)]
+            poly = MplPolygon(pts, closed=True, facecolor=color, edgecolor="none",
+                               transform=fig.transFigure, zorder=5, alpha=0.95)
+            fig.add_artist(poly)
+            artists.append(poly)
+
+    return artists
+
+
+# --------------------------------------------------------------------------
 # Main render loop
 # --------------------------------------------------------------------------
 
@@ -659,11 +750,17 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
     frames = []
     azim = 0.0
     birthday_artists = []
+    vine_artists = []
 
     def clear_birthday():
         for artist in birthday_artists:
             artist.remove()
         birthday_artists.clear()
+
+    def clear_vines():
+        for artist in vine_artists:
+            artist.remove()
+        vine_artists.clear()
 
     def capture():
         fig.canvas.draw()
@@ -768,10 +865,21 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
 
     finale_time = 0.0
 
+    # Ivy grows in above the banner, staggered per vine, starting a bit
+    # after the text arrives and then staying put once fully grown.
+    IVY_START = text_fly_start + int(fps * 0.5)
+    IVY_STAGGER = int(fps * 0.22)
+    IVY_DURATION = int(fps * 1.5)
+
+    def ivy_growth(global_frame):
+        return [max(0.0, min(1.0, (global_frame - (IVY_START + k * IVY_STAGGER)) / IVY_DURATION))
+                for k in range(len(IVY_VINES))]
+
     for f in range(finale_frames):
         ax.cla()
         setup_axes(ax)
         clear_birthday()
+        clear_vines()
         azim = -90 + 10 * np.sin(f * 0.03)
         elev = 15 + 5 * np.sin(f * 0.02)
         ax.view_init(elev=elev, azim=azim)
@@ -783,6 +891,7 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         if f >= text_fly_start:
             text_progress = min(1.0, (f - text_fly_start) / text_fly_duration)
             birthday_artists.append(draw_happy_birthday(fig, text_progress))
+            vine_artists.extend(draw_ivy(fig, IVY_VINES, ivy_growth(f)))
 
         confetti.update(dt)
         confetti.draw(ax)
@@ -794,6 +903,7 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         ax.cla()
         setup_axes(ax)
         clear_birthday()
+        clear_vines()
         azim = -90 + 10 * np.sin((finale_frames + f) * 0.03)
         elev = 15 + 5 * np.sin((finale_frames + f) * 0.02)
         ax.view_init(elev=elev, azim=azim)
@@ -806,6 +916,7 @@ def generate(output="countdown_birthday.gif", fps=20, quick=False):
         confetti.draw(ax)
 
         birthday_artists.append(draw_happy_birthday(fig, 1.0))
+        vine_artists.extend(draw_ivy(fig, IVY_VINES, ivy_growth(finale_frames + f)))
         capture()
 
     plt.close(fig)
