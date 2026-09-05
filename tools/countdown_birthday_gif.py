@@ -629,14 +629,15 @@ class Confetti:
 
 
 def draw_happy_birthday(fig, progress):
-    """Overlay 'Happy Birthday!' flying from the background into the foreground."""
+    """Overlay the two-line birthday banner flying from the background into
+    the foreground."""
     t = ease_out_back(progress, overshoot=1.2)
-    fontsize = 12 + 26 * t
+    fontsize = 10 + 19 * t
     alpha = ease_out_cubic(min(progress / 0.5, 1.0))
     y = 0.12 + 0.38 * t
-    return fig.text(0.5, y, "Happy Birthday!", ha="center", va="center",
+    return fig.text(0.5, y, "Happy 14th Birthday\nOlivia!", ha="center", va="center",
                      fontsize=fontsize, fontweight="bold", color=GOLD, alpha=alpha,
-                     family="DejaVu Sans",
+                     family="DejaVu Sans", linespacing=1.3,
                      path_effects=[pe.withStroke(linewidth=max(fontsize * 0.08, 1), foreground="#7a1d1d")])
 
 
@@ -668,10 +669,10 @@ def build_ivy_vines():
     """A handful of ivy tendrils creeping in from the left and right, up
     and over the top of the "Happy Birthday!" banner."""
     configs = [
-        dict(start=(0.055, 0.565), direction=1, height=0.27, drift=0.34, seed=1),
-        dict(start=(0.10, 0.545), direction=1, height=0.20, drift=0.22, seed=2),
-        dict(start=(0.945, 0.565), direction=-1, height=0.27, drift=0.34, seed=3),
-        dict(start=(0.90, 0.545), direction=-1, height=0.20, drift=0.22, seed=4),
+        dict(start=(0.055, 0.645), direction=1, height=0.27, drift=0.34, seed=1),
+        dict(start=(0.10, 0.625), direction=1, height=0.20, drift=0.22, seed=2),
+        dict(start=(0.945, 0.645), direction=-1, height=0.27, drift=0.34, seed=3),
+        dict(start=(0.90, 0.625), direction=-1, height=0.20, drift=0.22, seed=4),
     ]
     vines = []
     for cfg in configs:
