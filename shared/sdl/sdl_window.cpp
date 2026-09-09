@@ -71,6 +71,16 @@ typedef struct vidmode_s
 } vidmode_t;
 
 const vidmode_t r_vidModes[] = {
+    // Modes 0-12 are the original id/Raven list, unchanged - some UI
+    // resolution dropdowns (ui/setup.menu and friends, shipped in the
+    // retail game's own assets*.pk3, not part of this source tree) hardcode
+    // these exact indices as literal "ui_r_mode" values, so they must keep
+    // meaning exactly what they always have. New modes are appended after
+    // index 12 instead of being inserted/reordered, for the same reason -
+    // see R_ModeList_f's own comment, and code/rd-vulkan's/vanilla's "r_mode
+    // -1"/"-2" for the actually-unbounded way to reach any resolution the
+    // display supports (including one newer than anything in this fixed
+    // list), which a retail menu's fixed dropdown simply has no entry for.
     { "Mode  0: 320x240",		320,	240 },
     { "Mode  1: 400x300",		400,	300 },
     { "Mode  2: 512x384",		512,	384 },
@@ -83,11 +93,33 @@ const vidmode_t r_vidModes[] = {
     { "Mode  9: 1600x1200",		1600,	1200 },
     { "Mode 10: 2048x1536",		2048,	1536 },
     { "Mode 11: 856x480 (wide)", 856,	 480 },
-    { "Mode 12: 2400x600(surround)",2400,600 }
+    { "Mode 12: 2400x600(surround)",2400,600 },
+    // Modes 13+ are new: today's common display resolutions, none of which
+    // existed anywhere in this list before (nothing here even reached
+    // 1920x1080) - reachable via "r_mode <n>" or the "modelist" console
+    // command on any client, regardless of whether a given UI's own fixed
+    // dropdown happens to offer them.
+    { "Mode 13: 1280x720 (720p)",		1280,	720  },
+    { "Mode 14: 1366x768",			1366,	768  },
+    { "Mode 15: 1600x900",			1600,	900  },
+    { "Mode 16: 1920x1080 (1080p)",		1920,	1080 },
+    { "Mode 17: 1920x1200",			1920,	1200 },
+    { "Mode 18: 2560x1080 (ultrawide)",	2560,	1080 },
+    { "Mode 19: 2560x1440 (1440p)",		2560,	1440 },
+    { "Mode 20: 2560x1600",			2560,	1600 },
+    { "Mode 21: 3440x1440 (ultrawide)",	3440,	1440 },
+    { "Mode 22: 3840x1600 (ultrawide)",	3840,	1600 },
+    { "Mode 23: 3840x2160 (4K UHD)",		3840,	2160 },
+    { "Mode 24: 5120x1440 (ultrawide)",	5120,	1440 }
 };
 static const int	s_numVidModes = ARRAY_LEN( r_vidModes );
 
-#define R_MODE_FALLBACK (4) // 640x480
+#define R_MODE_FALLBACK (4) // 800x600 - a safe, near-universally-supported
+                             // resolution to retry with if the caller's own
+                             // requested mode fails to set, not related to
+                             // r_mode's own *default* value below (which
+                             // exists to pick a good resolution on a client's
+                             // very first run, before anything has failed).
 
 qboolean R_GetModeInfo( int *width, int *height, int mode ) {
 	const vidmode_t	*vm;
@@ -739,7 +771,17 @@ window_t WIN_Init( const windowDesc_t *windowDesc, glconfig_t *glConfig )
 	r_customheight		= Cvar_Get( "r_customheight",		"1024",		CVAR_ARCHIVE|CVAR_LATCH );
 	r_swapInterval		= Cvar_Get( "r_swapInterval",		"0",		CVAR_ARCHIVE_ND );
 	r_stereo			= Cvar_Get( "r_stereo",				"0",		CVAR_ARCHIVE_ND|CVAR_LATCH );
-	r_mode				= Cvar_Get( "r_mode",				"4",		CVAR_ARCHIVE|CVAR_LATCH );
+	// Default to "use the desktop's actual resolution" (-2, see
+	// GLimp_SetMode's own comment) rather than a fixed list entry - a fresh
+	// profile with no saved r_mode should start at whatever the display
+	// natively supports (4K, 5K, ultrawide, ...), not a hardcoded 800x600.
+	// No fixed list, however extended, can cover every display a fresh
+	// install might run on - r_vidModes above didn't even reach 1920x1080
+	// until this same change added modes 13+. CVAR_ARCHIVE means this
+	// default only applies once, on a fresh homepath with nothing saved yet
+	// - anyone who already has an r_mode saved (including one of the fixed
+	// list entries above) keeps it unchanged.
+	r_mode				= Cvar_Get( "r_mode",				"-2",		CVAR_ARCHIVE|CVAR_LATCH );
 	r_displayRefresh	= Cvar_Get( "r_displayRefresh",		"0",		CVAR_LATCH );
 	Cvar_CheckRange( r_displayRefresh, 0, 240, qtrue );
 

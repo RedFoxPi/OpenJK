@@ -10,6 +10,7 @@ Key: [-] removed, [+] added, [\*] modified
 * [+] Add `r_noborder` option (windowed mode feature).
 * [+] Add `r_centerWindow` option (windowed mode feature).
 * [+] Add `r_mode -2` option to use desktop resolution.
+* [+] Added 12 modern `r_mode` resolutions (720p through 4K UHD and several ultrawide formats), and `r_mode` now defaults to `-2` (desktop resolution) on a fresh install instead of a fixed 800x600.
 * [\*] Removed cheat protection from `r_we` cmd, `r_dynamicGlow*` cvars
 * [-] Removed CD Check Code
 * [-] Removed Anti-Tamper Code. (It serves no purpose with source code available.)
