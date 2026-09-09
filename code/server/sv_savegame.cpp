@@ -148,7 +148,7 @@ void SV_WipeGame_f(void)
 		return;
 	}
 	SG_WipeSavegame(Cmd_Argv(1));
-//	Com_Printf("%s has been wiped\n", Cmd_Argv(1));	// wurde gelöscht in german, but we've only got one string
+//	Com_Printf("%s has been wiped\n", Cmd_Argv(1));	// wurde gelï¿½scht in german, but we've only got one string
 //	Com_Printf("Ok\n"); // no localization of this
 }
 
@@ -158,7 +158,16 @@ void SV_WipeGame_f(void)
 */
 void SG_StoreSaveGameComment(const char *sComment)
 {
-	memmove(saveGameComment,sComment,iSG_COMMENT_SIZE);
+	// Q_strncpyz, not a raw memmove(saveGameComment, sComment,
+	// iSG_COMMENT_SIZE): that unconditionally read iSG_COMMENT_SIZE bytes
+	// from sComment regardless of how long the string actually pointed to
+	// by the caller was - a real out-of-bounds read, not just noise (one
+	// real caller, SV_SaveGame_f, passes a bare "" string literal, only 1
+	// byte long). saveGameComment is read elsewhere in this file as a
+	// plain C-string (e.g. `!*saveGameComment`), matching the sibling
+	// direction's own Q_strncpyz(sComment, saveGameComment, ...) a few
+	// lines below.
+	Q_strncpyz(saveGameComment,sComment,iSG_COMMENT_SIZE);
 }
 
 qboolean SV_TryLoadTransition( const char *mapname )

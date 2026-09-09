@@ -476,11 +476,24 @@ int PC_StringizeTokens(token_t *tokens, token_t *token)
 	token->endwhitespace_p = NULL;
 	token->string[0] = '\0';
 	strcat(token->string, "\"");
+	// Self-limiting by construction, not just "probably fine": strncat
+	// never appends more than the bound it's given, so strlen(token->string)
+	// can never exceed MAX_TOKEN-1 entering any iteration (including this
+	// loop's own prior ones), which keeps "MAX_TOKEN - strlen(...) - 1"
+	// from ever going negative - GCC's -Wstringop-truncation can't prove
+	// that invariant across the loop, but it holds.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+#endif
 	for (t = tokens; t; t = t->next)
 	{
 		strncat(token->string, t->string, MAX_TOKEN - strlen(token->string) - 1);
 	} //end for
 	strncat(token->string, "\"", MAX_TOKEN - strlen(token->string) - 1);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 	return qtrue;
 } //end of the function PC_StringizeTokens
 //============================================================================

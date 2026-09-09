@@ -2113,7 +2113,16 @@ int AAS_Reachability_Jump(int area1num, int area2num)
 	int stopevent, areas[10], numareas;
 	float phys_jumpvel, maxjumpdistance, maxjumpheight, height, bestdist, speed;
 	float *v1, *v2, *v3, *v4;
-	vec3_t beststart, beststart2, bestend, bestend2;
+	// Zero-initialized, not left uninitialized: only ever written to inside
+	// the quad-nested loop below (via AAS_ClosestEdgePoints), which the
+	// bestdist range check just below that loop already guards their only
+	// real use behind - but that guard correlates with bestdist's value,
+	// not directly with whether the loop body ran, which is one level of
+	// indirection more than GCC's own -Wmaybe-uninitialized analysis can
+	// follow through the AAS_ClosestEdgePoints call boundary. Zeroing here
+	// is a real, not just cosmetic, safety net for the same "no ground
+	// face pair found at all" case that guard exists for.
+	vec3_t beststart = {0, 0, 0}, beststart2 = {0, 0, 0}, bestend = {0, 0, 0}, bestend2 = {0, 0, 0};
 	vec3_t teststart, testend, dir, velocity, cmdmove, up = {0, 0, 1}, sidewards;
 	aas_area_t *area1, *area2;
 	aas_face_t *face1, *face2;
@@ -2185,10 +2194,19 @@ int AAS_Reachability_Jump(int area1num, int area2num)
 			} //end for
 		} //end for
 	} //end for
-	VectorMiddle(beststart, beststart2, beststart);
-	VectorMiddle(bestend, bestend2, bestend);
+	// beststart/beststart2/bestend/bestend2 are only ever written to inside
+	// the quad-nested loop above (via AAS_ClosestEdgePoints) - if area1 and
+	// area2 have no FACE_GROUND-flagged face between them at all (bestdist
+	// never dropping below its 999999 sentinel), that loop body never runs
+	// even once, and reading them below would be genuinely uninitialized
+	// (this is what GCC's own -Wmaybe-uninitialized flags here, not a false
+	// positive - reordered under the same bestdist range check the second
+	// AAS_ClosestEdgePoints caller, AAS_Reachability_FuncBobStartWalkOrJump
+	// below, already gates this exact pattern behind).
 	if (bestdist > 4 && bestdist < maxjumpdistance)
 	{
+		VectorMiddle(beststart, beststart2, beststart);
+		VectorMiddle(bestend, bestend2, bestend);
 //		Log_Write("shortest distance between %d and %d is %f\r\n", area1num, area2num, bestdist);
 		// if very close and almost no height difference then the bot can walk
 		if (bestdist <= 48 && fabs(beststart[2] - bestend[2]) < 8)

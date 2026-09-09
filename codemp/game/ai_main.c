@@ -6940,7 +6940,15 @@ void StandardBotAI(bot_state_t *bs, float thinktime)
 		}
 		else
 		{
-			VectorCopy(bs->currentEnemy->client->ps.origin, headlevel);
+			// currentEnemy->client is NULL in this branch (that's the
+			// branch condition) - a non-player enemy (e.g. a turret) has no
+			// client_t/playerState at all, so its origin has to come from
+			// the entity state instead, same fallback already used for
+			// this exact client-vs-non-client split elsewhere in this file
+			// (e.g. BotAimAtEnemy's usethisvec, ~line 3882). The previous
+			// `client->ps.origin` here was a copy-paste bug that
+			// dereferenced the very pointer this branch guarantees is NULL.
+			VectorCopy(bs->currentEnemy->s.origin, headlevel);
 		}
 
 		if (!bs->frame_Enemy_Vis)

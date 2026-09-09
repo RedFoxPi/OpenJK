@@ -457,11 +457,24 @@ void R_CheckMP3s( const char *psDir )
 									memcpy(pTAG->id,"TAG",3);
 								}
 
+								// ID3v1.1's title/artist/comment/album fields are fixed-width,
+								// non-null-terminated (spec-defined, not a bug) - strncpy's
+								// "may not null-terminate" warning is a known false positive
+								// here, not something to work around by growing the buffers or
+								// switching to a null-terminating copy (that would write past
+								// the tag's real, on-disk field width).
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-truncation"
+#endif
 								strncpy(pTAG->title,	Filename_WithoutPath(Filename_WithoutExt(sFilename)), sizeof(pTAG->title));
 								strncpy(pTAG->artist,	"Raven Software",						sizeof(pTAG->artist)	);
 								memcpy(pTAG->year,		"2002",									sizeof(pTAG->year)		);
 								strncpy(pTAG->comment,	va("%s %g",sKEY_MAXVOL,fMaxVol),		sizeof(pTAG->comment)	);
 								strncpy(pTAG->album,	va("%s %d",sKEY_UNCOMP,iActualUnpackedSize),sizeof(pTAG->album)	);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 								if (FS_Write( pTAG, sizeof(*pTAG), f ))	// NZ = success
 								{

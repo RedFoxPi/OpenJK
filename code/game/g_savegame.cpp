@@ -803,9 +803,19 @@ static void copy_retail_gclient_to_current(
 			dst.ps.saber[i]);
 	}
 
+	// dst's own offset for the dst pointer, src's own offset for the src
+	// pointer - not swapped, as this previously was. RetailGClient and
+	// gclient_t have different layouts before ps.dualSabers (that's the
+	// whole reason this function exists - saberInfoRetail_t vs
+	// saberInfo_t), so src_post_offset and dst_post_offset are genuinely
+	// different values; applying src's offset to the dst pointer (and
+	// vice versa) wrote to the wrong place in dst and read from the wrong
+	// place in src - confirmed by GCC's own -Warray-bounds here, which
+	// caught the read running past the end of the real (6376-byte)
+	// RetailGClient object being loaded from an old-format savegame.
 	::memcpy(
-		reinterpret_cast<char*>(&dst) + src_post_offset,
-		reinterpret_cast<const char*>(&src) + dst_post_offset,
+		reinterpret_cast<char*>(&dst) + dst_post_offset,
+		reinterpret_cast<const char*>(&src) + src_post_offset,
 		src_post_size);
 }
 

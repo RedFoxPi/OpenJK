@@ -679,7 +679,18 @@ typedef struct srfSurfaceFace_s {
 	int			numPoints;
 	int			numIndices;
 	int			ofsIndices;
-	float		points[1][VERTEXSIZE];	// variable sized
+	// A true (C99-style) flexible array member, not a fixed [1] - every
+	// access past points[0] (RE_GetBModelVerts indexes up to points[3], for
+	// instance) is genuinely in-bounds real data, allocated via
+	// `&((srfSurfaceFace_t*)0)->points[numPoints]`-style offset math
+	// (tr_bsp.cpp) rather than sizeof(srfSurfaceFace_t) - nothing in this
+	// codebase takes sizeof() of this struct, so widening this from [1] to
+	// [] changes nothing about the real, already-variable-sized allocation,
+	// it just stops GCC's -Warray-bounds from treating "index 1" the same
+	// as "index past declared size 1" (a real false positive this fixes,
+	// confirmed by that offset-math allocation already treating this as
+	// unbounded).
+	float		points[][VERTEXSIZE];	// variable sized
 										// there is a variable length list of indices here also
 } srfSurfaceFace_t;
 

@@ -42,6 +42,19 @@ void SetMiscModelModels( char *modelNameString, gentity_t *ent, qboolean damage_
 	if ( damage_model )
 	{
 		len = strlen( modelNameString ) - 4; // extract the extension
+		// Clamp rather than trust the map/entity-supplied model name to
+		// always be at least 4 characters (a bare extension, or shorter,
+		// would otherwise underflow len negative - and negative size_t as
+		// strncpy's bound is a real buffer overrun, not just noise) or to
+		// fit within damageModel's fixed MAX_QPATH buffer.
+		if ( len < 0 )
+		{
+			len = 0;
+		}
+		else if ( (size_t)len >= sizeof( damageModel ) )
+		{
+			len = sizeof( damageModel ) - 1;
+		}
 
 		//Dead/damaged model
 		strncpy( damageModel, modelNameString, len );

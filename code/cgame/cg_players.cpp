@@ -6527,8 +6527,25 @@ Ghoul2 Insert End
 				}
 
 				// stash point so we can connect-the-dots later
+				// `i` is only ever 0 or 1 here - it's the enclosing `for (int
+				// i = 0; i < 1; i++)` loop's own counter (line 6435 above),
+				// only ever additionally set to the literal 1 (line 6471) to
+				// deliberately end that loop a beat early, both values well
+				// within oldPos/oldNormal's [2][3] bound - GCC's
+				// -Warray-bounds "subscript -1" here is a known false
+				// positive from this function's own size/complexity (likely
+				// value-range analysis losing precision across the inlined
+				// WP_SaberBladeUseSecondBladeStyle calls above), not a real
+				// negative index.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
 				VectorCopy( trace.endpos, client->ps.saber[saberNum].blade[bladeNum].trail.oldPos[i] );
 				VectorCopy( trace.plane.normal, client->ps.saber[saberNum].blade[bladeNum].trail.oldNormal[i] );
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 				if ( !i && trace.contents&(CONTENTS_SOLID|CONTENTS_TERRAIN|CONTENTS_SHOTCLIP) )
 				{	//Now that we don't let the blade go through walls, we need to shorten the blade when it hits one

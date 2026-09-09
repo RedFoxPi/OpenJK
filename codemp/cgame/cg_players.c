@@ -706,7 +706,14 @@ retryModel:
 		char iconName[1024];
 		strcpy(iconName, "icon_");
 		j = strlen(iconName);
-		while (skinName[i] && skinName[i] != '|' && j < 1024)
+		// j < sizeof(iconName)-1, not < sizeof(iconName): the loop must
+		// leave room for the '\0' written right after it exits, or a
+		// skinName long enough to fill the buffer exactly makes that write
+		// land one byte past the end of iconName - a real stack overflow,
+		// not just a warning (confirmed by GCC's own -Wstringop-overflow
+		// here: "writing 1 byte into a region of size 0", i.e. exactly this
+		// case, j having already reached sizeof(iconName)).
+		while (skinName[i] && skinName[i] != '|' && j < (int)sizeof(iconName) - 1)
 		{
             iconName[j] = skinName[i];
 			j++;

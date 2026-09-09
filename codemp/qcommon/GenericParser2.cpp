@@ -155,7 +155,15 @@ static char *GetToken(char **text, bool allowLineBreaks, bool readUntilEOL = fal
 		}
 	}
 
-	if (token[0] == '\"')
+	// length > 0 guard, not just "if (token[0] == '\"')": length is a
+	// signed int, so if it were ever 0 here, length-- would go negative and
+	// then implicitly convert to a huge size_t for memmove's bound - real
+	// undefined behavior, not just a warning (this is exactly what GCC's
+	// own -Wstringop-overflow flags: "specified bound 18446744073709551615
+	// exceeds maximum object size", i.e. (size_t)-1). Not known to be
+	// reachable with today's callers, but token[0] alone doesn't prove
+	// length >= 1 either, so this is a real safety net, not a no-op.
+	if (token[0] == '\"' && length > 0)
 	{	// remove start quote
 		length--;
 		memmove(token, token+1, length);

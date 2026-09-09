@@ -287,7 +287,12 @@ itemconfig_t *LoadItemConfig(char *filename)
 		LibVarSet( "max_iteminfo", "256" );
 	}
 
-	strncpy( path, filename, MAX_PATH );
+	// Q_strncpyz, not a raw strncpy(path, filename, MAX_PATH): filename is
+	// caller-supplied (ultimately from a .bsp/.gm entity string), and a raw
+	// strncpy with a bound exactly equal to the destination's size leaves
+	// path un-terminated (a real over-read, not just a truncation) whenever
+	// filename is >= MAX_PATH characters.
+	Q_strncpyz( path, filename, MAX_PATH );
 	PC_SetBaseFolder(BOTFILESBASEFOLDER);
 	source = LoadSourceFile( path );
 	if( !source ) {
@@ -320,7 +325,7 @@ itemconfig_t *LoadItemConfig(char *filename)
 				return NULL;
 			} //end if
 			StripDoubleQuotes(token.string);
-			strncpy(ii->classname, token.string, sizeof(ii->classname)-1);
+			Q_strncpyz(ii->classname, token.string, sizeof(ii->classname));
 			if (!ReadStructure(source, &iteminfo_struct, (char *) ii))
 			{
 				FreeMemory(ic);
@@ -691,8 +696,7 @@ void BotGoalName(int number, char *name, int size)
 	{
 		if (li->number == number)
 		{
-			strncpy(name, itemconfig->iteminfo[li->iteminfo].name, size-1);
-			name[size-1] = '\0';
+			Q_strncpyz(name, itemconfig->iteminfo[li->iteminfo].name, size);
 			return;
 		} //end for
 	} //end for
